@@ -321,7 +321,6 @@ def finalize_video(input_webm: str, output_mp4: str) -> None:
 def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
     """YouTube Data API v3で動画をアップロードする"""
     print(f"[YouTube] アップロード中: {title}")
-
     try:
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
@@ -331,7 +330,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
 
         SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
         TOKEN_PATH = Path.home() / ".bottan_youtube_token.pickle"
-        CLIENT_SECRETS = Path.home() / ".bottan_youtube_client_secrets.json"
+        CLIENT_SECRETS = Path(os.getenv("YOUTUBE_CLIENT_SECRETS", str(Path.home() / ".bottan_youtube_client_secrets.json")))
 
         creds = None
         if TOKEN_PATH.exists():
@@ -342,7 +341,12 @@ def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(CLIENT_SECRETS), SCOPES
             )
-            creds = flow.run_local_server(port=0)
+            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
+            auth_url, _ = flow.authorization_url(prompt="consent")
+            print(f"\n以下のURLをブラウザで開いてください:\n{auth_url}\n")
+            code = input("認証後に表示されたコードを入力してください: ")
+            flow.fetch_token(code=code)
+            creds = flow.credentials
             with open(TOKEN_PATH, "wb") as f:
                 pickle.dump(creds, f)
 
@@ -352,8 +356,8 @@ def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
             "snippet": {
                 "title": title,
                 "description": description,
-                "tags": ["botたん", "全肯定", "Bluesky", "VRM", "AI"],
-                "categoryId": "22",  # People & Blogs
+                "tags": ["botたん", "全肯定", "Bluesky", "VTuber"],
+                "categoryId": "22",
             },
             "status": {
                 "privacyStatus": "public",
@@ -379,22 +383,6 @@ def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
     except ImportError:
         print("[YouTube] google-api-python-client未インストール。スキップします。")
         print("pip install google-api-python-client google-auth-oauthlib")
-
-
-# ──────────────────────────────────────────────
-# ユーティリティ
-# ──────────────────────────────────────────────
-
-def _timed(label: str, fn, *args, **kwargs):
-    t0 = time.time()
-    result = fn(*args, **kwargs)
-    print(f"[TIME] {label}: {time.time() - t0:.1f}秒")
-    return result
-
-
-# ──────────────────────────────────────────────
-# メイン
-# ──────────────────────────────────────────────
 
 def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
