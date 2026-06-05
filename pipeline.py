@@ -249,12 +249,19 @@ def record_with_unity(wav_path: str, output_webm: str) -> None:
         unity_proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE)
         deadline = time.time() + 300
         while time.time() < deadline:
-            if Path(output_webm).exists():
+            if Path(output_webm).exists() and os.path.getsize(output_webm) > 0:
+                print(f"[Unity] ファイル検出: {output_webm}")
+                # ファイルサイズが安定するまで待つ
+                prev_size = 0
+                while True:
+                    time.sleep(2)
+                    current_size = os.path.getsize(output_webm)
+                    print(f"[Unity] ファイルサイズ: {current_size} bytes")
+                    if current_size == prev_size and current_size > 0:
+                        print(f"[Unity] 書き込み完了を確認")
+                        break
+                    prev_size = current_size
                 unity_proc.terminate()
-                try:
-                    unity_proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    unity_proc.kill()
                 break
             if unity_proc.poll() is not None:
                 break
@@ -310,7 +317,7 @@ def finalize_video(input_webm: str, output_mp4: str) -> None:
         output_mp4
     ]
 
-    subprocess.run(cmd, check=True, timeout=120, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(cmd, check=True, timeout=120)
     print(f"[FFmpeg] 変換完了: {output_mp4}")
 
 
@@ -384,6 +391,14 @@ def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
         print("[YouTube] google-api-python-client未インストール。スキップします。")
         print("pip install google-api-python-client google-auth-oauthlib")
 
+def _timed(label, fn, *args):
+    import time
+    print(f"[{label}] 開始...")
+    start = time.time()
+    result = fn(*args)
+    print(f"[{label}] 完了 ({time.time()-start:.1f}s)")
+    return result
+
 def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmp_dir = Path(tempfile.gettempdir())
@@ -434,6 +449,7 @@ def main():
         raise
 
     finally:
+        #pass
         # 一時ファイル削除
         for path in [wav_path, webm_path]:
             if Path(path).exists():
