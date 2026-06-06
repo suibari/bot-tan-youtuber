@@ -161,11 +161,11 @@ def generate_script(data: dict) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=4000,
-        temperature=0.5,
+        #max_tokens=4000,
+        #temperature=0.5,
         extra_body=extra if extra else None,
     )
-    #print(f"[DEBUG] response: {response}")
+    print(f"[DEBUG] finish_reason: {response.choices[0].finish_reason}")
 
     script = response.choices[0].message.content.strip()
     print(f"[LLM] 台本生成完了:\n{script}\n")
