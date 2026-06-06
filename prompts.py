@@ -29,7 +29,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30) -> str:
         mood_ja = m.get("mood", "")
         mood_en = m.get("mood_en", "")
         energy = m.get("energy", "")
-        mood_lines += "- " + date + " 状態:" + status + " 気分:" + mood_ja + "(" + mood_en + ") エネルギー:" + str(energy) + "\n"
+        mood_lines += "- " + date + " 状態:" + str(status or "") + " 気分:" + str(mood_ja or "") + "(" + str(mood_en or "") + ") エネルギー:" + str(energy or "") + "\n"
 
     post_lines = ""
     for i, r in enumerate(interactions, 1):
