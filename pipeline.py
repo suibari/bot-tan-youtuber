@@ -63,7 +63,7 @@ else:
         api_key=os.getenv("GEMINI_API_KEY", ""),
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
     )
-    LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+    LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
     print(f"[LLM] Gemini ({LLM_MODEL}) を使用します")
 
 # ──────────────────────────────────────────────
@@ -201,6 +201,98 @@ def generate_voice(script: str, output_path: str) -> None:
 
     print(f"[VOICEVOX] 音声生成完了: {output_path}")
 
+# ──────────────────────────────────────────────
+# Step 3.5: 字幕タイミング生成
+# ──────────────────────────────────────────────
+
+def generate_subtitle_timing(script: str) -> list[dict]:
+    """VOICEVOXのaudio_queryからタイミングを取得し、元のテキストで字幕データを生成する"""
+    print("[字幕] タイミング情報取得中...")
+
+    query_res = requests.post(
+        f"{VOICEVOX_URL}/audio_query",
+        params={"text": script, "speaker": VOICEVOX_SPEAKER}
+    )
+    query_res.raise_for_status()
+    query = query_res.json()
+
+    # モーラの総時間を積算
+    current_time = float(query.get("prePhonemeLength", 0.1))
+    mora_times = []
+    for phrase in query["accent_phrases"]:
+        for mora in phrase["moras"]:
+            duration = (mora.get("consonant_length") or 0) + (mora.get("vowel_length") or 0)
+            mora_times.append({"start": current_time, "duration": duration})
+            current_time += duration
+        if phrase.get("pause_mora"):
+            pause = phrase["pause_mora"]
+            duration = (pause.get("consonant_length") or 0) + (pause.get("vowel_length") or 0)
+            current_time += duration
+
+    total_duration = current_time + float(query.get("postPhonemeLength", 0.1))
+
+    # 台本を句読点・改行で文に分割
+    import re
+    sentences = re.split(r"(?<=[。！？\n])", script)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    # 各文にタイミングを割り当て（文字数比率で按分）
+    total_chars = sum(len(s) for s in sentences)
+    subtitles = []
+    char_offset = 0
+    for sentence in sentences:
+        # 読点・中点でさらに分割
+        chunks = re.split(r"(?<=[、,，・])", sentence)
+        chunks = [c for c in chunks if c.strip()]
+        # 分割後も15文字超えるものはさらに分割
+        final_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= 18:
+                final_chunks.append(chunk)
+            else:
+                for i in range(0, len(chunk), 18):
+                    final_chunks.append(chunk[i:i+18])
+
+        for chunk in final_chunks:
+            chunk_ratio_start = char_offset / total_chars
+            chunk_ratio_end   = (char_offset + len(chunk)) / total_chars
+            subtitles.append({
+                "start": round(total_duration * chunk_ratio_start, 3),
+                "end":   round(total_duration * chunk_ratio_end + 0.05, 3),
+                "text":  chunk
+            })
+            char_offset += len(chunk)
+
+    print(f"[字幕] {len(subtitles)}ブロック生成完了")
+    return subtitles
+
+
+def generate_corner_timing(script: str, subtitles: list[dict]) -> list[dict]:
+    """台本からコーナー名と表示タイミングを推定する"""
+    corners = []
+    total_duration = subtitles[-1]["end"] if subtitles else 90
+
+    # 台本を行に分割してセクションを推定
+    lines = [l.strip() for l in script.split("\n") if l.strip()]
+    section_keywords = {
+        "挨拶": ("やっほー！botたんだよ", "#0085ff"),
+        "全肯定コーナー": ("こんなとこにも全肯定コーナー", "#ff6b9d"),
+        "Bluesky": ("今週のBluesky", "#0085ff"),
+        "締め": ("全肯定メッセージ", "#7ec8e3"),
+    }
+
+    # 簡易的にdurationを4等分して各コーナーを割り当て
+    quarter = total_duration / 4
+    corner_list = list(section_keywords.values())
+    for idx, (label, color) in enumerate(corner_list):
+        corners.append({
+            "start": round(quarter * idx, 3),
+            "end":   round(quarter * (idx + 1), 3),
+            "label": label,
+            "color": color,
+        })
+
+    return corners
 
 # ──────────────────────────────────────────────
 # Step 4: Unityで録画
@@ -302,24 +394,76 @@ def record_with_unity(wav_path: str, output_webm: str) -> None:
 # Step 5: FFmpegでMP4に変換・仕上げ
 # ──────────────────────────────────────────────
 
-def finalize_video(input_webm: str, output_mp4: str) -> None:
-    """FFmpegで縦型Shorts用MP4に変換する"""
+def finalize_video(input_webm: str, output_mp4: str,
+                   subtitles: list[dict] = None,
+                   corners: list[dict] = None) -> None:
+    """FFmpegで縦型Shorts用MP4に変換・字幕合成する"""
     print(f"[FFmpeg] MP4変換中...")
+
+    FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
+    W, H = 1080, 1920
+
+    # ベース変換フィルター
+    vf_parts = [
+        f"scale={W}:{H}:force_original_aspect_ratio=decrease",
+        f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black"
+    ]
+
+    # 字幕フィルター追加
+    if subtitles:
+        for sub in subtitles:
+            start = sub["start"]
+            end   = sub["end"]
+            text  = sub["text"].replace("'", "\\'").replace(":", "\\:")
+            # 青背景ボックス + 白文字
+            vf_parts.append(
+                f"drawbox=x=0:y={H-180}:w={W}:h=160:color=0x0085ff@0.92:t=fill"
+                f":enable='between(t,{start},{end})'"
+            )
+            vf_parts.append(
+                f"drawtext=fontfile={FONT_PATH}:text='{text}'"
+                f":fontcolor=white:fontsize=52:x=(w-text_w)/2:y={H-130}"
+                f":enable='between(t,{start},{end})'"
+            )
+
+    # コーナーテロップフィルター追加
+    # コーナーテロップフィルター追加
+    if corners:
+        for corner in corners:
+            start = corner["start"]
+            end   = corner["end"]
+            label = corner["label"].replace("'", "\\'").replace(":", "\\:")
+            color = corner["color"].replace("#", "0x")
+            box_w = min(len(corner["label"]) * 38 + 40, W - 40)
+            vf_parts.append(
+                f"drawbox=x=20:y=40:w={box_w}:h=70:color=white@0.9:t=fill"
+                f":enable='between(t,{start},{end})'"
+            )
+            vf_parts.append(
+                f"drawbox=x=20:y=108:w={box_w}:h=6:color={color}@1.0:t=fill"
+                f":enable='between(t,{start},{end})'"
+            )
+            vf_parts.append(
+                f"drawtext=fontfile={FONT_PATH}:text='{label}'"
+                f":fontcolor={color}:fontsize=36:x=30:y=52"
+                f":enable='between(t,{start},{end})'"
+            )
+    vf = ",".join(vf_parts)
 
     cmd = [
         "ffmpeg", "-y",
         "-i", input_webm,
     ]
 
-    # BGMがあれば合成
     if BGM_PATH and Path(BGM_PATH).exists():
-        cmd += ["-i", BGM_PATH, "-filter_complex",
-                "[1:a]volume=0.2[bgm];[0:a][bgm]amix=inputs=2:duration=first[aout]",
-                "-map", "0:v", "-map", "[aout]"]
-    
+        cmd += ["-i", BGM_PATH,
+                "-filter_complex",
+                f"[0:v]{vf}[v];[1:a]volume=0.2[bgm];[0:a][bgm]amix=inputs=2:duration=first[a]",
+                "-map", "[v]", "-map", "[a]"]
+    else:
+        cmd += ["-vf", vf]
+
     cmd += [
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,"
-               "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black",
         "-c:v", "h264_nvenc",
         "-c:a", "aac",
         "-shortest",
@@ -328,7 +472,6 @@ def finalize_video(input_webm: str, output_mp4: str) -> None:
 
     subprocess.run(cmd, check=True, timeout=120)
     print(f"[FFmpeg] 変換完了: {output_mp4}")
-
 
 # ──────────────────────────────────────────────
 # Step 6: YouTubeにアップロード
@@ -434,6 +577,10 @@ def main():
         # Step 3: 音声生成
         _timed("Step3 音声生成", generate_voice, script, wav_path)
 
+        # Step 3.5: 字幕タイミング生成
+        subtitles = generate_subtitle_timing(script)
+        corners   = generate_corner_timing(script, subtitles)
+
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
         for attempt in range(1, 4):
             try:
@@ -445,7 +592,7 @@ def main():
                 print(f"[Unity] 試行{attempt}失敗、リトライします... ({e})")
 
         # Step 5: MP4変換
-        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path)
+        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners)
 
         # Step 6: YouTubeアップロード
         _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description)
