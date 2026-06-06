@@ -327,6 +327,10 @@ def _start_xvfb() -> tuple:
 def record_with_unity(wav_path: str, output_webm: str) -> None:
     """Unityを起動してVRM口パク録画を行う"""
     print(f"[Unity] 録画開始...")
+    # 既存のUnityプロセスを終了
+    import subprocess as sp
+    sp.run(["pkill", "-f", "Unity -projectPath"], capture_output=True)
+    time.sleep(2)
 
     output_base = output_webm.replace(".webm", "")
 
