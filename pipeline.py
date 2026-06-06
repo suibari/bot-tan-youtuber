@@ -41,7 +41,7 @@ from prompts import SYSTEM_PROMPT, build_user_prompt
 # 設定
 # ──────────────────────────────────────────────
 
-BLUESKY_HANDLE   = os.getenv("BLUESKY_HANDLE", "bot-tan.bsky.social")
+BLUESKY_HANDLE   = os.getenv("BLUESKY_HANDLE", "bot-tan.suibari.com")
 BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD", "")
 VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
 VOICEVOX_SPEAKER = int(os.getenv("VOICEVOX_SPEAKER", "8"))
@@ -98,10 +98,9 @@ def fetch_weekly_data() -> dict:
                     created_at
                 FROM affirmative_bot.interaction
                 WHERE type = 'NormalReply'
-                  AND details->>'score' IS NOT NULL
-                  AND created_at >= date_trunc('week', CURRENT_DATE)
-                ORDER BY RANDOM()
-                LIMIT 3
+                  AND (details->>'score')::int >= 88
+                  AND created_at >= NOW() - INTERVAL '7 days'
+                ORDER BY score DESC
             """)
             interactions = cur.fetchall()
 
@@ -114,9 +113,8 @@ def fetch_weekly_data() -> dict:
                     energy,
                     created_at
                 FROM affirmative_bot.biorhythm_history
-                WHERE created_at >= date_trunc('week', CURRENT_DATE)
-                ORDER BY energy DESC
-                LIMIT 1
+                WHERE created_at >= NOW() - INTERVAL '7 days'
+                ORDER BY RANDOM()
             """)
             moods = cur.fetchall()
 
@@ -124,9 +122,20 @@ def fetch_weekly_data() -> dict:
         conn.close()
 
     print(f"[DB] インタラクション: {len(interactions)}件, Mood履歴: {len(moods)}件")
+    all_moods = [dict(r) for r in moods]
+    # statusごとに1件ずつランダムサンプリング
+    import random
+    seen_status = {}
+    for m in all_moods:
+        s = m.get("status")
+        if s not in seen_status:
+            seen_status[s] = m
+    sampled_moods = list(seen_status.values())
+    random.shuffle(sampled_moods)
+
     return {
         "interactions": [dict(r) for r in interactions],
-        "moods":        [dict(r) for r in moods],
+        "moods":        sampled_moods,
     }
 
 # ──────────────────────────────────────────────
@@ -156,7 +165,7 @@ def generate_script(data: dict) -> str:
         temperature=0.5,
         extra_body=extra if extra else None,
     )
-    print(f"[DEBUG] response: {response}")
+    #print(f"[DEBUG] response: {response}")
 
     script = response.choices[0].message.content.strip()
     print(f"[LLM] 台本生成完了:\n{script}\n")
