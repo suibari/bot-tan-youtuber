@@ -452,12 +452,12 @@ def finalize_video(input_webm: str, output_mp4: str,
             text  = sub["text"].replace("'", "\\'").replace(":", "\\:")
             # 青背景ボックス + 白文字
             vf_parts.append(
-                f"drawbox=x=0:y={H-180}:w={W}:h=160:color=0x0085ff@0.92:t=fill"
+                f"drawbox=x=0:y={H-420}:w={W}:h=160:color=0x0085ff@0.92:t=fill"
                 f":enable='between(t,{start},{end})'"
             )
             vf_parts.append(
                 f"drawtext=fontfile={FONT_PATH}:text='{text}'"
-                f":fontcolor=white:fontsize=52:x=(w-text_w)/2:y={H-130}"
+                f":fontcolor=white:fontsize=52:x=(w-text_w)/2:y={H-370}"
                 f":enable='between(t,{start},{end})'"
             )
 
