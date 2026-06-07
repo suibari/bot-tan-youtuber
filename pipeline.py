@@ -36,6 +36,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from prompts import SYSTEM_PROMPT, build_user_prompt
+from description import build_description
 
 # ──────────────────────────────────────────────
 # 設定
@@ -500,6 +501,11 @@ def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
             with open(TOKEN_PATH, "rb") as f:
                 creds = pickle.load(f)
 
+        if creds and creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+            with open(TOKEN_PATH, "wb") as f:
+                pickle.dump(creds, f)
         if not creds or not creds.valid:
             flow = InstalledAppFlow.from_client_secrets_file(
                 str(CLIENT_SECRETS), SCOPES
@@ -599,6 +605,7 @@ def main():
         _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners)
 
         # Step 6: YouTubeアップロード
+        description = build_description()
         _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description)
 
         elapsed = time.time() - total_start
