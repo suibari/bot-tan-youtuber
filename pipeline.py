@@ -590,6 +590,16 @@ def _timed(label, fn, *args):
     print(f"[{label}] 完了 ({time.time()-start:.1f}s)")
     return result
 
+def _retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,)):
+    """最大 attempts 回リトライする共通ヘルパー"""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args)
+        except catch as e:
+            if attempt == attempts:
+                raise
+            print(f"[{label}] 試行{attempt}失敗、リトライします... ({e})")
+
 def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmp_dir = Path(tempfile.gettempdir())
@@ -611,7 +621,7 @@ def main():
             return
 
         # Step 2: 台本生成
-        raw_script = _timed("Step2 台本生成", generate_script, data)
+        raw_script = _retry("Step2 台本生成", generate_script, data)
 
         # Step 2.5: タグ抽出、クリーン台本作成
         clean_script, emotion_matches = extract_emotions_from_script(raw_script)
@@ -633,14 +643,8 @@ def main():
         print(f"[感情] 保存: {emotion_path}")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
-        for attempt in range(1, 4):
-            try:
-                _timed(f"Step4 Unity録画 (試行{attempt})", record_with_unity, wav_path, webm_path, emotion_path)
-                break
-            except (RuntimeError, TimeoutError) as e:
-                if attempt == 3:
-                    raise
-                print(f"[Unity] 試行{attempt}失敗、リトライします... ({e})")
+        _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
+               catch=(RuntimeError, TimeoutError))
 
         # Step 5: MP4変換
         _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners)
