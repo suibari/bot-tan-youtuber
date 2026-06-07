@@ -624,7 +624,12 @@ def main():
             return
 
         # Step 2: 台本生成
-        raw_script = _retry("Step2 台本生成", generate_script, data)
+        script_cache = os.getenv("SCRIPT_CACHE", "")
+        if script_cache and Path(script_cache).exists():
+            raw_script = open(script_cache).read()
+            print(f"[LLM] キャッシュから台本読み込み: {script_cache}")
+        else:
+            raw_script = _timed("Step2 台本生成", generate_script, data)
 
         # Step 2.5: タグ抽出、クリーン台本作成
         clean_script, emotion_matches = extract_emotions_from_script(raw_script)
