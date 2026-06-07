@@ -58,14 +58,16 @@ if USE_LOCAL_LLM:
         base_url="http://localhost:11434/v1"
     )
     LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M")
+    LLM_MODELS = [LLM_MODEL]
     print(f"[LLM] Ollama ({LLM_MODEL}) を使用します")
 else:
     llm_client = OpenAI(
         api_key=os.getenv("GEMINI_API_KEY", ""),
         base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
     )
-    LLM_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
-    print(f"[LLM] Gemini ({LLM_MODEL}) を使用します")
+    LLM_MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").split(",") if m.strip()]
+    LLM_MODEL = LLM_MODELS[0]
+    print(f"[LLM] Gemini ({', '.join(LLM_MODELS)}) を使用します")
 
 # ──────────────────────────────────────────────
 # Step 1: ラズパイDBからデータ取得
@@ -82,8 +84,8 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", ""),
 }
 
-def fetch_weekly_data() -> dict:
-    """ラズパイDBから今週のインタラクションとMood履歴を取得する"""
+def fetch_from_bot_db() -> dict:
+    """ラズパイDBからインタラクションとMood履歴を取得する"""
     print("[DB] ラズパイDBに接続中...")
 
     conn = psycopg2.connect(**DB_CONFIG)
@@ -156,8 +158,7 @@ def generate_script(data: dict) -> str:
         user_prompt = build_user_prompt(data)
         extra = {}
 
-    response = llm_client.chat.completions.create(
-        model=LLM_MODEL,
+    response = _llm_create(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -603,6 +604,21 @@ def _retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,)):
                 raise
             print(f"[{label}] 試行{attempt}失敗、リトライします... ({e})")
 
+def _llm_create(attempts_per_model: int = 3, **kwargs):
+    """LLM_MODELS を左から順に attempts_per_model 回ずつ試す"""
+    last_exc = None
+    for model in LLM_MODELS:
+        for attempt in range(1, attempts_per_model + 1):
+            try:
+                return llm_client.chat.completions.create(model=model, **kwargs)
+            except Exception as e:
+                last_exc = e
+                if attempt < attempts_per_model:
+                    print(f"[LLM] {model} 試行{attempt}失敗、リトライします... ({e})")
+                else:
+                    print(f"[LLM] {model} {attempts_per_model}回失敗、次のモデルへ移行します ({e})")
+    raise last_exc
+
 def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmp_dir = Path(tempfile.gettempdir())
@@ -618,7 +634,7 @@ def main():
     total_start = time.time()
     try:
         # Step 1: DBからデータ取得
-        data = _timed("Step1 DB取得", fetch_weekly_data)
+        data = _timed("Step1 DB取得", fetch_from_bot_db)
         if not data["interactions"] and not data["moods"]:
             print("[ERROR] データが取得できませんでした")
             return
