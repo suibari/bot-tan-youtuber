@@ -183,7 +183,7 @@ def extract_emotions_from_script(script: str) -> tuple[str, list[tuple[str, str]
     return clean_script, matches  # タイミングはまだ計算しない
 
 
-def build_emotion_timeline(matches: list[tuple[str, str]], subtitles: list[dict]) -> list[dict]:
+def build_emotion_timeline(matches: list[tuple[str, str]], subtitles: list[dict]) -> tuple[list[dict], float]:
     """字幕タイミング確定後に感情タイムラインを生成する"""
     total_duration = subtitles[-1]["end"] if subtitles else 90
     total_chars = sum(len(text.strip()) for _, text in matches)
@@ -198,8 +198,11 @@ def build_emotion_timeline(matches: list[tuple[str, str]], subtitles: list[dict]
         })
         char_offset += len(text.strip())
 
-    print(f"[感情] {len(emotions)}件のタイムライン生成完了")
-    return emotions
+    # あいさつタイミング
+    wave_time = subtitles[-1]["start"] if subtitles else 0
+
+    print(f"[感情] {len(emotions)}件のタイムライン生成完了, waveTime: {wave_time}s")
+    return emotions, wave_time
 
 # ──────────────────────────────────────────────
 # Step 3: VOICEVOXで音声生成
@@ -634,12 +637,12 @@ def main():
         corners   = generate_corner_timing(clean_script, subtitles)
 
         # 感情タイムライン生成
-        emotions = build_emotion_timeline(emotion_matches, subtitles)
+        emotions, wave_time = build_emotion_timeline(emotion_matches, subtitles)
 
 		# 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
         with open(emotion_path, "w") as f:
-            json.dump(emotions, f, ensure_ascii=False)
+            json.dump({"emotions": emotions, "waveTime": wave_time}, f, ensure_ascii=False)
         print(f"[感情] 保存: {emotion_path}")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
