@@ -655,7 +655,10 @@ def main():
         # Step 6: YouTubeアップロード
         title = build_title()
         description = build_description()
-        _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description)
+        if os.getenv("SKIP_YOUTUBE") != "true":
+            _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description)
+        else:
+            print("[YouTube] スキップ (SKIP_YOUTUBE=true)")
 
         elapsed = time.time() - total_start
         print(f"\n✅ パイプライン完了: {mp4_path}  (合計: {elapsed:.1f}秒)")
