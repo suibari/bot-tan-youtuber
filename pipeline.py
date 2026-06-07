@@ -36,7 +36,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from prompts import SYSTEM_PROMPT, build_user_prompt
-from description import build_description
+from description import build_description, build_title
 
 # ──────────────────────────────────────────────
 # 設定
@@ -100,7 +100,7 @@ def fetch_weekly_data() -> dict:
                 FROM affirmative_bot.interaction
                 WHERE type = 'NormalReply'
                   AND (details->>'score')::int >= 88
-                  AND created_at >= NOW() - INTERVAL '7 days'
+                  AND created_at >= NOW() - INTERVAL '1 days'
                 ORDER BY score DESC
             """)
             interactions = cur.fetchall()
@@ -114,7 +114,7 @@ def fetch_weekly_data() -> dict:
                     energy,
                     created_at
                 FROM affirmative_bot.biorhythm_history
-                WHERE created_at >= NOW() - INTERVAL '7 days'
+                WHERE created_at >= NOW() - INTERVAL '1 days'
                 ORDER BY RANDOM()
             """)
             moods = cur.fetchall()
@@ -646,6 +646,7 @@ def main():
         _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners)
 
         # Step 6: YouTubeアップロード
+        title = build_title()
         description = build_description()
         _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description)
 
