@@ -90,7 +90,7 @@ def fetch_weekly_data() -> dict:
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-            # 今週のAIリプライ（スコアあり・ランダム3件）
+            # 今週のAIリプライ
             cur.execute("""
                 SELECT
                     did,
@@ -105,7 +105,7 @@ def fetch_weekly_data() -> dict:
             """)
             interactions = cur.fetchall()
 
-            # 今週エネルギーが最も高かった時のmood（1件）
+            # 今週エネルギー
             cur.execute("""
                 SELECT
                     status,
@@ -171,6 +171,35 @@ def generate_script(data: dict) -> str:
     script = response.choices[0].message.content.strip()
     print(f"[LLM] 台本生成完了:\n{script}\n")
     return script
+
+import re
+
+def extract_emotions_from_script(script: str) -> tuple[str, list[tuple[str, str]]]:
+    """台本からタグを抽出し、クリーン台本と(emotion, text)リストを返す"""
+    pattern = re.compile(r'\[(Happy|Sad|Angry|Surprised|Relaxed)\]([^\[]+)', re.DOTALL)
+    matches = pattern.findall(script)
+
+    clean_script = re.sub(r'\[(Happy|Sad|Angry|Surprised|Relaxed)\]', '', script).strip()
+    return clean_script, matches  # タイミングはまだ計算しない
+
+
+def build_emotion_timeline(matches: list[tuple[str, str]], subtitles: list[dict]) -> list[dict]:
+    """字幕タイミング確定後に感情タイムラインを生成する"""
+    total_duration = subtitles[-1]["end"] if subtitles else 90
+    total_chars = sum(len(text.strip()) for _, text in matches)
+
+    emotions = []
+    char_offset = 0
+    for emotion, text in matches:
+        ratio = char_offset / total_chars if total_chars > 0 else 0
+        emotions.append({
+            "time": round(total_duration * ratio, 2),
+            "emotion": emotion
+        })
+        char_offset += len(text.strip())
+
+    print(f"[感情] {len(emotions)}件のタイムライン生成完了")
+    return emotions
 
 # ──────────────────────────────────────────────
 # Step 3: VOICEVOXで音声生成
@@ -325,7 +354,7 @@ def _start_xvfb() -> tuple:
     raise RuntimeError("Xvfb: 空きディスプレイ番号が見つかりません (99-199)")
 
 
-def record_with_unity(wav_path: str, output_webm: str) -> None:
+def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> None:
     """Unityを起動してVRM口パク録画を行う"""
     print(f"[Unity] 録画開始...")
     # 既存のUnityプロセスを終了
@@ -349,6 +378,7 @@ def record_with_unity(wav_path: str, output_webm: str) -> None:
             "-projectPath", UNITY_PROJECT,
             "-wavFile", wav_path,
             "-outputFile", output_base,
+            "-emotionFile", emotion_path,
         ]
         print(f"[Unity] コマンド: {' '.join(cmd)}")
 
@@ -432,7 +462,6 @@ def finalize_video(input_webm: str, output_mp4: str,
             )
 
     # コーナーテロップフィルター追加
-    # コーナーテロップフィルター追加
     if corners:
         for corner in corners:
             start = corner["start"]
@@ -463,7 +492,7 @@ def finalize_video(input_webm: str, output_mp4: str,
     if BGM_PATH and Path(BGM_PATH).exists():
         cmd += ["-i", BGM_PATH,
                 "-filter_complex",
-                f"[0:v]{vf}[v];[1:a]volume=0.2[bgm];[0:a][bgm]amix=inputs=2:duration=first[a]",
+                f"[0:v]{vf}[v];[1:a]volume=0.05[bgm];[0:a][bgm]amix=inputs=2:duration=first[a]",
                 "-map", "[v]", "-map", "[a]"]
     else:
         cmd += ["-vf", vf]
@@ -582,19 +611,31 @@ def main():
             return
 
         # Step 2: 台本生成
-        script = _timed("Step2 台本生成", generate_script, data)
+        raw_script = _timed("Step2 台本生成", generate_script, data)
+
+        # Step 2.5: タグ抽出、クリーン台本作成
+        clean_script, emotion_matches = extract_emotions_from_script(raw_script)
 
         # Step 3: 音声生成
-        _timed("Step3 音声生成", generate_voice, script, wav_path)
+        _timed("Step3 音声生成", generate_voice, clean_script, wav_path)
 
-        # Step 3.5: 字幕タイミング生成
-        subtitles = generate_subtitle_timing(script)
-        corners   = generate_corner_timing(script, subtitles)
+        # Step 3.5: 字幕・コーナータイミング生成
+        subtitles = generate_subtitle_timing(clean_script)
+        corners   = generate_corner_timing(clean_script, subtitles)
+
+        # 感情タイムライン生成
+        emotions = build_emotion_timeline(emotion_matches, subtitles)
+
+		# 感情JSONファイル保存
+        emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
+        with open(emotion_path, "w") as f:
+            json.dump(emotions, f, ensure_ascii=False)
+        print(f"[感情] 保存: {emotion_path}")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
         for attempt in range(1, 4):
             try:
-                _timed(f"Step4 Unity録画 (試行{attempt})", record_with_unity, wav_path, webm_path)
+                _timed(f"Step4 Unity録画 (試行{attempt})", record_with_unity, wav_path, webm_path, emotion_path)
                 break
             except (RuntimeError, TimeoutError) as e:
                 if attempt == 3:

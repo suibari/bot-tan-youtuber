@@ -15,8 +15,15 @@ SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのAIキ�
 - セクション名・記号・説明文は一切含めない
 - 日本語のみで出力する
 - 接続詞「それから」「そして」の連続使用を避ける
-- 各セクションの間は1行空ける"""
+- 各セクションの間は1行空ける
 
+【感情タグルール】
+- 各文の先頭に感情タグを必ず付ける
+- 使用できるタグ: [Happy] [Sad] [Angry] [Surprised] [Relaxed]
+- 必ず1文に1タグ、文の先頭のみに付ける
+- タグと本文の間にスペースは入れない
+- 例: [Happy]やっほー！botたんだよ！
+- 台本テキスト以外は一切出力しない"""
 
 def build_user_prompt(data: dict, max_interactions: int = 30) -> str:
     moods = data["moods"][:20]
@@ -83,4 +90,5 @@ def build_user_prompt(data: dict, max_interactions: int = 30) -> str:
   - 「また来週ね」で終わる
 
 合計目安：300文字、90秒
-重要：②のコーナーでは必ず具体的な豆知識・考察を1つ入れること。"""
+重要：②のコーナーでは必ず具体的な豆知識・考察を1つ入れること。
+重要：すべての文の先頭に [Happy] [Sad] [Angry] [Surprised] [Relaxed] のいずれかを付けること。"""
