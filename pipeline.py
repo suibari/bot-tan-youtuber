@@ -584,11 +584,32 @@ def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
             if status:
                 print(f"[YouTube] アップロード進捗: {int(status.progress() * 100)}%")
 
-        print(f"[YouTube] アップロード完了: https://youtube.com/watch?v={response['id']}")
+        url = f"https://youtube.com/watch?v={response['id']}"
+        print(f"[YouTube] アップロード完了: {url}")
+        return url
 
     except ImportError:
         print("[YouTube] google-api-python-client未インストール。スキップします。")
         print("pip install google-api-python-client google-auth-oauthlib")
+
+def save_youtube_upload_to_db(url: str, title: str) -> None:
+    """YouTube投稿情報をDBのyoutube_shortsテーブルに記録する"""
+    print(f"[DB] YouTube投稿情報を記録中: {url}")
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO affirmative_bot.youtube_shorts (url, title, status)
+                VALUES (%s, %s, 'new')
+                ON CONFLICT (url) DO NOTHING
+                """,
+                (url, title),
+            )
+        conn.commit()
+        print("[DB] youtube_shorts に記録完了")
+    finally:
+        conn.close()
 
 def _timed(label, fn, *args):
     import time
@@ -681,7 +702,9 @@ def main():
         title = build_title()
         description = build_description()
         if os.getenv("SKIP_YOUTUBE") != "true":
-            _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description)
+            yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description)
+            if yt_url:
+                save_youtube_upload_to_db(yt_url, title)
         else:
             print("[YouTube] スキップ (SKIP_YOUTUBE=true)")
 
