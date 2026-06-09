@@ -29,4 +29,4 @@ https://maou.audio
 
 def build_title() -> str:
     date_label = datetime.now().strftime("%Y/%m/%d")
-    return f"botたんの青空ニュース! {date_label}"
+    return f"botたんの全肯定ニュース! {date_label}"
