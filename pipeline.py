@@ -264,13 +264,14 @@ def generate_subtitle_timing(script: str) -> list[dict]:
             current_time += duration
 
     total_duration = current_time + float(query.get("postPhonemeLength", 0.1))
+    n_moras = len(mora_times)
 
     # 台本を句読点・改行で文に分割
     import re
     sentences = re.split(r"(?<=[。！？\n])", script)
     sentences = [s.strip() for s in sentences if s.strip()]
 
-    # 各文にタイミングを割り当て（文字数比率で按分）
+    # 各文にタイミングを割り当て（モーラタイミングを基準に按分）
     total_chars = sum(len(s) for s in sentences)
     subtitles = []
     char_offset = 0
@@ -281,20 +282,23 @@ def generate_subtitle_timing(script: str) -> list[dict]:
         # 分割後も15文字超えるものはさらに分割
         final_chunks = []
         for chunk in chunks:
-            if len(chunk) <= 18:
+            if len(chunk) <= 15:
                 final_chunks.append(chunk)
             else:
-                for i in range(0, len(chunk), 18):
-                    final_chunks.append(chunk[i:i+18])
+                for i in range(0, len(chunk), 15):
+                    final_chunks.append(chunk[i:i+15])
 
         for chunk in final_chunks:
-            chunk_ratio_start = char_offset / total_chars
-            chunk_ratio_end   = (char_offset + len(chunk)) / total_chars
-            subtitles.append({
-                "start": round(total_duration * chunk_ratio_start, 3),
-                "end":   round(total_duration * chunk_ratio_end + 0.05, 3),
-                "text":  chunk
-            })
+            if n_moras > 0 and total_chars > 0:
+                # モーラタイミングを使って実際の発音タイミングに対応
+                s_idx = min(int(char_offset * n_moras / total_chars), n_moras - 1)
+                e_idx = min(int((char_offset + len(chunk)) * n_moras / total_chars), n_moras - 1)
+                start_t = mora_times[s_idx]["start"]
+                end_t   = mora_times[e_idx]["start"] + mora_times[e_idx]["duration"] + 0.1
+            else:
+                start_t = total_duration * (char_offset / max(total_chars, 1))
+                end_t   = total_duration * ((char_offset + len(chunk)) / max(total_chars, 1)) + 0.1
+            subtitles.append({"start": round(start_t, 3), "end": round(end_t, 3), "text": chunk})
             char_offset += len(chunk)
 
     print(f"[字幕] {len(subtitles)}ブロック生成完了")
@@ -311,7 +315,7 @@ def generate_corner_timing(script: str, subtitles: list[dict]) -> list[dict]:
     section_keywords = {
         "挨拶": ("やっほー！botたんだよ", "#0085ff"),
         "全肯定コーナー": ("こんなとこにも全肯定コーナー", "#ff6b9d"),
-        "Bluesky": ("今週のBluesky", "#0085ff"),
+        "Bluesky": ("今日のBluesky", "#0085ff"),
         "締め": ("全肯定メッセージ", "#7ec8e3"),
     }
 
