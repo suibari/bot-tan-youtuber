@@ -8,14 +8,19 @@ def build_description() -> str:
 
 ━━━━━━━━━━━━━━━━━━
 👧 全肯定botたんとは？
-Bluesky SNSで活動中の、みんなを励ますのが大好きなJKです。
-リプライするとなんでも全肯定してくれます。目指せフォロワー2万人！
-
-🌐 Blueskyはこちら
-https://bsky.app/profile/bot-tan.suibari.com
-💬 フォローすると全肯定リプライが届きます！
-
+SNSで活動中の、みんなを励ますのが大好きなJKです
+リプライするとなんでも全肯定してくれます
 https://suibari.com/character
+
+🌐 Blueskyアカウントはこちら
+botたんの活動場所です
+フォローすると全肯定リプライが届きます！💬
+https://bsky.app/profile/bot-tan.suibari.com
+
+😎 本プロジェクトについてはこちら
+世界中を全肯定したい！
+全肯定botたんは開発者すいばりが運営しています
+https://note.com/suibari/n/n36e699f32479
 ━━━━━━━━━━━━━━━━━━
 #botたん #全肯定 #Bluesky #VTuber
 

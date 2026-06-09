@@ -182,7 +182,8 @@ def extract_emotions_from_script(script: str) -> tuple[str, list[tuple[str, str]
     pattern = re.compile(r'\[(Happy|Sad|Angry|Surprised|Relaxed)\]([^\[]+)', re.DOTALL)
     matches = pattern.findall(script)
 
-    clean_script = re.sub(r'\[(Happy|Sad|Angry|Surprised|Relaxed)\]', '', script).strip()
+    clean_script = re.sub(r'\[(Happy|Sad|Angry|Surprised|Relaxed)\]', '', script)
+    clean_script = re.sub(r'\[[^\]]*\]', '', clean_script).strip()  # [Study][SelfAffirmationCorner]等の残留タグを除去
     return clean_script, matches  # タイミングはまだ計算しない
 
 
@@ -392,31 +393,69 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict
     return subtitles
 
 
-def generate_corner_timing(script: str, subtitles: list[dict], intro_duration: float = 0.0) -> list[dict]:
-    """台本からコーナー名と表示タイミングを推定する"""
-    corners = []
+SECTION_TAGS = ['Thumbnail', 'FirstGreeting', 'SelfAffirmationCorner', 'BlueskySelfAffirmationCorner', 'Closing']
+
+
+def extract_section_starts(raw_script: str) -> dict[str, str]:
+    """セクションタグ直後の発話テキスト先頭8文字を返す（字幕検索キーワード用）"""
+    result = {}
+    tags_pattern = '|'.join(SECTION_TAGS)
+    section_re = re.compile(
+        r'\[(' + tags_pattern + r')\](.*?)(?=\[(?:' + tags_pattern + r')\]|---THUMBNAIL---|$)',
+        re.DOTALL
+    )
+    for m in section_re.finditer(raw_script):
+        tag = m.group(1)
+        text = re.sub(r'\[[^\]]*\]', '', m.group(2)).strip()
+        if text:
+            result[tag] = text[:8]
+    return result
+
+
+def _find_subtitle_time(subtitles: list[dict], keyword: str, start_from: float = 0.0) -> float | None:
+    """keyword を含む最初の字幕の start を返す。見つからなければ None。"""
+    for sub in subtitles:
+        if sub["start"] >= start_from and keyword in sub["text"]:
+            return sub["start"]
+    return None
+
+
+def generate_corner_timing(
+    script: str,
+    subtitles: list[dict],
+    intro_duration: float = 0.0,
+    section_starts: dict[str, str] = None,
+) -> list[dict]:
+    """セクションタグで確定したタイミングでコーナーラベルを生成する"""
+    corner_meta = [
+        ('FirstGreeting', "やっほー！botたんだよ", "#0085ff"),
+        ('SelfAffirmationCorner',        "こんなとこにも全肯定コーナー", "#ff6b9d"),
+        ('BlueskySelfAffirmationCorner', "今日のBluesky", "#0085ff"),
+        ('Closing',       "全肯定メッセージ", "#7ec8e3"),
+    ]
     total_duration = subtitles[-1]["end"] if subtitles else 90
 
-    # 台本を行に分割してセクションを推定
-    lines = [l.strip() for l in script.split("\n") if l.strip()]
-    section_keywords = {
-        "挨拶": ("やっほー！botたんだよ", "#0085ff"),
-        "全肯定コーナー": ("こんなとこにも全肯定コーナー", "#ff6b9d"),
-        "Bluesky": ("今日のBluesky", "#0085ff"),
-        "締め": ("全肯定メッセージ", "#7ec8e3"),
-    }
+    resolved_starts = []
+    search_from = intro_duration
+    for tag, _label, _color in corner_meta:
+        keyword = (section_starts or {}).get(tag)
+        t = _find_subtitle_time(subtitles, keyword, start_from=search_from) if keyword else None
+        if t is not None:
+            print(f"[コーナー] {tag}: '{keyword}' → {t}s")
+            search_from = t + 0.01
+        else:
+            print(f"[コーナー] {tag}: キーワード未検出、フォールバック使用")
+        resolved_starts.append(t)
 
-    # 簡易的にdurationを4等分して各コーナーを割り当て（intro_durationでオフセット）
+    # フォールバック: 見つからないセクションは4等分で補完
     body_duration = total_duration - intro_duration
     quarter = body_duration / 4
-    corner_list = list(section_keywords.values())
-    for idx, (label, color) in enumerate(corner_list):
-        corners.append({
-            "start": round(quarter * idx       + intro_duration, 3),
-            "end":   round(quarter * (idx + 1) + intro_duration, 3),
-            "label": label,
-            "color": color,
-        })
+    corners = []
+    for i, (_tag, label, color) in enumerate(corner_meta):
+        start = resolved_starts[i] if resolved_starts[i] is not None else round(quarter * i + intro_duration, 3)
+        next_start = next((resolved_starts[j] for j in range(i + 1, len(resolved_starts)) if resolved_starts[j] is not None), None)
+        end = next_start if next_start is not None else total_duration
+        corners.append({"start": round(start, 3), "end": round(end, 3), "label": label, "color": color})
 
     return corners
 
@@ -785,6 +824,8 @@ def main():
 
         # Step 2.5: タグ抽出、クリーン台本作成
         raw_script, thumbnail_text, thumbnail_in_script = extract_thumbnail_text(raw_script)
+        section_starts = extract_section_starts(raw_script)  # セクションタグ除去前に抽出
+        print(f"[セクション] 検出: {section_starts}")
         clean_script, emotion_matches = extract_emotions_from_script(raw_script)
 
         # 冒頭一言（thumbnail_text）をclean_scriptの先頭から除去してmain_scriptを作る
@@ -809,19 +850,31 @@ def main():
         subtitles = generate_subtitle_timing(main_script, time_offset=intro_duration)
         if intro_duration > 0:
             subtitles = [{"start": 0.0, "end": round(intro_duration, 3), "text": thumbnail_text}] + subtitles
-        corners   = generate_corner_timing(main_script, subtitles, intro_duration)
+        corners   = generate_corner_timing(main_script, subtitles, intro_duration, section_starts)
 
         # 感情タイムライン生成
         emotions, wave_time = build_emotion_timeline(emotion_matches, subtitles, intro_duration)
 
-        # BlueskyコーナーのDoThankful発火時刻（corners index 2 = 「今日のBluesky」）
-        thankful_time = corners[2]["start"] if len(corners) > 2 else 0.0
+        # トリガー発火時刻を字幕から算出
+        # DoGreeting①: ②挨拶末尾の「botたんだよ」発話タイミング（セクション先頭ではなく末尾）
+        greeting_time1 = _find_subtitle_time(subtitles, "botたんだよ") or 0.0
+        # DoGreeting②・DoThankful: ⑤締めセクション内に限定して検索（誤マッチ防止）
+        closing_start = corners[3]["start"] if len(corners) >= 4 else 0.0
+        greeting_time2 = _find_subtitle_time(subtitles, "フォロー", start_from=closing_start) or 0.0
+        thankful_time  = _find_subtitle_time(subtitles, "高評価",   start_from=closing_start) or 0.0
+        print(f"[トリガー] greetingTime1: {greeting_time1}s, greetingTime2: {greeting_time2}s, thankfulTime: {thankful_time}s")
 
         # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
         with open(emotion_path, "w") as f:
-            json.dump({"emotions": emotions, "waveTime": wave_time, "thankfulTime": thankful_time}, f, ensure_ascii=False)
-        print(f"[感情] 保存: {emotion_path} (thankfulTime: {thankful_time}s)")
+            json.dump({
+                "emotions":      emotions,
+                "waveTime":      wave_time,
+                "thankfulTime":  thankful_time,
+                "greetingTime1": greeting_time1,
+                "greetingTime2": greeting_time2,
+            }, f, ensure_ascii=False)
+        print(f"[感情] 保存: {emotion_path}")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
         _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path, screenshot_path,

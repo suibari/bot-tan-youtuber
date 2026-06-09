@@ -30,6 +30,12 @@ public class VRM1LipSync : MonoBehaviour
     private float _thankfulTime = 0f;
     private bool  _thankfulFired = false;
 
+    // Greetingタイムライン
+    private float _greetingTime1 = 0f;
+    private float _greetingTime2 = 0f;
+    private bool  _greetingFired1 = false;
+    private bool  _greetingFired2 = false;
+
     [System.Serializable]
     private class EmotionEntry
     {
@@ -59,10 +65,12 @@ public class VRM1LipSync : MonoBehaviour
         }
         string json = File.ReadAllText(emotionFile);
         var data = JsonUtility.FromJson<EmotionData>(json);
-        _emotions     = new List<EmotionEntry>(data.emotions);
-        _waveTime     = data.waveTime;
-        _thankfulTime = data.thankfulTime;
-        Debug.Log($"[LipSync] 感情タイムライン: {_emotions.Count}件, waveTime: {_waveTime}s, thankfulTime: {_thankfulTime}s");
+        _emotions      = new List<EmotionEntry>(data.emotions);
+        _waveTime      = data.waveTime;
+        _thankfulTime  = data.thankfulTime;
+        _greetingTime1 = data.greetingTime1;
+        _greetingTime2 = data.greetingTime2;
+        Debug.Log($"[LipSync] 感情タイムライン: {_emotions.Count}件, waveTime: {_waveTime}s, thankfulTime: {_thankfulTime}s, greetingTime1: {_greetingTime1}s, greetingTime2: {_greetingTime2}s");
     }
 
     [System.Serializable]
@@ -71,6 +79,8 @@ public class VRM1LipSync : MonoBehaviour
         public EmotionEntry[] emotions;
         public float waveTime;
         public float thankfulTime;
+        public float greetingTime1;
+        public float greetingTime2;
     }
 
     string GetArg(string name)
@@ -127,7 +137,27 @@ public class VRM1LipSync : MonoBehaviour
             return;
         }
 
-        // BlueskyコーナーDoThankful発火
+        // 挨拶DoGreeting発火（「botたんだよ！」発話タイミング）
+        if (!_greetingFired1 && _greetingTime1 > 0 && _audioSource.isPlaying
+            && _audioSource.time >= _greetingTime1)
+        {
+            var animator = GetComponentInParent<Animator>();
+            if (animator != null) animator.SetTrigger("DoGreeting");
+            _greetingFired1 = true;
+            Debug.Log($"[LipSync] DoGreeting1発火: {_audioSource.time}s");
+        }
+
+        // フォローDoGreeting発火
+        if (!_greetingFired2 && _greetingTime2 > 0 && _audioSource.isPlaying
+            && _audioSource.time >= _greetingTime2)
+        {
+            var animator = GetComponentInParent<Animator>();
+            if (animator != null) animator.SetTrigger("DoGreeting");
+            _greetingFired2 = true;
+            Debug.Log($"[LipSync] DoGreeting2発火: {_audioSource.time}s");
+        }
+
+        // DoThankful発火（「高評価・チャンネル登録・コメント」発話タイミング）
         if (!_thankfulFired && _thankfulTime > 0 && _audioSource.isPlaying
             && _audioSource.time >= _thankfulTime)
         {
