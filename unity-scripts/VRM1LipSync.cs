@@ -26,6 +26,10 @@ public class VRM1LipSync : MonoBehaviour
     private float _waveTime = 0f;
     private bool  _waveFired = false;
 
+    // Thankfulタイムライン
+    private float _thankfulTime = 0f;
+    private bool  _thankfulFired = false;
+
     [System.Serializable]
     private class EmotionEntry
     {
@@ -55,9 +59,10 @@ public class VRM1LipSync : MonoBehaviour
         }
         string json = File.ReadAllText(emotionFile);
         var data = JsonUtility.FromJson<EmotionData>(json);
-        _emotions = new List<EmotionEntry>(data.emotions);
-        _waveTime = data.waveTime;
-        Debug.Log($"[LipSync] 感情タイムライン: {_emotions.Count}件, waveTime: {_waveTime}s");
+        _emotions     = new List<EmotionEntry>(data.emotions);
+        _waveTime     = data.waveTime;
+        _thankfulTime = data.thankfulTime;
+        Debug.Log($"[LipSync] 感情タイムライン: {_emotions.Count}件, waveTime: {_waveTime}s, thankfulTime: {_thankfulTime}s");
     }
 
     [System.Serializable]
@@ -65,6 +70,7 @@ public class VRM1LipSync : MonoBehaviour
     {
         public EmotionEntry[] emotions;
         public float waveTime;
+        public float thankfulTime;
     }
 
     string GetArg(string name)
@@ -119,6 +125,16 @@ public class VRM1LipSync : MonoBehaviour
             _currentWeight = Mathf.Lerp(_currentWeight, 0f, Time.deltaTime / smoothing);
             _expression.SetWeight(ExpressionKey.Aa, _currentWeight);
             return;
+        }
+
+        // BlueskyコーナーDoThankful発火
+        if (!_thankfulFired && _thankfulTime > 0 && _audioSource.isPlaying
+            && _audioSource.time >= _thankfulTime)
+        {
+            var animator = GetComponentInParent<Animator>();
+            if (animator != null) animator.SetTrigger("DoThankful");
+            _thankfulFired = true;
+            Debug.Log($"[LipSync] DoThankful発火: {_audioSource.time}s");
         }
 
         // 締めWaving発火

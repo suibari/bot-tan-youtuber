@@ -814,11 +814,14 @@ def main():
         # 感情タイムライン生成
         emotions, wave_time = build_emotion_timeline(emotion_matches, subtitles, intro_duration)
 
+        # BlueskyコーナーのDoThankful発火時刻（corners index 2 = 「今日のBluesky」）
+        thankful_time = corners[2]["start"] if len(corners) > 2 else 0.0
+
         # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
         with open(emotion_path, "w") as f:
-            json.dump({"emotions": emotions, "waveTime": wave_time}, f, ensure_ascii=False)
-        print(f"[感情] 保存: {emotion_path}")
+            json.dump({"emotions": emotions, "waveTime": wave_time, "thankfulTime": thankful_time}, f, ensure_ascii=False)
+        print(f"[感情] 保存: {emotion_path} (thankfulTime: {thankful_time}s)")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
         _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path, screenshot_path,
