@@ -38,6 +38,8 @@ load_dotenv()
 from prompts import SYSTEM_PROMPT, build_user_prompt
 from description import build_description, build_title
 
+from thumbnail import capture_thumbnail_frame, generate_thumbnail
+
 # ──────────────────────────────────────────────
 # 設定
 # ──────────────────────────────────────────────
@@ -205,6 +207,19 @@ def build_emotion_timeline(matches: list[tuple[str, str]], subtitles: list[dict]
     print(f"[感情] {len(emotions)}件のタイムライン生成完了, waveTime: {wave_time}s")
     return emotions, wave_time
 
+def extract_thumbnail_text(raw_script: str) -> tuple[str, str]:
+    """台本からサムネイル一言を抽出する"""
+    if "---THUMBNAIL---" in raw_script:
+        parts = raw_script.split("---THUMBNAIL---", 1)
+        script = parts[0].strip()
+        thumbnail_text = parts[1].strip()
+        print(f"[サムネイル] 一言: {thumbnail_text}")
+    else:
+        print("[サムネイル] 一言なし、デフォルト使用")
+        script = raw_script
+        thumbnail_text = "今日も全肯定だよ！"
+    return script, thumbnail_text
+
 # ──────────────────────────────────────────────
 # Step 3: VOICEVOXで音声生成
 # ──────────────────────────────────────────────
@@ -362,7 +377,7 @@ def _start_xvfb() -> tuple:
     raise RuntimeError("Xvfb: 空きディスプレイ番号が見つかりません (99-199)")
 
 
-def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> None:
+def record_with_unity(wav_path: str, output_webm: str, emotion_path: str, screenshot_path: str) -> None:
     """Unityを起動してVRM口パク録画を行う"""
     print(f"[Unity] 録画開始...")
     # 既存のUnityプロセスを終了
@@ -387,6 +402,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> Non
             "-wavFile", wav_path,
             "-outputFile", output_base,
             "-emotionFile", emotion_path,
+            "-screenshotFile", screenshot_path,
         ]
         print(f"[Unity] コマンド: {' '.join(cmd)}")
 
@@ -424,6 +440,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> Non
             raise FileNotFoundError(f"録画ファイルが見つかりません: {output_webm}")
 
         print(f"[Unity] 録画完了: {output_webm}")
+        time.sleep(5)  # GPU メモリ解放待ち
 
     finally:
         if xvfb_proc and xvfb_proc.poll() is None:
@@ -506,7 +523,9 @@ def finalize_video(input_webm: str, output_mp4: str,
         cmd += ["-vf", vf]
 
     cmd += [
-        "-c:v", "h264_nvenc",
+        # "-c:v", "h264_nvenc", #NOTE: UnityスクショとGPUエンコードは両立不可
+        "-c:v", "libx264",
+        "-preset", "fast",
         "-c:a", "aac",
         "-shortest",
         output_mp4
@@ -519,7 +538,7 @@ def finalize_video(input_webm: str, output_mp4: str,
 # Step 6: YouTubeにアップロード
 # ──────────────────────────────────────────────
 
-def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
+def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_path: str = "") -> None:
     """YouTube Data API v3で動画をアップロードする"""
     print(f"[YouTube] アップロード中: {title}")
     try:
@@ -584,7 +603,17 @@ def upload_to_youtube(mp4_path: str, title: str, description: str) -> None:
             if status:
                 print(f"[YouTube] アップロード進捗: {int(status.progress() * 100)}%")
 
-        url = f"https://youtube.com/watch?v={response['id']}"
+        video_id = response['id']
+
+        # サムネイル設定
+        if thumbnail_path and Path(thumbnail_path).exists():
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(thumbnail_path, mimetype="image/png")
+            ).execute()
+            print(f"[YouTube] サムネイル設定完了")
+
+        url = f"https://youtube.com/watch?v={video_id}"
         print(f"[YouTube] アップロード完了: {url}")
         return url
 
@@ -651,6 +680,7 @@ def main():
     wav_path    = str(tmp_dir / f"bottan_{ts}.wav")
     webm_path   = str(tmp_dir / f"bottan_{ts}.webm")
     mp4_path    = str(tmp_dir / f"bottan_{ts}.mp4")
+    screenshot_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
 
     date_label  = datetime.now().strftime("%Y/%m/%d")
     title       = f"botたんの今週のひとこと {date_label}"
@@ -673,6 +703,7 @@ def main():
             raw_script = _timed("Step2 台本生成", generate_script, data)
 
         # Step 2.5: タグ抽出、クリーン台本作成
+        raw_script, thumbnail_text = extract_thumbnail_text(raw_script)
         clean_script, emotion_matches = extract_emotions_from_script(raw_script)
 
         # Step 3: 音声生成
@@ -692,8 +723,12 @@ def main():
         print(f"[感情] 保存: {emotion_path}")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
-        _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
+        _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path, screenshot_path,
                catch=(RuntimeError, TimeoutError))
+
+        # サムネ作成
+        thumbnail_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
+        generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
 
         # Step 5: MP4変換
         _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners)
@@ -702,7 +737,7 @@ def main():
         title = build_title()
         description = build_description()
         if os.getenv("SKIP_YOUTUBE") != "true":
-            yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description)
+            yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description, thumbnail_path)
             if yt_url:
                 save_youtube_upload_to_db(yt_url, title)
         else:

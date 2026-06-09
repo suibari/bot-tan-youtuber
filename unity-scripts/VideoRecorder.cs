@@ -41,6 +41,7 @@ public class VideoRecorderAutoPlay
 public class VideoRecorder : MonoBehaviour
 {
     [SerializeField] private AudioSource audioSource;
+    [SerializeField] private string screenshotPath = "";
 
     void Start()
     {
@@ -53,6 +54,23 @@ public class VideoRecorder : MonoBehaviour
 
     IEnumerator RecordVideo(string wavPath, string outputPath)
     {
+        // スクリーンショットパスを引数から取得
+        screenshotPath = VideoRecorderAutoPlay.GetArg("-screenshotFile") ?? "";
+
+        if (!string.IsNullOrEmpty(wavPath) && File.Exists(wavPath))
+        {
+            yield return StartCoroutine(LoadAudioClip(wavPath));
+        }
+
+        // スクリーンショット撮影（録画開始前）
+        if (!string.IsNullOrEmpty(screenshotPath))
+        {
+            yield return new WaitForEndOfFrame();
+            ScreenCapture.CaptureScreenshot(screenshotPath);
+            yield return new WaitForSeconds(0.5f); // 書き込み待ち
+            Debug.Log($"[Screenshot] 保存: {screenshotPath}");
+        }
+
         if (!string.IsNullOrEmpty(wavPath) && File.Exists(wavPath))
         {
             yield return StartCoroutine(LoadAudioClip(wavPath));
