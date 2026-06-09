@@ -23,8 +23,6 @@ public class VRM1LipSync : MonoBehaviour
     private ExpressionKey _currentEmotion = ExpressionKey.Happy;
 
     // Waveタイムライン
-    private float _introWaveTime = 0f;
-    private bool  _introWaveFired = false;
     private float _waveTime = 0f;
     private bool  _waveFired = false;
 
@@ -58,16 +56,14 @@ public class VRM1LipSync : MonoBehaviour
         string json = File.ReadAllText(emotionFile);
         var data = JsonUtility.FromJson<EmotionData>(json);
         _emotions = new List<EmotionEntry>(data.emotions);
-        _introWaveTime = data.introWaveTime;
         _waveTime = data.waveTime;
-        Debug.Log($"[LipSync] 感情タイムライン: {_emotions.Count}件, introWaveTime: {_introWaveTime}s, waveTime: {_waveTime}s");
+        Debug.Log($"[LipSync] 感情タイムライン: {_emotions.Count}件, waveTime: {_waveTime}s");
     }
 
     [System.Serializable]
     private class EmotionData
     {
         public EmotionEntry[] emotions;
-        public float introWaveTime;
         public float waveTime;
     }
 
@@ -123,16 +119,6 @@ public class VRM1LipSync : MonoBehaviour
             _currentWeight = Mathf.Lerp(_currentWeight, 0f, Time.deltaTime / smoothing);
             _expression.SetWeight(ExpressionKey.Aa, _currentWeight);
             return;
-        }
-
-        // 冒頭Waving発火（冒頭一言終了 → 挨拶アニメへ）
-        if (!_introWaveFired && _introWaveTime > 0 && _audioSource.isPlaying
-            && _audioSource.time >= _introWaveTime)
-        {
-            var animator = GetComponentInParent<Animator>();
-            if (animator != null) animator.SetTrigger("DoWave");
-            _introWaveFired = true;
-            Debug.Log($"[LipSync] 冒頭DoWave発火: {_audioSource.time}s");
         }
 
         // 締めWaving発火

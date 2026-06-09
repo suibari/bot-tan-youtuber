@@ -190,9 +190,9 @@ def build_emotion_timeline(
     matches: list[tuple[str, str]],
     subtitles: list[dict],
     intro_duration: float = 0.0
-) -> tuple[list[dict], float, float]:
+) -> tuple[list[dict], float]:
     """字幕タイミング確定後に感情タイムラインを生成する
-    戻り値: (emotions, intro_wave_time, wave_time)
+    戻り値: (emotions, wave_time)
     """
     total_duration = subtitles[-1]["end"] if subtitles else 90
     total_chars = sum(len(text.strip()) for _, text in matches)
@@ -207,11 +207,10 @@ def build_emotion_timeline(
         })
         char_offset += len(text.strip())
 
-    intro_wave_time = intro_duration
     wave_time = subtitles[-1]["start"] if subtitles else 0
 
-    print(f"[感情] {len(emotions)}件のタイムライン生成完了, introWaveTime: {intro_wave_time}s, waveTime: {wave_time}s")
-    return emotions, intro_wave_time, wave_time
+    print(f"[感情] {len(emotions)}件のタイムライン生成完了, waveTime: {wave_time}s")
+    return emotions, wave_time
 
 def extract_thumbnail_text(raw_script: str) -> tuple[str, str, bool]:
     """台本からサムネイル一言を抽出する。戻り値: (script, thumbnail_text, in_script)"""
@@ -813,12 +812,12 @@ def main():
         corners   = generate_corner_timing(main_script, subtitles, intro_duration)
 
         # 感情タイムライン生成
-        emotions, intro_wave_time, wave_time = build_emotion_timeline(emotion_matches, subtitles, intro_duration)
+        emotions, wave_time = build_emotion_timeline(emotion_matches, subtitles, intro_duration)
 
         # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
         with open(emotion_path, "w") as f:
-            json.dump({"emotions": emotions, "introWaveTime": intro_wave_time, "waveTime": wave_time}, f, ensure_ascii=False)
+            json.dump({"emotions": emotions, "waveTime": wave_time}, f, ensure_ascii=False)
         print(f"[感情] 保存: {emotion_path}")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
