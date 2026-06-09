@@ -297,47 +297,67 @@ def generate_voice(script: str, output_path: str, intro_text: str = "") -> None:
 # Step 3.5: 字幕タイミング生成
 # ──────────────────────────────────────────────
 
-def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict]:
-    """VOICEVOXのaudio_queryからタイミングを取得し、元のテキストで字幕データを生成する"""
-    print("[字幕] タイミング情報取得中...")
-
-    query_res = requests.post(
+def _query_mora_times(text: str) -> tuple[list[dict], float]:
+    """audio_queryからモーラタイミングリストと総尺(秒)を返す"""
+    res = requests.post(
         f"{VOICEVOX_URL}/audio_query",
-        params={"text": script, "speaker": VOICEVOX_SPEAKER}
+        params={"text": text, "speaker": VOICEVOX_SPEAKER}
     )
-    query_res.raise_for_status()
-    query = query_res.json()
+    res.raise_for_status()
+    query = res.json()
 
-    # モーラの総時間を積算
-    current_time = float(query.get("prePhonemeLength", 0.1))
+    t = float(query.get("prePhonemeLength", 0.1))
     mora_times = []
     for phrase in query["accent_phrases"]:
         for mora in phrase["moras"]:
-            duration = (mora.get("consonant_length") or 0) + (mora.get("vowel_length") or 0)
-            mora_times.append({"start": current_time, "duration": duration})
-            current_time += duration
+            dur = (mora.get("consonant_length") or 0) + (mora.get("vowel_length") or 0)
+            mora_times.append({"start": t, "duration": dur})
+            t += dur
         if phrase.get("pause_mora"):
-            pause = phrase["pause_mora"]
-            duration = (pause.get("consonant_length") or 0) + (pause.get("vowel_length") or 0)
-            current_time += duration
+            p = phrase["pause_mora"]
+            t += (p.get("consonant_length") or 0) + (p.get("vowel_length") or 0)
+    total = t + float(query.get("postPhonemeLength", 0.1))
+    return mora_times, total
 
-    total_duration = current_time + float(query.get("postPhonemeLength", 0.1))
-    n_moras = len(mora_times)
+
+def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict]:
+    """文ごとにaudio_queryを発行してタイミングを取得し、字幕データを生成する。
+
+    文単位で独立したモーラ計測を行うことで、漢字とかなの混在による
+    文字数比率ずれを排除する。
+    """
+    import re
+    print("[字幕] タイミング情報取得中...")
+
+    # フルスクリプトのクエリで合計尺を取得（スケーリング基準）
+    _, total_duration = _query_mora_times(script)
 
     # 台本を句読点・改行で文に分割
-    import re
     sentences = re.split(r"(?<=[。！？\n])", script)
     sentences = [s.strip() for s in sentences if s.strip()]
 
-    # 各文にタイミングを割り当て（モーラタイミングを基準に按分）
-    total_chars = sum(len(s) for s in sentences)
-    subtitles = []
-    char_offset = 0
+    # 各文のモーラタイミングと尺を取得
+    sentence_data = []
     for sentence in sentences:
-        # 読点・中点でさらに分割
+        mora_times, sent_dur = _query_mora_times(sentence)
+        sentence_data.append((sentence, mora_times, sent_dur))
+
+    # 文ごとの尺の合計をフルスクリプトの合計尺にスケーリング
+    # （文ごとクエリはprePhoneme/postPhonemeが各文に付くため合計が実際より長くなる）
+    total_sent = sum(d for _, _, d in sentence_data)
+    scale = total_duration / total_sent if total_sent > 0 else 1.0
+
+    subtitles = []
+    current_time = 0.0
+
+    for sentence, sent_moras, sent_dur in sentence_data:
+        scaled_dur = sent_dur * scale
+        n_sent_moras = len(sent_moras)
+        mora_scale = scaled_dur / sent_dur if sent_dur > 0 else 1.0
+
+        # 読点・中点でさらに分割 → 15文字上限チャンク
         chunks = re.split(r"(?<=[、,，・])", sentence)
         chunks = [c for c in chunks if c.strip()]
-        # 分割後も15文字超えるものはさらに分割
         final_chunks = []
         for chunk in chunks:
             if len(chunk) <= 15:
@@ -346,18 +366,28 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict
                 for i in range(0, len(chunk), 15):
                     final_chunks.append(chunk[i:i+15])
 
+        sentence_chars = sum(len(c) for c in final_chunks)
+        char_offset = 0
+
         for chunk in final_chunks:
-            if n_moras > 0 and total_chars > 0:
-                # モーラタイミングを使って実際の発音タイミングに対応
-                s_idx = min(int(char_offset * n_moras / total_chars), n_moras - 1)
-                e_idx = min(int((char_offset + len(chunk)) * n_moras / total_chars), n_moras - 1)
-                start_t = mora_times[s_idx]["start"]
-                end_t   = mora_times[e_idx]["start"] + mora_times[e_idx]["duration"] + 0.1
+            if n_sent_moras > 0 and sentence_chars > 0:
+                s_idx = min(int(char_offset * n_sent_moras / sentence_chars), n_sent_moras - 1)
+                e_idx = min(int((char_offset + len(chunk)) * n_sent_moras / sentence_chars), n_sent_moras - 1)
+                start_t = current_time + sent_moras[s_idx]["start"] * mora_scale
+                end_t   = current_time + (sent_moras[e_idx]["start"] + sent_moras[e_idx]["duration"]) * mora_scale + 0.05
             else:
-                start_t = total_duration * (char_offset / max(total_chars, 1))
-                end_t   = total_duration * ((char_offset + len(chunk)) / max(total_chars, 1)) + 0.1
-            subtitles.append({"start": round(start_t + time_offset, 3), "end": round(end_t + time_offset, 3), "text": chunk})
+                ratio_s = char_offset / max(sentence_chars, 1)
+                ratio_e = (char_offset + len(chunk)) / max(sentence_chars, 1)
+                start_t = current_time + ratio_s * scaled_dur
+                end_t   = current_time + ratio_e * scaled_dur + 0.05
+            subtitles.append({
+                "start": round(start_t + time_offset, 3),
+                "end":   round(end_t   + time_offset, 3),
+                "text":  chunk,
+            })
             char_offset += len(chunk)
+
+        current_time += scaled_dur
 
     print(f"[字幕] {len(subtitles)}ブロック生成完了")
     return subtitles
