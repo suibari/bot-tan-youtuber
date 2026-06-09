@@ -23,8 +23,10 @@ public class VRM1LipSync : MonoBehaviour
     private ExpressionKey _currentEmotion = ExpressionKey.Happy;
 
     // Waveタイムライン
+    private float _introWaveTime = 0f;
+    private bool  _introWaveFired = false;
     private float _waveTime = 0f;
-    private bool _waveFired = false;
+    private bool  _waveFired = false;
 
     [System.Serializable]
     private class EmotionEntry
@@ -56,14 +58,16 @@ public class VRM1LipSync : MonoBehaviour
         string json = File.ReadAllText(emotionFile);
         var data = JsonUtility.FromJson<EmotionData>(json);
         _emotions = new List<EmotionEntry>(data.emotions);
+        _introWaveTime = data.introWaveTime;
         _waveTime = data.waveTime;
-        Debug.Log($"[LipSync] 感情タイムライン: {_emotions.Count}件, waveTime: {_waveTime}s");
+        Debug.Log($"[LipSync] 感情タイムライン: {_emotions.Count}件, introWaveTime: {_introWaveTime}s, waveTime: {_waveTime}s");
     }
 
     [System.Serializable]
     private class EmotionData
     {
         public EmotionEntry[] emotions;
+        public float introWaveTime;
         public float waveTime;
     }
 
@@ -121,14 +125,24 @@ public class VRM1LipSync : MonoBehaviour
             return;
         }
 
-        // Waving発火
-        if (!_waveFired && _waveTime > 0 && _audioSource.isPlaying 
+        // 冒頭Waving発火（冒頭一言終了 → 挨拶アニメへ）
+        if (!_introWaveFired && _introWaveTime > 0 && _audioSource.isPlaying
+            && _audioSource.time >= _introWaveTime)
+        {
+            var animator = GetComponentInParent<Animator>();
+            if (animator != null) animator.SetTrigger("DoWave");
+            _introWaveFired = true;
+            Debug.Log($"[LipSync] 冒頭DoWave発火: {_audioSource.time}s");
+        }
+
+        // 締めWaving発火
+        if (!_waveFired && _waveTime > 0 && _audioSource.isPlaying
             && _audioSource.time >= _waveTime)
         {
             var animator = GetComponentInParent<Animator>();
             if (animator != null) animator.SetTrigger("DoWave");
             _waveFired = true;
-            Debug.Log($"[LipSync] DoWave発火: {_audioSource.time}s");
+            Debug.Log($"[LipSync] 締めDoWave発火: {_audioSource.time}s");
         }
 
         _audioSource.GetOutputData(_samples, 0);

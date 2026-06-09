@@ -186,8 +186,14 @@ def extract_emotions_from_script(script: str) -> tuple[str, list[tuple[str, str]
     return clean_script, matches  # タイミングはまだ計算しない
 
 
-def build_emotion_timeline(matches: list[tuple[str, str]], subtitles: list[dict]) -> tuple[list[dict], float]:
-    """字幕タイミング確定後に感情タイムラインを生成する"""
+def build_emotion_timeline(
+    matches: list[tuple[str, str]],
+    subtitles: list[dict],
+    intro_duration: float = 0.0
+) -> tuple[list[dict], float, float]:
+    """字幕タイミング確定後に感情タイムラインを生成する
+    戻り値: (emotions, intro_wave_time, wave_time)
+    """
     total_duration = subtitles[-1]["end"] if subtitles else 90
     total_chars = sum(len(text.strip()) for _, text in matches)
 
@@ -201,42 +207,45 @@ def build_emotion_timeline(matches: list[tuple[str, str]], subtitles: list[dict]
         })
         char_offset += len(text.strip())
 
-    # あいさつタイミング
+    intro_wave_time = intro_duration
     wave_time = subtitles[-1]["start"] if subtitles else 0
 
-    print(f"[感情] {len(emotions)}件のタイムライン生成完了, waveTime: {wave_time}s")
-    return emotions, wave_time
+    print(f"[感情] {len(emotions)}件のタイムライン生成完了, introWaveTime: {intro_wave_time}s, waveTime: {wave_time}s")
+    return emotions, intro_wave_time, wave_time
 
-def extract_thumbnail_text(raw_script: str) -> tuple[str, str]:
-    """台本からサムネイル一言を抽出する"""
+def extract_thumbnail_text(raw_script: str) -> tuple[str, str, bool]:
+    """台本からサムネイル一言を抽出する。戻り値: (script, thumbnail_text, in_script)"""
     if "---THUMBNAIL---" in raw_script:
         parts = raw_script.split("---THUMBNAIL---", 1)
         script = parts[0].strip()
         thumbnail_text = parts[1].strip()
         print(f"[サムネイル] 一言: {thumbnail_text}")
+        return script, thumbnail_text, True
     else:
         print("[サムネイル] 一言なし、デフォルト使用")
-        script = raw_script
-        thumbnail_text = "今日も全肯定だよ！"
-    return script, thumbnail_text
+        return raw_script, "今日も全肯定だよ！", False
 
 # ──────────────────────────────────────────────
 # Step 3: VOICEVOXで音声生成
 # ──────────────────────────────────────────────
 
-def generate_voice(script: str, output_path: str) -> None:
-    """VOICEVOXで音声ファイルを生成する"""
-    print(f"[VOICEVOX] 音声生成中... (speaker: {VOICEVOX_SPEAKER})")
+def get_wav_duration(wav_path: str) -> float:
+    """WAVファイルの長さを秒で返す"""
+    import wave
+    with wave.open(wav_path, 'r') as f:
+        return f.getnframes() / float(f.getframerate())
 
-    # audio_query
+
+def _synthesize(text: str, output_path: str, extra_params: dict = None) -> None:
+    """VOICEVOXでテキストを音声合成してファイルに保存する"""
     query_res = requests.post(
         f"{VOICEVOX_URL}/audio_query",
-        params={"text": script, "speaker": VOICEVOX_SPEAKER}
+        params={"text": text, "speaker": VOICEVOX_SPEAKER}
     )
     query_res.raise_for_status()
     query = query_res.json()
-
-    # synthesis
+    if extra_params:
+        query.update(extra_params)
     synth_res = requests.post(
         f"{VOICEVOX_URL}/synthesis",
         params={"speaker": VOICEVOX_SPEAKER},
@@ -244,17 +253,51 @@ def generate_voice(script: str, output_path: str) -> None:
         data=json.dumps(query)
     )
     synth_res.raise_for_status()
-
     with open(output_path, "wb") as f:
         f.write(synth_res.content)
 
+
+def generate_voice(script: str, output_path: str, intro_text: str = "") -> None:
+    """VOICEVOXで音声ファイルを生成する。intro_text がある場合は冒頭一言を結合する"""
+    print(f"[VOICEVOX] 音声生成中... (speaker: {VOICEVOX_SPEAKER})")
+
+    if intro_text:
+        intro_wav = output_path.replace(".wav", "_intro.wav")
+        main_tmp  = output_path + ".main_tmp.wav"
+        list_file = output_path + ".concat_list.txt"
+        try:
+            _synthesize(intro_text, intro_wav, {
+                "speedScale":      0.85,
+                "intonationScale": 1.4,
+                "volumeScale":     1.3,
+                "pitchScale":      0.05,
+            })
+            _synthesize(script, main_tmp)
+            with open(list_file, "w") as f:
+                f.write(f"file '{intro_wav}'\nfile '{main_tmp}'\n")
+            subprocess.run(
+                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                 "-i", list_file, "-c", "copy", output_path],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print(f"[VOICEVOX] 冒頭+本編音声生成完了: {output_path}")
+            return
+        except Exception as e:
+            print(f"[VOICEVOX] 冒頭一言生成失敗、本編のみで続行: {e}")
+        finally:
+            for p in [main_tmp, list_file]:
+                if Path(p).exists():
+                    Path(p).unlink()
+
+    # intro_text なし or 冒頭生成失敗時は本編のみ
+    _synthesize(script, output_path)
     print(f"[VOICEVOX] 音声生成完了: {output_path}")
 
 # ──────────────────────────────────────────────
 # Step 3.5: 字幕タイミング生成
 # ──────────────────────────────────────────────
 
-def generate_subtitle_timing(script: str) -> list[dict]:
+def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict]:
     """VOICEVOXのaudio_queryからタイミングを取得し、元のテキストで字幕データを生成する"""
     print("[字幕] タイミング情報取得中...")
 
@@ -313,14 +356,14 @@ def generate_subtitle_timing(script: str) -> list[dict]:
             else:
                 start_t = total_duration * (char_offset / max(total_chars, 1))
                 end_t   = total_duration * ((char_offset + len(chunk)) / max(total_chars, 1)) + 0.1
-            subtitles.append({"start": round(start_t, 3), "end": round(end_t, 3), "text": chunk})
+            subtitles.append({"start": round(start_t + time_offset, 3), "end": round(end_t + time_offset, 3), "text": chunk})
             char_offset += len(chunk)
 
     print(f"[字幕] {len(subtitles)}ブロック生成完了")
     return subtitles
 
 
-def generate_corner_timing(script: str, subtitles: list[dict]) -> list[dict]:
+def generate_corner_timing(script: str, subtitles: list[dict], intro_duration: float = 0.0) -> list[dict]:
     """台本からコーナー名と表示タイミングを推定する"""
     corners = []
     total_duration = subtitles[-1]["end"] if subtitles else 90
@@ -334,13 +377,14 @@ def generate_corner_timing(script: str, subtitles: list[dict]) -> list[dict]:
         "締め": ("全肯定メッセージ", "#7ec8e3"),
     }
 
-    # 簡易的にdurationを4等分して各コーナーを割り当て
-    quarter = total_duration / 4
+    # 簡易的にdurationを4等分して各コーナーを割り当て（intro_durationでオフセット）
+    body_duration = total_duration - intro_duration
+    quarter = body_duration / 4
     corner_list = list(section_keywords.values())
     for idx, (label, color) in enumerate(corner_list):
         corners.append({
-            "start": round(quarter * idx, 3),
-            "end":   round(quarter * (idx + 1), 3),
+            "start": round(quarter * idx       + intro_duration, 3),
+            "end":   round(quarter * (idx + 1) + intro_duration, 3),
             "label": label,
             "color": color,
         })
@@ -456,9 +500,13 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str, screen
 
 def finalize_video(input_webm: str, output_mp4: str,
                    subtitles: list[dict] = None,
-                   corners: list[dict] = None) -> None:
+                   corners: list[dict] = None,
+                   intro_duration: float = 0.0) -> None:
     """FFmpegで縦型Shorts用MP4に変換・字幕合成する"""
     print(f"[FFmpeg] MP4変換中...")
+
+    if intro_duration > 0 and corners is not None:
+        corners = [{"start": 0, "end": intro_duration, "label": "今日の全肯定", "color": "#0085ff"}] + corners
 
     FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
     W, H = 1080, 1920
@@ -548,7 +596,10 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
         from googleapiclient.http import MediaFileUpload
         import pickle
 
-        SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+        SCOPES = [
+            "https://www.googleapis.com/auth/youtube.upload",
+            "https://www.googleapis.com/auth/youtube" # for Dubug
+        ]
         TOKEN_PATH = Path.home() / ".bottan_youtube_token.pickle"
         CLIENT_SECRETS = Path(os.getenv("YOUTUBE_CLIENT_SECRETS", str(Path.home() / ".bottan_youtube_client_secrets.json")))
 
@@ -677,8 +728,9 @@ def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmp_dir = Path(tempfile.gettempdir())
 
-    wav_path    = str(tmp_dir / f"bottan_{ts}.wav")
-    webm_path   = str(tmp_dir / f"bottan_{ts}.webm")
+    wav_path       = str(tmp_dir / f"bottan_{ts}.wav")
+    intro_wav_path = wav_path.replace(".wav", "_intro.wav")
+    webm_path      = str(tmp_dir / f"bottan_{ts}.webm")
     mp4_path    = str(tmp_dir / f"bottan_{ts}.mp4")
     screenshot_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
 
@@ -703,23 +755,40 @@ def main():
             raw_script = _timed("Step2 台本生成", generate_script, data)
 
         # Step 2.5: タグ抽出、クリーン台本作成
-        raw_script, thumbnail_text = extract_thumbnail_text(raw_script)
+        raw_script, thumbnail_text, thumbnail_in_script = extract_thumbnail_text(raw_script)
         clean_script, emotion_matches = extract_emotions_from_script(raw_script)
 
+        # 冒頭一言（thumbnail_text）をclean_scriptの先頭から除去してmain_scriptを作る
+        # ---THUMBNAIL--- がなく fallback テキストの場合はスキップ（誤削除防止）
+        main_script = clean_script
+        if thumbnail_in_script and thumbnail_text:
+            stripped = clean_script.strip()
+            if stripped.startswith(thumbnail_text):
+                main_script = stripped[len(thumbnail_text):].strip()
+            else:
+                m = re.match(r'^[^。！？\n]+[。！？\n]?', stripped)
+                if m:
+                    main_script = stripped[m.end():].strip()
+
         # Step 3: 音声生成
-        _timed("Step3 音声生成", generate_voice, clean_script, wav_path)
+        _timed("Step3 音声生成", generate_voice, main_script, wav_path, thumbnail_text)
+
+        # 冒頭一言の音声時間を取得
+        intro_duration = get_wav_duration(intro_wav_path) if thumbnail_text and Path(intro_wav_path).exists() else 0.0
 
         # Step 3.5: 字幕・コーナータイミング生成
-        subtitles = generate_subtitle_timing(clean_script)
-        corners   = generate_corner_timing(clean_script, subtitles)
+        subtitles = generate_subtitle_timing(main_script, time_offset=intro_duration)
+        if intro_duration > 0:
+            subtitles = [{"start": 0.0, "end": round(intro_duration, 3), "text": thumbnail_text}] + subtitles
+        corners   = generate_corner_timing(main_script, subtitles, intro_duration)
 
         # 感情タイムライン生成
-        emotions, wave_time = build_emotion_timeline(emotion_matches, subtitles)
+        emotions, intro_wave_time, wave_time = build_emotion_timeline(emotion_matches, subtitles, intro_duration)
 
-		# 感情JSONファイル保存
+        # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
         with open(emotion_path, "w") as f:
-            json.dump({"emotions": emotions, "waveTime": wave_time}, f, ensure_ascii=False)
+            json.dump({"emotions": emotions, "introWaveTime": intro_wave_time, "waveTime": wave_time}, f, ensure_ascii=False)
         print(f"[感情] 保存: {emotion_path}")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
@@ -731,7 +800,7 @@ def main():
         generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
 
         # Step 5: MP4変換
-        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners)
+        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners, intro_duration)
 
         # Step 6: YouTubeアップロード
         title = build_title()
@@ -753,7 +822,7 @@ def main():
     finally:
         #pass
         # 一時ファイル削除
-        for path in [wav_path, webm_path]:
+        for path in [wav_path, intro_wav_path, webm_path]:
             if Path(path).exists():
                 Path(path).unlink()
                 print(f"[Cleanup] 削除: {path}")
