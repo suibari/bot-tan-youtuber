@@ -17,6 +17,7 @@ botたん YouTube Shorts 自動投稿パイプライン
   UNITY_EXE           : UnityエディタのパスまたはビルドされたPlayerのパス
   UNITY_PROJECT       : Unityプロジェクトのパス
   BGM_PATH            : BGM音声ファイルのパス (省略可)
+  YOUTUBE_PRIVACY     : YouTube動画の公開設定 (public/private/unlisted, デフォルト: public)
 """
 
 import os
@@ -147,17 +148,17 @@ def fetch_from_bot_db() -> dict:
 # Step 2: LLMで台本生成
 # ──────────────────────────────────────────────
 
-def generate_script(data: dict) -> str:
+def generate_script(data: dict, comments: list[dict] = None) -> str:
     """DBデータから台本を生成する"""
     print(f"[LLM] 台本生成中...")
 
     if USE_LOCAL_LLM:
         # ローカルLLMはコンテキストが小さいため、thinkingを無効化
-        user_prompt = build_user_prompt(data)
+        user_prompt = build_user_prompt(data, comments=comments)
         extra = {"options": {"num_ctx": int(os.getenv("LOCAL_LLM_CTX", "8192"))},
                  "think": False}
     else:
-        user_prompt = build_user_prompt(data)
+        user_prompt = build_user_prompt(data, comments=comments)
         extra = {}
 
     response = _llm_create(
@@ -393,7 +394,7 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict
     return subtitles
 
 
-SECTION_TAGS = ['Thumbnail', 'FirstGreeting', 'SelfAffirmationCorner', 'BlueskySelfAffirmationCorner', 'Closing']
+SECTION_TAGS = ['Thumbnail', 'FirstGreeting', 'CommentCorner', 'SelfAffirmationCorner', 'BlueskyCorner', 'Closing']
 
 
 def extract_section_starts(raw_script: str) -> dict[str, str]:
@@ -425,13 +426,16 @@ def generate_corner_timing(
     subtitles: list[dict],
     intro_duration: float = 0.0,
     section_starts: dict[str, str] = None,
+    has_comments: bool = False,
 ) -> list[dict]:
     """セクションタグで確定したタイミングでコーナーラベルを生成する"""
-    corner_meta = [
-        ('FirstGreeting', "やっほー！botたんだよ", "#0085ff"),
-        ('SelfAffirmationCorner',        "こんなとこにも全肯定コーナー", "#ff6b9d"),
-        ('BlueskySelfAffirmationCorner', "今日のBluesky", "#0085ff"),
-        ('Closing',       "全肯定メッセージ", "#7ec8e3"),
+    corner_meta = [('FirstGreeting', "やっほー！botたんだよ", "#0085ff")]
+    if has_comments:
+        corner_meta.append(('CommentCorner', "コメントコーナー", "#ff9f43"))
+    corner_meta += [
+        ('SelfAffirmationCorner', "こんなとこにも全肯定コーナー", "#ff6b9d"),
+        ('BlueskyCorner',         "今日のBluesky", "#0085ff"),
+        ('Closing',               "全肯定メッセージ", "#7ec8e3"),
     ]
     total_duration = subtitles[-1]["end"] if subtitles else 90
 
@@ -654,19 +658,17 @@ def finalize_video(input_webm: str, output_mp4: str,
 # Step 6: YouTubeにアップロード
 # ──────────────────────────────────────────────
 
-def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_path: str = "") -> None:
-    """YouTube Data API v3で動画をアップロードする"""
-    print(f"[YouTube] アップロード中: {title}")
+def _get_youtube_client():
+    """YouTube API クライアントを返す（OAuth2認証）。失敗時は None。"""
     try:
         from google.oauth2.credentials import Credentials
         from google_auth_oauthlib.flow import InstalledAppFlow
         from googleapiclient.discovery import build
-        from googleapiclient.http import MediaFileUpload
         import pickle
 
         SCOPES = [
             "https://www.googleapis.com/auth/youtube.upload",
-            "https://www.googleapis.com/auth/youtube" # for Dubug
+            "https://www.googleapis.com/auth/youtube",
         ]
         TOKEN_PATH = Path.home() / ".bottan_youtube_token.pickle"
         CLIENT_SECRETS = Path(os.getenv("YOUTUBE_CLIENT_SECRETS", str(Path.home() / ".bottan_youtube_client_secrets.json")))
@@ -682,9 +684,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
             with open(TOKEN_PATH, "wb") as f:
                 pickle.dump(creds, f)
         if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                str(CLIENT_SECRETS), SCOPES
-            )
+            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRETS), SCOPES)
             flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
             auth_url, _ = flow.authorization_url(prompt="consent")
             print(f"\n以下のURLをブラウザで開いてください:\n{auth_url}\n")
@@ -694,8 +694,85 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
             with open(TOKEN_PATH, "wb") as f:
                 pickle.dump(creds, f)
 
-        youtube = build("youtube", "v3", credentials=creds)
+        return build("youtube", "v3", credentials=creds)
 
+    except ImportError:
+        print("[YouTube] google-api-python-client未インストール。")
+        return None
+    except Exception as e:
+        print(f"[YouTube] 認証失敗: {e}")
+        return None
+
+
+def fetch_youtube_comments() -> list[dict]:
+    """前日のYouTube動画へのコメントをランダム3件取得する。取得失敗時は []。"""
+    try:
+        import random
+        from urllib.parse import urlparse, parse_qs
+
+        conn = psycopg2.connect(**DB_CONFIG)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT url FROM affirmative_bot.youtube_shorts ORDER BY id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+        conn.close()
+
+        if not row:
+            print("[コメント] 前日動画なし → CommentCornerスキップ")
+            return []
+
+        video_id = parse_qs(urlparse(row["url"]).query).get("v", [None])[0]
+        if not video_id:
+            print("[コメント] video_id抽出失敗")
+            return []
+
+        youtube = _get_youtube_client()
+        if youtube is None:
+            return []
+
+        result = youtube.commentThreads().list(
+            part="snippet",
+            videoId=video_id,
+            maxResults=50,
+            order="relevance",
+            textFormat="plainText",
+        ).execute()
+
+        comments = [
+            {
+                "text":   item["snippet"]["topLevelComment"]["snippet"]["textDisplay"].strip(),
+                "author": item["snippet"]["topLevelComment"]["snippet"]["authorDisplayName"],
+            }
+            for item in result.get("items", [])
+            if item["snippet"]["topLevelComment"]["snippet"]["textDisplay"].strip()
+        ]
+
+        if not comments:
+            print("[コメント] コメントなし → CommentCornerスキップ")
+            return []
+
+        selected = random.sample(comments, min(3, len(comments)))
+        print(f"[コメント] {len(selected)}件取得 (候補{len(comments)}件中)")
+        return selected
+
+    except Exception as e:
+        print(f"[コメント] 取得失敗: {e} → CommentCornerスキップ")
+        return []
+
+
+def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_path: str = "") -> None:
+    """YouTube Data API v3で動画をアップロードする"""
+    print(f"[YouTube] アップロード中: {title}")
+    youtube = _get_youtube_client()
+    if youtube is None:
+        print("[YouTube] クライアント取得失敗。スキップします。")
+        return None
+
+    try:
+        from googleapiclient.http import MediaFileUpload
+
+        privacy = os.getenv("YOUTUBE_PRIVACY", "public")
         body = {
             "snippet": {
                 "title": title,
@@ -704,7 +781,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
                 "categoryId": "22",
             },
             "status": {
-                "privacyStatus": "public",
+                "privacyStatus": privacy,
                 "selfDeclaredMadeForKids": False,
             }
         }
@@ -724,7 +801,6 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
 
         video_id = response['id']
 
-        # サムネイル設定
         if thumbnail_path and Path(thumbnail_path).exists():
             youtube.thumbnails().set(
                 videoId=video_id,
@@ -733,7 +809,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
             print(f"[YouTube] サムネイル設定完了")
 
         url = f"https://youtube.com/watch?v={video_id}"
-        print(f"[YouTube] アップロード完了: {url}")
+        print(f"[YouTube] アップロード完了 ({privacy}): {url}")
         return url
 
     except ImportError:
@@ -814,13 +890,18 @@ def main():
             print("[ERROR] データが取得できませんでした")
             return
 
+        # Step 1.5: 前日動画のコメント取得（CommentCornerの有無を決定）
+        comments = fetch_youtube_comments()
+        has_comments = bool(comments)
+        print(f"[コメント] CommentCorner: {'あり (' + str(len(comments)) + '件)' if has_comments else 'なし → スキップ'}")
+
         # Step 2: 台本生成
         script_cache = os.getenv("SCRIPT_CACHE", "")
         if script_cache and Path(script_cache).exists():
             raw_script = open(script_cache).read()
             print(f"[LLM] キャッシュから台本読み込み: {script_cache}")
         else:
-            raw_script = _timed("Step2 台本生成", generate_script, data)
+            raw_script = _timed("Step2 台本生成", generate_script, data, comments)
 
         # Step 2.5: タグ抽出、クリーン台本作成
         raw_script, thumbnail_text, thumbnail_in_script = extract_thumbnail_text(raw_script)
@@ -850,7 +931,7 @@ def main():
         subtitles = generate_subtitle_timing(main_script, time_offset=intro_duration)
         if intro_duration > 0:
             subtitles = [{"start": 0.0, "end": round(intro_duration, 3), "text": thumbnail_text}] + subtitles
-        corners   = generate_corner_timing(main_script, subtitles, intro_duration, section_starts)
+        corners   = generate_corner_timing(main_script, subtitles, intro_duration, section_starts, has_comments)
 
         # 感情タイムライン生成
         emotions, wave_time = build_emotion_timeline(emotion_matches, subtitles, intro_duration)
@@ -858,8 +939,8 @@ def main():
         # トリガー発火時刻を字幕から算出
         # DoGreeting①: ②挨拶末尾の「botたんだよ」発話タイミング（セクション先頭ではなく末尾）
         greeting_time1 = _find_subtitle_time(subtitles, "botたんだよ") or 0.0
-        # DoGreeting②・DoThankful: ⑤締めセクション内に限定して検索（誤マッチ防止）
-        closing_start = corners[3]["start"] if len(corners) >= 4 else 0.0
+        # DoGreeting②・DoThankful: ⑤/⑥締めセクション内に限定（corners末尾がClosing）
+        closing_start = corners[-1]["start"] if corners else 0.0
         greeting_time2 = _find_subtitle_time(subtitles, "フォロー", start_from=closing_start) or 0.0
         thankful_time  = _find_subtitle_time(subtitles, "高評価",   start_from=closing_start) or 0.0
         print(f"[トリガー] greetingTime1: {greeting_time1}s, greetingTime2: {greeting_time2}s, thankfulTime: {thankful_time}s")

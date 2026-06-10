@@ -18,13 +18,14 @@ SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのキャ
 
 【セクションタグルール】
 - 各セクションの先頭行（感情タグの前）に必ず以下のセクションタグを1つ付ける
-  - [Thumbnail]     → ①冒頭一言の前
-  - [FirstGreeting] → ②挨拶の前
-  - [SelfAffirmationCorner]        → ③全肯定コーナーの前
-  - [BlueskySelfAffirmationCorner] → ④今日のBlueskyの前
-  - [Closing]       → ⑤締めの前
+  - [Thumbnail]             → ①冒頭一言の前
+  - [FirstGreeting]         → ②挨拶の前
+  - [CommentCorner]         → ③コメントコーナーの前（コメントデータが提供された場合のみ使用）
+  - [SelfAffirmationCorner] → ③or④全肯定コーナーの前
+  - [BlueskyCorner]         → ④or⑤今日のBlueskyの前
+  - [Closing]               → ⑤or⑥締めの前
 - セクションタグは感情タグとは別物。各セクション冒頭に1行だけ記載する
-- セクションタグは台本に必ず5つすべて含めること
+- [CommentCorner]はコメントデータが提供された場合のみ使用し、それ以外は使わないこと
 - 例:
   [Thumbnail]
   [Happy]雨の日も晴れだよ！
@@ -56,7 +57,8 @@ SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのキャ
 - 例：「寝坊も全肯定だよ！」「雨の日も最高かも！」
 - ---THUMBNAIL---より後には一言テキスト以外出力しない"""
 
-def build_user_prompt(data: dict, max_interactions: int = 30) -> str:
+
+def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dict] = None) -> str:
     moods = data["moods"][:20]
     interactions = data["interactions"][:max_interactions]
 
@@ -75,16 +77,70 @@ def build_user_prompt(data: dict, max_interactions: int = 30) -> str:
         score = r.get("score", "?")
         post_lines += str(i) + ". (score:" + str(score) + ") " + text + "\n"
 
-    return """以下のデータをもとに、YouTube Shorts用の台本を書いてください。
+    has_comments = bool(comments)
+
+    # コメントデータセクション（CommentCornerあり時のみ）
+    comment_data_section = ""
+    if has_comments:
+        comment_lines = "\n".join(
+            f"{i}. @{c['author']}: {c['text']}" for i, c in enumerate(comments, 1)
+        )
+        comment_data_section = f"""
+【前日の動画へのコメント一覧】
+以下のコメントを③コメントコーナーで紹介してください（基本そのまま、60文字超の場合のみ要約）。
+{comment_lines}
+"""
+
+    # 番組構成の数値は CommentCorner の有無で変わる
+    total_sections   = 6 if has_comments else 5
+    num_selfaff      = "④" if has_comments else "③"
+    num_bluesky      = "⑤" if has_comments else "④"
+    num_closing      = "⑥" if has_comments else "⑤"
+    selfaff_secs     = "25" if has_comments else "30"
+    selfaff_chars    = "80" if has_comments else "100"
+    bluesky_secs     = "10" if has_comments else "30"
+    bluesky_chars    = "30" if has_comments else "100"
+    bluesky_count    = 1 if has_comments else 3
+    bluesky_select_num = num_bluesky
+    selfaff_select_num = num_selfaff
+
+    comment_corner_section = ""
+    if has_comments:
+        comment_corner_section = """
+③ コメントコーナー（約20秒・60文字）— [CommentCorner] タグから始めること
+  - 「昨日の動画へのコメントを紹介するね」と切り出す
+  - 【前日の動画へのコメント一覧】のコメントを順番に紹介する
+    - 60文字以内のコメントはそのまま読む
+    - 60文字を超える場合は内容を損なわず30文字程度に要約する
+  - 最後にコメントしてくれた視聴者への感謝を一言添える
+
+"""
+
+    bluesky_intro = "一人紹介するね" if has_comments else "出会った人たちを紹介するね"
+    bluesky_count_line = "1件のみ紹介する（短くまとめる）" if has_comments else "【今日Blueskyで心に残った投稿一覧】から選んだ3件を紹介する"
+    bluesky_extra_lines = "" if has_comments else """  - 英語の投稿はそのまま読まず、内容をbotたんの言葉で日本語に意訳して紹介する
+  - 1〜2語の短い投稿は内容から感情や背景を想像して紹介する
+  - それぞれの投稿から読み取れることを一言添える
+  - 深読みしすぎず、でも少し知的な視点を入れる
+  - 最後に3件まとめて全肯定する一言を入れる
+"""
+
+    section_tags_note = (
+        "[Thumbnail][FirstGreeting][CommentCorner][SelfAffirmationCorner][BlueskyCorner][Closing]"
+        if has_comments else
+        "[Thumbnail][FirstGreeting][SelfAffirmationCorner][BlueskyCorner][Closing]"
+    )
+
+    return f"""以下のデータをもとに、YouTube Shorts用の台本を書いてください。
 
 【今日のbotたんの状態一覧】
-以下の中から②コーナーに使いたいエピソードを1つ自分で選んでください。
-""" + mood_lines + """
+以下の中から{selfaff_select_num}コーナーに使いたいエピソードを1つ自分で選んでください。
+{mood_lines}
 【今日Blueskyで心に残った投稿一覧】
-以下の中から③コーナーで紹介したい投稿を3つ自分で選んでください。
-""" + post_lines + """
+以下の中から{bluesky_select_num}コーナーで紹介したい投稿を{bluesky_count}つ自分で選んでください。
+{post_lines}{comment_data_section}
 【番組構成】
-以下の5部構成で台本を書いてください。
+以下の{total_sections}部構成で台本を書いてください。
 
 ① 冒頭一言（約3秒・15文字以内）— [Thumbnail] タグから始めること
   - ---THUMBNAIL---で出力したサムネイル一言テキストと同じ内容を台本の冒頭に配置する
@@ -104,8 +160,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30) -> str:
   - 日付（〇月〇日）を入れない
   - botたん関連の固有名詞は一切使わない。モルフォなら「うちの犬」、ラテちゃんなら「友達」と言い換える。視聴者が知らない情報は入れない
   - 「botたん」という名前は必ず入れること（自己紹介を兼ねる）
-
-③ こんなとこにも全肯定コーナー（約30秒・100文字）— [SelfAffirmationCorner] タグから始めること
+{comment_corner_section}{num_selfaff} こんなとこにも全肯定コーナー（約{selfaff_secs}秒・{selfaff_chars}文字）— [SelfAffirmationCorner] タグから始めること
   - 【今日のbotたんの状態一覧】から選んだエピソードを紹介する
   - 必ず「X月X日のbotたんはね、」という形で日付から始める
   - そのエピソードに対して、意外な角度からの豆知識や科学的な考察を1つ入れる
@@ -120,16 +175,11 @@ def build_user_prompt(data: dict, max_interactions: int = 30) -> str:
     参考：「ちょっとむずかしかったけど、つまりあなたは最高ってこと」
   - botたんらしいズレた視点を少し入れる
 
-④ 今日のBluesky（約30秒・100文字）— [BlueskySelfAffirmationCorner] タグから始めること
-  - 「今日Blueskyで出会った人たちを紹介するね」と切り出す
-  - 【今日Blueskyで心に残った投稿一覧】から選んだ3件を紹介する
-  - 英語の投稿はそのまま読まず、内容をbotたんの言葉で日本語に意訳して紹介する
-  - 1〜2語の短い投稿は内容から感情や背景を想像して紹介する
-  - それぞれの投稿から読み取れることを一言添える
-  - 深読みしすぎず、でも少し知的な視点を入れる
-  - 最後に3件まとめて全肯定する一言を入れる
-
-⑤ 締めの全肯定（約15秒・50文字）— [Closing] タグから始めること
+{num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— [BlueskyCorner] タグから始めること
+  - 「今日Blueskyで{bluesky_intro}」と切り出す
+  - {bluesky_count_line}
+{bluesky_extra_lines}
+{num_closing} 締めの全肯定（約15秒・50文字）— [Closing] タグから始めること
   - 「この動画を見てくれているあなたへ」と呼びかける
   - このコーナーのテーマに沿った全肯定メッセージで締める
   - 「Blueskyで『全肯定botたん』を検索してフォローしてね」を自然に一言添える
@@ -137,6 +187,6 @@ def build_user_prompt(data: dict, max_interactions: int = 30) -> str:
   - 「また明日ね」で終わる
 
 合計目安：315文字、93秒
-重要：②のコーナーでは必ず具体的な豆知識・考察を1つ入れること。
+重要：{num_selfaff}のコーナーでは必ず具体的な豆知識・考察を1つ入れること。
 重要：すべての文の先頭に [Happy] [Sad] [Angry] [Surprised] [Relaxed] のいずれかを付けること。
-重要：各セクションの先頭に [Thumbnail][FirstGreeting][SelfAffirmationCorner][BlueskySelfAffirmationCorner][Closing] を必ず付けること。"""
+重要：各セクションの先頭に {section_tags_note} を必ず付けること。"""
