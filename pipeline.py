@@ -559,6 +559,12 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str, screen
         time.sleep(5)  # GPU メモリ解放待ち
 
     finally:
+        if unity_proc and unity_proc.poll() is None:
+            unity_proc.terminate()
+            try:
+                unity_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                unity_proc.kill()
         if xvfb_proc and xvfb_proc.poll() is None:
             xvfb_proc.terminate()
             try:
