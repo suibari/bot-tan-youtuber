@@ -8,6 +8,13 @@ cp /home/suibari/work/bottan-pipeline/unity-scripts/VRM1LipSync.cs /home/suibari
 cp /home/suibari/work/bottan-pipeline/unity-scripts/VideoRecorder.cs /home/suibari/bottan-video/Assets/Scripts/VideoRecorder.cs
 echo "[Setup] 同期完了"
 
+# 引数から環境変数をセット (KEY=VALUE 形式)
+for arg in "$@"; do
+    if [[ "$arg" == *=* ]]; then
+        export "$arg"
+    fi
+done
+
 LOG_FILE="/home/suibari/work/bottan-pipeline/logs/pipeline_$(date +%Y%m%d_%H%M%S).log"
 python3 -u /home/suibari/work/bottan-pipeline/pipeline.py 2>&1 | tee "$LOG_FILE"
 
