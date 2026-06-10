@@ -107,9 +107,9 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     num_bluesky      = "④"  # コメなし時のみ使用
     num_closing      = "⑤"  # 両方とも⑤
     selfaff_secs     = "40" if has_comments else "30"
-    selfaff_chars    = "130" if has_comments else "100"
+    selfaff_chars    = "110" if has_comments else "85"
     bluesky_secs     = "30"   # コメなし時のみ使用
-    bluesky_chars    = "100"  # コメなし時のみ使用
+    bluesky_chars    = "85"   # コメなし時のみ使用
     bluesky_select_num = num_bluesky
     selfaff_select_num = num_selfaff
 
@@ -161,7 +161,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 視聴者の心に刺さる、その日のテーマを象徴する一言
   - 例：「朝が苦手でも最高だよ！」「おしゃべりは魔法だよ！」
 
-② 挨拶（約12秒・40文字）— [FirstGreeting] タグから始めること
+② 挨拶（約12秒・35文字）— [FirstGreeting] タグから始めること
   - 必ず1文だけで書くこと。2文以上にしない
   - Moodデータから1つエピソードを選び、以下の形式で書く
   - 形式：「[Happy]〜だったけど、全肯定で乗り切った！botたんだよ！」
@@ -187,15 +187,18 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     参考：「ちょっとむずかしかったけど、つまりあなたは最高ってこと」
   - botたんらしいズレた視点を少し入れる
 
-{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・60文字）— [Closing] タグから始めること
+{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・65文字）— [Closing] タグから始めること
   - 「この動画を見てくれているあなたへ」と呼びかける
   - このコーナーのテーマに沿った全肯定メッセージで締める
-  - 「コメントしてくれたら、明日の動画で全肯定で紹介するよ！」を自然に一言添える
-  - 「高評価・チャンネル登録・コメントしてくれると、botたんめちゃくちゃ喜ぶよ！」を自然に入れる
+  - テーマに関連した問いかけを視聴者に投げかける（コメント誘導）
+    - 具体的で答えやすい形にする
+    - 例（睡眠テーマ）：「みんなは最近ちゃんと寝れてる？コメントで教えてね」
+    - 例（友達テーマ）：「最近誰かと話して元気もらったことある？聞かせてほしいな」
+  - 「高評価・チャンネル登録もめちゃくちゃ嬉しいよ！」を自然に入れる
   - 「Blueskyで『全肯定botたん』を検索してフォローしてね」を自然に一言添える
   - 「また明日ね」で終わる
 
-合計目安：310文字、90秒
+合計目安：285文字、90秒
 重要：{num_selfaff}のコーナーでは必ず具体的な豆知識・考察を1つ入れること。
 重要：すべての文の先頭に [Happy] [Sad] [Angry] [Surprised] [Relaxed] のいずれかを付けること。
 重要：各セクションの先頭に {section_tags_note} を必ず付けること。"""
