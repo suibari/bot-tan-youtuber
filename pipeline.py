@@ -669,6 +669,7 @@ def _get_youtube_client():
         SCOPES = [
             "https://www.googleapis.com/auth/youtube.upload",
             "https://www.googleapis.com/auth/youtube",
+            "https://www.googleapis.com/auth/youtube.force-ssl"
         ]
         TOKEN_PATH = Path.home() / ".bottan_youtube_token.pickle"
         CLIENT_SECRETS = Path(os.getenv("YOUTUBE_CLIENT_SECRETS", str(Path.home() / ".bottan_youtube_client_secrets.json")))
