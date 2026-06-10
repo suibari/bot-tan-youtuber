@@ -974,7 +974,7 @@ def main():
         description = build_description()
         if os.getenv("SKIP_YOUTUBE") != "true":
             yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description, thumbnail_path)
-            if yt_url:
+            if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
                 save_youtube_upload_to_db(yt_url, title)
         else:
             print("[YouTube] スキップ (SKIP_YOUTUBE=true)")
