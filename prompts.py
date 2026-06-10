@@ -1,3 +1,7 @@
+from datetime import timezone, timedelta
+
+_JST = timezone(timedelta(hours=9))
+
 SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのキャラクターです。
 以下のキャラクター設定に従って台本を生成してください。
 
@@ -64,7 +68,13 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
     mood_lines = ""
     for m in moods:
-        date = m["created_at"].strftime("%-m/%-d") if m.get("created_at") else "?"
+        dt = m.get("created_at")
+        if dt:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc).astimezone(_JST)
+            date = dt.strftime("%-m/%-d")
+        else:
+            date = "?"
         status = m.get("status", "")
         mood_ja = m.get("mood", "")
         mood_en = m.get("mood_en", "")
