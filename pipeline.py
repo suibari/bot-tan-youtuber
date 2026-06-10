@@ -939,7 +939,7 @@ def main():
 
         # トリガー発火時刻を字幕から算出
         # DoGreeting①: ②挨拶末尾の「botたんだよ」発話タイミング（セクション先頭ではなく末尾）
-        greeting_time1 = _find_subtitle_time(subtitles, "botたんだよ") or 0.0
+        greeting_time1 = max(0.0, (_find_subtitle_time(subtitles, "botたんだよ") or 0.0) - 2.0)
         # DoGreeting②・DoThankful: ⑤/⑥締めセクション内に限定（corners末尾がClosing）
         closing_start = corners[-1]["start"] if corners else 0.0
         greeting_time2 = _find_subtitle_time(subtitles, "フォロー", start_from=closing_start) or 0.0
