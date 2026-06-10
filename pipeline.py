@@ -432,11 +432,10 @@ def generate_corner_timing(
     corner_meta = [('FirstGreeting', "やっほー！botたんだよ", "#0085ff")]
     if has_comments:
         corner_meta.append(('CommentCorner', "コメントコーナー", "#ff9f43"))
-    corner_meta += [
-        ('SelfAffirmationCorner', "こんなとこにも全肯定コーナー", "#ff6b9d"),
-        ('BlueskyCorner',         "今日のBluesky", "#0085ff"),
-        ('Closing',               "全肯定メッセージ", "#7ec8e3"),
-    ]
+    corner_meta.append(('SelfAffirmationCorner', "こんなとこにも全肯定コーナー", "#ff6b9d"))
+    if not has_comments:
+        corner_meta.append(('BlueskyCorner', "今日のBluesky", "#0085ff"))
+    corner_meta.append(('Closing', "全肯定メッセージ", "#7ec8e3"))
     total_duration = subtitles[-1]["end"] if subtitles else 90
 
     resolved_starts = []

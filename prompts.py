@@ -102,15 +102,14 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 """
 
     # 番組構成の数値は CommentCorner の有無で変わる
-    total_sections   = 6 if has_comments else 5
+    total_sections   = 5  # コメあり・なし両方とも5部構成
     num_selfaff      = "④" if has_comments else "③"
-    num_bluesky      = "⑤" if has_comments else "④"
-    num_closing      = "⑥" if has_comments else "⑤"
-    selfaff_secs     = "25" if has_comments else "30"
-    selfaff_chars    = "80" if has_comments else "100"
-    bluesky_secs     = "10" if has_comments else "30"
-    bluesky_chars    = "30" if has_comments else "100"
-    bluesky_count    = 1 if has_comments else 3
+    num_bluesky      = "④"  # コメなし時のみ使用
+    num_closing      = "⑤"  # 両方とも⑤
+    selfaff_secs     = "40" if has_comments else "30"
+    selfaff_chars    = "130" if has_comments else "100"
+    bluesky_secs     = "30"   # コメなし時のみ使用
+    bluesky_chars    = "100"  # コメなし時のみ使用
     bluesky_select_num = num_bluesky
     selfaff_select_num = num_selfaff
 
@@ -126,17 +125,22 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
 """
 
-    bluesky_intro = "一人紹介するね" if has_comments else "出会った人たちを紹介するね"
-    bluesky_count_line = "1件のみ紹介する（短くまとめる）" if has_comments else "【今日Blueskyで心に残った投稿一覧】から選んだ3件を紹介する"
-    bluesky_extra_lines = "" if has_comments else """  - 英語の投稿はそのまま読まず、内容をbotたんの言葉で日本語に意訳して紹介する
-  - 1〜2語の短い投稿は内容から感情や背景を想像して紹介する
-  - それぞれの投稿から読み取れることを一言添える
-  - 深読みしすぎず、でも少し知的な視点を入れる
-  - 最後に3件まとめて全肯定する一言を入れる
+    bluesky_data_section = "" if has_comments else f"""【今日Blueskyで心に残った投稿一覧】
+以下の中から{num_bluesky}コーナーで紹介したい投稿を1つ自分で選んでください。
+{post_lines}"""
+
+    bluesky_corner_section = "" if has_comments else f"""
+{num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— [BlueskyCorner] タグから始めること
+  - 「今日Blueskyで一番心に刺さった投稿を紹介するね」と切り出す
+  - 【今日Blueskyで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
+  - なぜその投稿に心を打たれたかをbotたんの言葉で語る
+  - 英語の投稿はそのまま読まず、内容をbotたんの言葉で日本語に意訳して紹介する
+  - 全肯定する一言で締める
+
 """
 
     section_tags_note = (
-        "[Thumbnail][FirstGreeting][CommentCorner][SelfAffirmationCorner][BlueskyCorner][Closing]"
+        "[Thumbnail][FirstGreeting][CommentCorner][SelfAffirmationCorner][Closing]"
         if has_comments else
         "[Thumbnail][FirstGreeting][SelfAffirmationCorner][BlueskyCorner][Closing]"
     )
@@ -146,9 +150,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 【今日のbotたんの状態一覧】
 以下の中から{selfaff_select_num}コーナーに使いたいエピソードを1つ自分で選んでください。
 {mood_lines}
-【今日Blueskyで心に残った投稿一覧】
-以下の中から{bluesky_select_num}コーナーで紹介したい投稿を{bluesky_count}つ自分で選んでください。
-{post_lines}{comment_data_section}
+{bluesky_data_section}{comment_data_section}
 【番組構成】
 以下の{total_sections}部構成で台本を書いてください。
 
@@ -159,7 +161,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 視聴者の心に刺さる、その日のテーマを象徴する一言
   - 例：「朝が苦手でも最高だよ！」「おしゃべりは魔法だよ！」
 
-② 挨拶（約15秒・50文字）— [FirstGreeting] タグから始めること
+② 挨拶（約12秒・40文字）— [FirstGreeting] タグから始めること
   - 必ず1文だけで書くこと。2文以上にしない
   - Moodデータから1つエピソードを選び、以下の形式で書く
   - 形式：「[Happy]〜だったけど、全肯定で乗り切った！botたんだよ！」
@@ -185,18 +187,15 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     参考：「ちょっとむずかしかったけど、つまりあなたは最高ってこと」
   - botたんらしいズレた視点を少し入れる
 
-{num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— [BlueskyCorner] タグから始めること
-  - 「今日Blueskyで{bluesky_intro}」と切り出す
-  - {bluesky_count_line}
-{bluesky_extra_lines}
-{num_closing} 締めの全肯定（約15秒・50文字）— [Closing] タグから始めること
+{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・60文字）— [Closing] タグから始めること
   - 「この動画を見てくれているあなたへ」と呼びかける
   - このコーナーのテーマに沿った全肯定メッセージで締める
-  - 「Blueskyで『全肯定botたん』を検索してフォローしてね」を自然に一言添える
+  - 「コメントしてくれたら、明日の動画で全肯定で紹介するよ！」を自然に一言添える
   - 「高評価・チャンネル登録・コメントしてくれると、botたんめちゃくちゃ喜ぶよ！」を自然に入れる
+  - 「Blueskyで『全肯定botたん』を検索してフォローしてね」を自然に一言添える
   - 「また明日ね」で終わる
 
-合計目安：315文字、93秒
+合計目安：310文字、90秒
 重要：{num_selfaff}のコーナーでは必ず具体的な豆知識・考察を1つ入れること。
 重要：すべての文の先頭に [Happy] [Sad] [Angry] [Surprised] [Relaxed] のいずれかを付けること。
 重要：各セクションの先頭に {section_tags_note} を必ず付けること。"""
