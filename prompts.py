@@ -103,15 +103,15 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
     # 番組構成の数値は CommentCorner の有無で変わる
     total_sections   = 5  # コメあり・なし両方とも5部構成
-    num_selfaff      = "④" if has_comments else "③"
-    num_bluesky      = "④"  # コメなし時のみ使用
+    num_selfaff      = "③"  # コメなし時のみ使用（コメあり時はSelfAffirmationCornerなし）
+    num_bluesky      = "④"  # コメあり・なし両方とも④
     num_closing      = "⑤"  # 両方とも⑤
-    selfaff_secs     = "40" if has_comments else "30"
-    selfaff_chars    = "110" if has_comments else "85"
-    bluesky_secs     = "30"   # コメなし時のみ使用
-    bluesky_chars    = "85"   # コメなし時のみ使用
+    selfaff_secs     = "30"  # コメなし時のみ使用
+    selfaff_chars    = "85"  # コメなし時のみ使用
+    bluesky_secs     = "30"
+    bluesky_chars    = "85"
     bluesky_select_num = num_bluesky
-    selfaff_select_num = num_selfaff
+    selfaff_select_num = "②" if has_comments else num_selfaff
 
     comment_corner_section = ""
     if has_comments:
@@ -125,11 +125,11 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
 """
 
-    bluesky_data_section = "" if has_comments else f"""【今日Blueskyで心に残った投稿一覧】
+    bluesky_data_section = f"""【今日Blueskyで心に残った投稿一覧】
 以下の中から{num_bluesky}コーナーで紹介したい投稿を1つ自分で選んでください。
 {post_lines}"""
 
-    bluesky_corner_section = "" if has_comments else f"""
+    bluesky_corner_section = f"""
 {num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— [BlueskyCorner] タグから始めること
   - 「今日Blueskyで一番心に刺さった投稿を紹介するね」と切り出す
   - 【今日Blueskyで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
@@ -140,7 +140,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 """
 
     section_tags_note = (
-        "[Thumbnail][FirstGreeting][CommentCorner][SelfAffirmationCorner][Closing]"
+        "[Thumbnail][FirstGreeting][CommentCorner][BlueskyCorner][Closing]"
         if has_comments else
         "[Thumbnail][FirstGreeting][SelfAffirmationCorner][BlueskyCorner][Closing]"
     )
@@ -153,18 +153,39 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
         excl_bsky = corner_context.get("excluded_bluesky_themes", [])
         if excl_fg:
             constraint_lines.append(f"重要：②挨拶では「{'・'.join(excl_fg)}」状態のエピソードを選ばないこと（直近2日間使用済み）")
-        if excl_sa:
+        if excl_sa and not has_comments:
             constraint_lines.append(f"重要：{num_selfaff}全肯定コーナーでは「{'・'.join(excl_sa)}」状態のエピソードを選ばないこと（直近2日間使用済み）")
-        if not has_comments and ref_bsky:
+        if ref_bsky:
             constraint_lines.append(f"BlueskyCorner参考：視聴者に受けているテーマ（優先的に参考にすること）：{'、'.join(ref_bsky)}")
-        if not has_comments and excl_bsky:
+        if excl_bsky:
             constraint_lines.append(f"BlueskyCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_bsky)}")
     constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
+
+    selfaff_corner_section = "" if has_comments else f"""{num_selfaff} こんなとこにも全肯定コーナー（約{selfaff_secs}秒・{selfaff_chars}文字）— [SelfAffirmationCorner] タグから始めること
+  - 【今日のbotたんの状態一覧】から選んだエピソードを紹介する
+  - 必ず「X月X日のbotたんはね、」という形で日付から始める
+  - そのエピソードに対して、意外な角度からの豆知識や科学的な考察を1つ入れる
+    例：睡眠なら「実は寝てる間に脳が記憶を整理してて」
+    例：散歩なら「歩くと創造性が60%上がるって研究があって」
+  - 難しそうな話をオチで全肯定につなげる
+    毎回必ず違う言い回しにすること。同じフレーズの繰り返しは厳禁。
+    以下は参考例であり、そのまま使ってはいけない。自分で新しい言い回しを作ること。
+    参考：「むずかしい話したけど、要するにそのままでいいってことだね」
+    参考：「科学的に言っても、ぜんぶアリってことが証明されてるんだよ」
+    参考：「なんでかって言うと、もうすでに十分すごいからだよ」
+    参考：「ちょっとむずかしかったけど、つまりあなたは最高ってこと」
+  - botたんらしいズレた視点を少し入れる
+
+"""
+
+    selfaff_important_note = "" if has_comments else f"重要：{num_selfaff}のコーナーでは必ず具体的な豆知識・考察を1つ入れること。\n"
+
+    mood_select_note = "②挨拶" if has_comments else f"{selfaff_select_num}"
 
     return f"""以下のデータをもとに、YouTube Shorts用の台本を書いてください。
 
 【今日のbotたんの状態一覧】
-以下の中から{selfaff_select_num}コーナーに使いたいエピソードを1つ自分で選んでください。
+以下の中から{mood_select_note}コーナーに使いたいエピソードを1つ自分で選んでください。
 {mood_lines}
 {bluesky_data_section}{comment_data_section}
 【番組構成】
@@ -188,22 +209,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 日付（〇月〇日）を入れない
   - botたん関連の固有名詞は一切使わない。モルフォなら「うちの犬」、ラテちゃんなら「友達」と言い換える。視聴者が知らない情報は入れない
   - 「botたん」という名前は必ず入れること（自己紹介を兼ねる）
-{comment_corner_section}{num_selfaff} こんなとこにも全肯定コーナー（約{selfaff_secs}秒・{selfaff_chars}文字）— [SelfAffirmationCorner] タグから始めること
-  - 【今日のbotたんの状態一覧】から選んだエピソードを紹介する
-  - 必ず「X月X日のbotたんはね、」という形で日付から始める
-  - そのエピソードに対して、意外な角度からの豆知識や科学的な考察を1つ入れる
-    例：睡眠なら「実は寝てる間に脳が記憶を整理してて」
-    例：散歩なら「歩くと創造性が60%上がるって研究があって」
-  - 難しそうな話をオチで全肯定につなげる
-    毎回必ず違う言い回しにすること。同じフレーズの繰り返しは厳禁。
-    以下は参考例であり、そのまま使ってはいけない。自分で新しい言い回しを作ること。
-    参考：「むずかしい話したけど、要するにそのままでいいってことだね」
-    参考：「科学的に言っても、ぜんぶアリってことが証明されてるんだよ」
-    参考：「なんでかって言うと、もうすでに十分すごいからだよ」
-    参考：「ちょっとむずかしかったけど、つまりあなたは最高ってこと」
-  - botたんらしいズレた視点を少し入れる
-
-{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・65文字）— [Closing] タグから始めること
+{comment_corner_section}{selfaff_corner_section}{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・65文字）— [Closing] タグから始めること
   - 「この動画を見てくれているあなたへ」と呼びかける
   - このコーナーのテーマに沿った全肯定メッセージで締める
   - テーマに関連した問いかけを視聴者に投げかける（コメント誘導）
@@ -215,6 +221,5 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 「また明日ね」で終わる
 
 合計目安：285文字、90秒
-重要：{num_selfaff}のコーナーでは必ず具体的な豆知識・考察を1つ入れること。
-重要：すべての文の先頭に [Happy] [Sad] [Angry] [Surprised] [Relaxed] のいずれかを付けること。
+{selfaff_important_note}重要：すべての文の先頭に [Happy] [Sad] [Angry] [Surprised] [Relaxed] のいずれかを付けること。
 重要：各セクションの先頭に {section_tags_note} を必ず付けること。{constraint_section}"""

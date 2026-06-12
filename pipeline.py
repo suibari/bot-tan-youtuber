@@ -456,8 +456,9 @@ def generate_corner_timing(
     corner_meta = [('FirstGreeting', "やっほー！botたんだよ", "#0085ff")]
     if has_comments:
         corner_meta.append(('CommentCorner', "コメントコーナー", "#ff9f43"))
-    corner_meta.append(('SelfAffirmationCorner', "こんなとこにも全肯定コーナー", "#ff6b9d"))
-    if not has_comments:
+        corner_meta.append(('BlueskyCorner', "今日のBluesky", "#0085ff"))
+    else:
+        corner_meta.append(('SelfAffirmationCorner', "こんなとこにも全肯定コーナー", "#ff6b9d"))
         corner_meta.append(('BlueskyCorner', "今日のBluesky", "#0085ff"))
     corner_meta.append(('Closing', "全肯定メッセージ", "#7ec8e3"))
     total_duration = subtitles[-1]["end"] if subtitles else 90
@@ -1116,12 +1117,12 @@ def main():
                 corners_metadata = [
                     {"corner_name": "Thumbnail", "theme": thumbnail_text},
                     {"corner_name": "FirstGreeting", "status": script_meta.get("first_greeting_status", "")},
-                    {"corner_name": "SelfAffirmationCorner", "status": script_meta.get("self_affirmation_status", "")},
                 ]
                 if not has_comments:
-                    bluesky_themes = script_meta.get("bluesky_themes", [])
-                    if isinstance(bluesky_themes, list) and bluesky_themes:
-                        corners_metadata.append({"corner_name": "BlueskyCorner", "theme": bluesky_themes})
+                    corners_metadata.append({"corner_name": "SelfAffirmationCorner", "status": script_meta.get("self_affirmation_status", "")})
+                bluesky_themes = script_meta.get("bluesky_themes", [])
+                if isinstance(bluesky_themes, list) and bluesky_themes:
+                    corners_metadata.append({"corner_name": "BlueskyCorner", "theme": bluesky_themes})
                 save_youtube_upload_to_db(yt_url, title, corners_metadata)
         else:
             print("[YouTube] スキップ (SKIP_YOUTUBE=true)")
