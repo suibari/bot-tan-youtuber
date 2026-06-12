@@ -148,17 +148,17 @@ def fetch_from_bot_db() -> dict:
 # Step 2: LLMで台本生成
 # ──────────────────────────────────────────────
 
-def generate_script(data: dict, comments: list[dict] = None) -> str:
+def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None) -> str:
     """DBデータから台本を生成する"""
     print(f"[LLM] 台本生成中...")
 
     if USE_LOCAL_LLM:
         # ローカルLLMはコンテキストが小さいため、thinkingを無効化
-        user_prompt = build_user_prompt(data, comments=comments)
+        user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
         extra = {"options": {"num_ctx": int(os.getenv("LOCAL_LLM_CTX", "8192"))},
                  "think": False}
     else:
-        user_prompt = build_user_prompt(data, comments=comments)
+        user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
         extra = {}
 
     response = _llm_create(
@@ -214,17 +214,41 @@ def build_emotion_timeline(
     print(f"[感情] {len(emotions)}件のタイムライン生成完了, waveTime: {wave_time}s")
     return emotions, wave_time
 
+def extract_script_meta(raw_script: str) -> tuple[str, dict]:
+    """---META---セクションを分離してメタ情報をJSON解析して返す。戻り値: (script_without_meta, meta_dict)"""
+    meta_marker = "---META---"
+    if meta_marker not in raw_script:
+        return raw_script, {}
+    parts = raw_script.split(meta_marker, 1)
+    script = parts[0].rstrip()
+    try:
+        meta = json.loads(parts[1].strip())
+        print(f"[META] first_greeting_status={meta.get('first_greeting_status')}, "
+              f"self_affirmation_status={meta.get('self_affirmation_status')}, "
+              f"bluesky_themes={meta.get('bluesky_themes')}")
+        return script, meta
+    except json.JSONDecodeError as e:
+        print(f"[META] JSON解析失敗: {e}")
+        return script, {}
+
 def extract_thumbnail_text(raw_script: str) -> tuple[str, str, bool]:
-    """台本からサムネイル一言を抽出する。戻り値: (script, thumbnail_text, in_script)"""
+    """[Thumbnail]タグからサムネイル一言を抽出する。戻り値: (script, thumbnail_text, in_script)"""
+    m = re.search(
+        r'\[Thumbnail\]\n\[(?:Happy|Sad|Angry|Surprised|Relaxed)\]([^\n]+)',
+        raw_script
+    )
+    if m:
+        thumbnail_text = m.group(1).strip()[:15]
+        print(f"[サムネイル] 一言: {thumbnail_text}")
+        return raw_script, thumbnail_text, True
+    # 後方互換: ---THUMBNAIL--- 形式（---META---より前のみ取得）
     if "---THUMBNAIL---" in raw_script:
         parts = raw_script.split("---THUMBNAIL---", 1)
-        script = parts[0].strip()
-        thumbnail_text = parts[1].strip()
-        print(f"[サムネイル] 一言: {thumbnail_text}")
-        return script, thumbnail_text, True
-    else:
-        print("[サムネイル] 一言なし、デフォルト使用")
-        return raw_script, "今日も全肯定だよ！", False
+        thumbnail_text = parts[1].split("---")[0].strip()[:15]
+        print(f"[サムネイル] 一言（旧形式）: {thumbnail_text}")
+        return parts[0].strip(), thumbnail_text, True
+    print("[サムネイル] 一言なし、デフォルト使用")
+    return raw_script, "今日も全肯定だよ！", False
 
 # ──────────────────────────────────────────────
 # Step 3: VOICEVOXで音声生成
@@ -821,7 +845,106 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
         print("[YouTube] google-api-python-client未インストール。スキップします。")
         print("pip install google-api-python-client google-auth-oauthlib")
 
-def save_youtube_upload_to_db(url: str, title: str) -> None:
+def fetch_recent_corners(limit: int = 2) -> dict:
+    """直近N件のcornersからFirstGreeting/SelfAffirmationCornerの除外statusを取得する"""
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT corners FROM affirmative_bot.youtube_shorts
+                WHERE corners IS NOT NULL
+                ORDER BY id DESC LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    excluded_fg, excluded_sa = set(), set()
+    for row in rows:
+        corners_data = row.get("corners") or []
+        if isinstance(corners_data, str):
+            corners_data = json.loads(corners_data)
+        for corner in corners_data:
+            status = corner.get("status")
+            if not status:
+                continue
+            name = corner.get("corner_name", "")
+            if name == "FirstGreeting":
+                excluded_fg.add(status)
+            elif name == "SelfAffirmationCorner":
+                excluded_sa.add(status)
+    result = {
+        "excluded_first_greeting_statuses": list(excluded_fg),
+        "excluded_self_affirmation_statuses": list(excluded_sa),
+    }
+    print(f"[corners] 除外status: FG={result['excluded_first_greeting_statuses']}, SA={result['excluded_self_affirmation_statuses']}")
+    return result
+
+def fetch_bluesky_corner_context() -> dict:
+    """BlueskyCornerの参考リスト（いいね上位3件）と除外リスト（直近3日間）を取得する"""
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT url, corners FROM affirmative_bot.youtube_shorts
+                WHERE corners IS NOT NULL AND created_at >= NOW() - INTERVAL '14 days'
+                ORDER BY created_at DESC
+            """)
+            videos_14d = cur.fetchall()
+            cur.execute("""
+                SELECT corners FROM affirmative_bot.youtube_shorts
+                WHERE corners IS NOT NULL AND created_at >= NOW() - INTERVAL '3 days'
+                ORDER BY created_at DESC
+            """)
+            videos_3d = cur.fetchall()
+    finally:
+        conn.close()
+
+    # 除外リスト（直近3日間のBlueskyCornerテーマ）
+    excluded_themes = []
+    for row in videos_3d:
+        for corner in (row.get("corners") or []):
+            if corner.get("corner_name") == "BlueskyCorner":
+                themes = corner.get("theme", [])
+                if isinstance(themes, list):
+                    excluded_themes.extend(themes)
+
+    # 参考リスト: YouTube APIでいいね数取得 → 上位3件のBlueskyCornerテーマ
+    reference_themes = []
+    if videos_14d:
+        try:
+            yt = _get_youtube_client()
+            video_likes = []
+            for video in videos_14d:
+                vid_match = re.search(r'[?&]v=([^&]+)', video["url"])
+                if not vid_match:
+                    continue
+                try:
+                    resp = yt.videos().list(part="statistics", id=vid_match.group(1)).execute()
+                    items = resp.get("items", [])
+                    if items:
+                        like_count = int(items[0]["statistics"].get("likeCount", 0))
+                        video_likes.append({"like_count": like_count, "corners": video["corners"]})
+                except Exception as e:
+                    print(f"[YouTube API] いいね数取得失敗: {e}")
+            video_likes.sort(key=lambda x: x["like_count"], reverse=True)
+            for v in video_likes[:3]:
+                for corner in (v["corners"] or []):
+                    if corner.get("corner_name") == "BlueskyCorner":
+                        themes = corner.get("theme", [])
+                        if isinstance(themes, list):
+                            reference_themes.extend(themes)
+        except Exception as e:
+            print(f"[YouTube API] 参考リスト取得失敗（スキップ）: {e}")
+
+    result = {
+        "reference_bluesky_themes": list(dict.fromkeys(reference_themes)),
+        "excluded_bluesky_themes": list(dict.fromkeys(excluded_themes)),
+    }
+    print(f"[corners] BlueskyCorner参考={result['reference_bluesky_themes']}, 除外={result['excluded_bluesky_themes']}")
+    return result
+
+def save_youtube_upload_to_db(url: str, title: str, corners_metadata: list[dict] = None) -> None:
     """YouTube投稿情報をDBのyoutube_shortsテーブルに記録する"""
     print(f"[DB] YouTube投稿情報を記録中: {url}")
     conn = psycopg2.connect(**DB_CONFIG)
@@ -829,11 +952,11 @@ def save_youtube_upload_to_db(url: str, title: str) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO affirmative_bot.youtube_shorts (url, title, status)
-                VALUES (%s, %s, 'new')
+                INSERT INTO affirmative_bot.youtube_shorts (url, title, status, corners)
+                VALUES (%s, %s, 'new', %s)
                 ON CONFLICT (url) DO NOTHING
                 """,
-                (url, title),
+                (url, title, json.dumps(corners_metadata or [], ensure_ascii=False)),
             )
         conn.commit()
         print("[DB] youtube_shorts に記録完了")
@@ -900,15 +1023,25 @@ def main():
         has_comments = bool(comments)
         print(f"[コメント] CommentCorner: {'あり (' + str(len(comments)) + '件)' if has_comments else 'なし → スキップ'}")
 
+        # corner_context取得（直近status除外・Bluesky参考/除外リスト）
+        corner_context = {}
+        try:
+            recent_corners = fetch_recent_corners(limit=2)
+            bsky_context = fetch_bluesky_corner_context()
+            corner_context = {**recent_corners, **bsky_context}
+        except Exception as e:
+            print(f"[corner_context] 取得失敗（スキップ）: {e}")
+
         # Step 2: 台本生成
         script_cache = os.getenv("SCRIPT_CACHE", "")
         if script_cache and Path(script_cache).exists():
             raw_script = open(script_cache).read()
             print(f"[LLM] キャッシュから台本読み込み: {script_cache}")
         else:
-            raw_script = _timed("Step2 台本生成", generate_script, data, comments)
+            raw_script = _timed("Step2 台本生成", generate_script, data, comments, corner_context)
 
         # Step 2.5: タグ抽出、クリーン台本作成
+        raw_script, script_meta = extract_script_meta(raw_script)  # ---META--- 分離（先に実行）
         raw_script, thumbnail_text, thumbnail_in_script = extract_thumbnail_text(raw_script)
         section_starts = extract_section_starts(raw_script)  # セクションタグ除去前に抽出
         print(f"[セクション] 検出: {section_starts}")
@@ -980,7 +1113,16 @@ def main():
         if os.getenv("SKIP_YOUTUBE") != "true":
             yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description, thumbnail_path)
             if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
-                save_youtube_upload_to_db(yt_url, title)
+                corners_metadata = [
+                    {"corner_name": "Thumbnail", "theme": thumbnail_text},
+                    {"corner_name": "FirstGreeting", "status": script_meta.get("first_greeting_status", "")},
+                    {"corner_name": "SelfAffirmationCorner", "status": script_meta.get("self_affirmation_status", "")},
+                ]
+                if not has_comments:
+                    bluesky_themes = script_meta.get("bluesky_themes", [])
+                    if isinstance(bluesky_themes, list) and bluesky_themes:
+                        corners_metadata.append({"corner_name": "BlueskyCorner", "theme": bluesky_themes})
+                save_youtube_upload_to_db(yt_url, title, corners_metadata)
         else:
             print("[YouTube] スキップ (SKIP_YOUTUBE=true)")
 

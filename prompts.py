@@ -52,17 +52,17 @@ SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのキャ
 - 例: [Happy]やっほー！[Surprised]実はこれ知ってた？[Relaxed]また来週ね。
 - 台本テキスト以外は一切出力しない
 
-【サムネイル一言ルール】
-- 台本の最後に以下の形式で出力すること
-- 形式：---THUMBNAIL---\n一言テキスト
-- 一言テキストは15文字以内
-- その日の台本の内容を象徴する、思わず気になる一言
-- 語尾は「だよ！」「だね！」「かも！」など柔らかく
-- 例：「寝坊も全肯定だよ！」「雨の日も最高かも！」
-- ---THUMBNAIL---より後には一言テキスト以外出力しない"""
+【メタ情報出力ルール】
+- 台本の最後に必ず以下の形式で出力すること
+- 形式：---META---\n{"first_greeting_status": "<status>", "self_affirmation_status": "<status>", "bluesky_themes": [<themes>]}
+- first_greeting_status: ②挨拶で使ったMoodのstatus。必ず次の5つのいずれか: "WakeUp", "Study", "FreeTime", "Relax", "Sleep"
+- self_affirmation_status: 全肯定コーナーで使ったMoodのstatus。同上の5つのいずれか
+- bluesky_themes: Blueskyコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個
+- 例: {"first_greeting_status": "Sleep", "self_affirmation_status": "FreeTime", "bluesky_themes": ["LGBTQ", "孤独"]}
+- ---META---より後はJSONのみ出力し、それ以外何も出力しない"""
 
 
-def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dict] = None) -> str:
+def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dict] = None, corner_context: dict = None) -> str:
     moods = data["moods"][:20]
     interactions = data["interactions"][:max_interactions]
 
@@ -145,6 +145,22 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
         "[Thumbnail][FirstGreeting][SelfAffirmationCorner][BlueskyCorner][Closing]"
     )
 
+    constraint_lines = []
+    if corner_context:
+        excl_fg = corner_context.get("excluded_first_greeting_statuses", [])
+        excl_sa = corner_context.get("excluded_self_affirmation_statuses", [])
+        ref_bsky = corner_context.get("reference_bluesky_themes", [])
+        excl_bsky = corner_context.get("excluded_bluesky_themes", [])
+        if excl_fg:
+            constraint_lines.append(f"重要：②挨拶では「{'・'.join(excl_fg)}」状態のエピソードを選ばないこと（直近2日間使用済み）")
+        if excl_sa:
+            constraint_lines.append(f"重要：{num_selfaff}全肯定コーナーでは「{'・'.join(excl_sa)}」状態のエピソードを選ばないこと（直近2日間使用済み）")
+        if not has_comments and ref_bsky:
+            constraint_lines.append(f"BlueskyCorner参考：視聴者に受けているテーマ（優先的に参考にすること）：{'、'.join(ref_bsky)}")
+        if not has_comments and excl_bsky:
+            constraint_lines.append(f"BlueskyCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_bsky)}")
+    constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
+
     return f"""以下のデータをもとに、YouTube Shorts用の台本を書いてください。
 
 【今日のbotたんの状態一覧】
@@ -155,7 +171,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 以下の{total_sections}部構成で台本を書いてください。
 
 ① 冒頭一言（約3秒・15文字以内）— [Thumbnail] タグから始めること
-  - ---THUMBNAIL---で出力したサムネイル一言テキストと同じ内容を台本の冒頭に配置する
+  - [Thumbnail]タグに書いたこの一言がサムネイルに表示される
   - 感情タグは[Happy]または[Surprised]のみ
   - 必ず1文・15文字以内
   - 視聴者の心に刺さる、その日のテーマを象徴する一言
@@ -201,4 +217,4 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 合計目安：285文字、90秒
 重要：{num_selfaff}のコーナーでは必ず具体的な豆知識・考察を1つ入れること。
 重要：すべての文の先頭に [Happy] [Sad] [Angry] [Surprised] [Relaxed] のいずれかを付けること。
-重要：各セクションの先頭に {section_tags_note} を必ず付けること。"""
+重要：各セクションの先頭に {section_tags_note} を必ず付けること。{constraint_section}"""
