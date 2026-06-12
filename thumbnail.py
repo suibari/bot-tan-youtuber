@@ -1,9 +1,10 @@
 # thumbnail.py
+import random
 import subprocess
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
-FONT_MARU = "/usr/share/fonts/opentype/mplus/Mplus1-Bold.otf"
+FONT_MARU = "/usr/share/fonts/truetype/keifont/keifont.ttf"
 W, H = 1080, 1920
 BLUE = (0, 133, 255)
 
@@ -11,10 +12,10 @@ BLUE = (0, 133, 255)
 def capture_thumbnail_frame(input_webm: str, output_png: str, emotions: list[dict]) -> None:
     """動画からサムネイル用フレームを切り出す"""
     target_time = 2.0
-    for e in emotions:
-        if e["emotion"] != "Happy":
-            target_time = e["time"] + 0.5
-            break
+    non_happy = [e for e in emotions if e["emotion"] != "Happy"]
+    if non_happy:
+        chosen = random.choice(non_happy)
+        target_time = chosen["time"] + random.uniform(0.0, 1.5)
 
     cmd = ["ffmpeg", "-y", "-i", input_webm,
            "-ss", str(target_time), "-vframes", "1", output_png]
@@ -44,20 +45,22 @@ def generate_thumbnail(frame_png: str, output_png: str, thumbnail_text: str) -> 
     bbox = draw.textbbox((0, 0), top_text, font=font_top)
     text_w = bbox[2] - bbox[0]
     x = (W - text_w) // 2
-    y = 60
+    y = 190
     draw_text_with_outline(draw, top_text, font_top, x, y,
                            text_color=BLUE,
-                           outline_color=(0, 0, 0),
+                           outline_color=(255, 255, 255),
                            outline_width=8)
 
     # 下部テキスト（青帯 + 白文字）
-    font_bottom = ImageFont.truetype(FONT_MARU, 60)
-    box_y = H - 220
-    draw.rectangle([0, box_y, W, box_y + 180], fill=BLUE + (235,))
+    font_bottom = ImageFont.truetype(FONT_MARU, 90)
+    box_y = H - 480
+    box_h = 230
+    draw.rectangle([0, box_y, W, box_y + box_h], fill=BLUE + (235,))
     bbox = draw.textbbox((0, 0), thumbnail_text, font=font_bottom)
     text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
     x = (W - text_w) // 2
-    y = box_y + 55
+    y = box_y + (box_h - text_h) // 2 - bbox[1]
     draw.text((x, y), thumbnail_text, font=font_bottom, fill=(255, 255, 255))
 
     # PNG保存

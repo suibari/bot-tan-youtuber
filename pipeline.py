@@ -492,7 +492,7 @@ def _start_xvfb() -> tuple:
     raise RuntimeError("Xvfb: 空きディスプレイ番号が見つかりません (99-199)")
 
 
-def record_with_unity(wav_path: str, output_webm: str, emotion_path: str, screenshot_path: str) -> None:
+def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> None:
     """Unityを起動してVRM口パク録画を行う"""
     print(f"[Unity] 録画開始...")
     # 既存のUnityプロセスを終了
@@ -517,7 +517,6 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str, screen
             "-wavFile", wav_path,
             "-outputFile", output_base,
             "-emotionFile", emotion_path,
-            "-screenshotFile", screenshot_path,
         ]
         print(f"[Unity] コマンド: {' '.join(cmd)}")
 
@@ -964,11 +963,12 @@ def main():
         print(f"[感情] 保存: {emotion_path}")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
-        _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path, screenshot_path,
+        _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
                catch=(RuntimeError, TimeoutError))
 
         # サムネ作成
         thumbnail_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
+        capture_thumbnail_frame(webm_path, screenshot_path, emotions)
         generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
 
         # Step 5: MP4変換
