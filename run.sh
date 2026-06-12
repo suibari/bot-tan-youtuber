@@ -2,12 +2,6 @@
 source /home/suibari/work/bottan-pipeline/venv/bin/activate
 mkdir -p /home/suibari/work/bottan-pipeline/logs
 
-# Unityスクリプトを同期
-echo "[Setup] Unityスクリプトを同期中..."
-cp /home/suibari/work/bottan-pipeline/unity-scripts/VRM1LipSync.cs /home/suibari/bottan-video/Assets/Scripts/VRM1LipSync.cs
-cp /home/suibari/work/bottan-pipeline/unity-scripts/VideoRecorder.cs /home/suibari/bottan-video/Assets/Scripts/VideoRecorder.cs
-echo "[Setup] 同期完了"
-
 # 引数から環境変数をセット (KEY=VALUE 形式)
 for arg in "$@"; do
     if [[ "$arg" == *=* ]]; then
