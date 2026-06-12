@@ -2,6 +2,9 @@
 source /home/suibari/work/bottan-pipeline/venv/bin/activate
 mkdir -p /home/suibari/work/bottan-pipeline/logs
 
+# requirementsに更新があったら、インストールする
+pip install -r requirements.txt -q --disable-pip-version-check 2>&1 | grep -v "already satisfied"
+
 # 引数から環境変数をセット (KEY=VALUE 形式)
 for arg in "$@"; do
     if [[ "$arg" == *=* ]]; then
