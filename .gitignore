@@ -221,3 +221,5 @@ __marimo__/
 
 .client_secret.json
 unity-scripts/*.meta
+
+test*.py

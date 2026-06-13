@@ -31,7 +31,7 @@ from pathlib import Path
 
 import requests
 from atproto import Client
-from openai import OpenAI
+from openai import OpenAI, BadRequestError as _OpenAIBadRequestError
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -71,6 +71,45 @@ else:
     LLM_MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").split(",") if m.strip()]
     LLM_MODEL = LLM_MODELS[0]
     print(f"[LLM] Gemini ({', '.join(LLM_MODELS)}) を使用します")
+
+# Gemini response_schema: 台本をJSONとして構造化出力させるスキーマ
+SCRIPT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "section": {"type": "string"},
+                    "sentences": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text":    {"type": "string"},
+                                "valence": {"type": "number"},
+                                "arousal": {"type": "number"},
+                            },
+                            "required": ["text", "valence", "arousal"],
+                        },
+                    },
+                },
+                "required": ["section", "sentences"],
+            },
+        },
+        "meta": {
+            "type": "object",
+            "properties": {
+                "first_greeting_status":   {"type": "string"},
+                "self_affirmation_status": {"type": "string"},
+                "bluesky_themes":          {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["first_greeting_status", "self_affirmation_status", "bluesky_themes"],
+        },
+    },
+    "required": ["sections", "meta"],
+}
 
 # ──────────────────────────────────────────────
 # Step 1: ラズパイDBからデータ取得
@@ -152,23 +191,32 @@ def generate_script(data: dict, comments: list[dict] = None, corner_context: dic
     """DBデータから台本を生成する"""
     print(f"[LLM] 台本生成中...")
 
+    user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
+    extra_kwargs: dict = {}
+
     if USE_LOCAL_LLM:
-        # ローカルLLMはコンテキストが小さいため、thinkingを無効化
-        user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
-        extra = {"options": {"num_ctx": int(os.getenv("LOCAL_LLM_CTX", "8192"))},
-                 "think": False}
+        # Gemma(Ollama)はresponse_schema非対応のため構造化出力不可
+        extra_kwargs["extra_body"] = {
+            "options": {"num_ctx": int(os.getenv("LOCAL_LLM_CTX", "8192"))},
+            "think": False,
+        }
     else:
-        user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
-        extra = {}
+        # Gemini OpenAI互換エンドポイントの構造化出力はresponse_formatで渡す
+        # （extra_bodyにresponse_mime_type/response_schemaを渡すと400エラーになる）
+        extra_kwargs["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name":   "script",
+                "schema": SCRIPT_SCHEMA,
+            },
+        }
 
     response = _llm_create(
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ],
-        #max_tokens=4000,
-        #temperature=0.5,
-        extra_body=extra if extra else None,
+        **extra_kwargs,
     )
     print(f"[DEBUG] finish_reason: {response.choices[0].finish_reason}")
 
@@ -178,77 +226,42 @@ def generate_script(data: dict, comments: list[dict] = None, corner_context: dic
 
 import re
 
-def extract_emotions_from_script(script: str) -> tuple[str, list[tuple[str, str]]]:
-    """台本からタグを抽出し、クリーン台本と(emotion, text)リストを返す"""
-    pattern = re.compile(r'\[(Happy|Sad|Angry|Surprised|Relaxed)\]([^\[]+)', re.DOTALL)
-    matches = pattern.findall(script)
-
-    clean_script = re.sub(r'\[(Happy|Sad|Angry|Surprised|Relaxed)\]', '', script)
-    clean_script = re.sub(r'\[[^\]]*\]', '', clean_script).strip()  # [Study][SelfAffirmationCorner]等の残留タグを除去
-    return clean_script, matches  # タイミングはまだ計算しない
+def parse_script_json(raw_script: str) -> dict:
+    """Gemini構造化出力のJSONをパースする。
+    戻り値: {"sections": [...], "meta": {...}}
+    USE_LOCAL_LLM=True（Gemma）の場合はJSONパースを試みるが、
+    失敗しても呼び出し元でエラーとして扱う（Gemmaでの構造化出力は非サポート）。
+    """
+    cleaned = re.sub(r"```json|```", "", raw_script).strip()
+    return json.loads(cleaned)
 
 
 def build_emotion_timeline(
-    matches: list[tuple[str, str]],
+    sentences: list[dict],
     subtitles: list[dict],
     intro_duration: float = 0.0
 ) -> tuple[list[dict], float]:
-    """字幕タイミング確定後に感情タイムラインを生成する
+    """文ごとのvalence/arousalから感情タイムラインを生成する。
     戻り値: (emotions, wave_time)
     """
     total_duration = subtitles[-1]["end"] if subtitles else 90
-    total_chars = sum(len(text.strip()) for _, text in matches)
+    total_chars = sum(len(s["text"]) for s in sentences)
 
     emotions = []
     char_offset = 0
-    for emotion, text in matches:
+    for sentence in sentences:
         ratio = char_offset / total_chars if total_chars > 0 else 0
         emotions.append({
-            "time": round(total_duration * ratio, 2),
-            "emotion": emotion
+            "time":    round(total_duration * ratio, 2),
+            "valence": sentence.get("valence", 0.0),
+            "arousal": sentence.get("arousal", 0.0),
         })
-        char_offset += len(text.strip())
+        char_offset += len(sentence["text"])
 
     wave_time = subtitles[-1]["start"] if subtitles else 0
 
     print(f"[感情] {len(emotions)}件のタイムライン生成完了, waveTime: {wave_time}s")
     return emotions, wave_time
-
-def extract_script_meta(raw_script: str) -> tuple[str, dict]:
-    """---META---セクションを分離してメタ情報をJSON解析して返す。戻り値: (script_without_meta, meta_dict)"""
-    meta_marker = "---META---"
-    if meta_marker not in raw_script:
-        return raw_script, {}
-    parts = raw_script.split(meta_marker, 1)
-    script = parts[0].rstrip()
-    try:
-        meta = json.loads(parts[1].strip())
-        print(f"[META] first_greeting_status={meta.get('first_greeting_status')}, "
-              f"self_affirmation_status={meta.get('self_affirmation_status')}, "
-              f"bluesky_themes={meta.get('bluesky_themes')}")
-        return script, meta
-    except json.JSONDecodeError as e:
-        print(f"[META] JSON解析失敗: {e}")
-        return script, {}
-
-def extract_thumbnail_text(raw_script: str) -> tuple[str, str, bool]:
-    """[Thumbnail]タグからサムネイル一言を抽出する。戻り値: (script, thumbnail_text, in_script)"""
-    m = re.search(
-        r'\[Thumbnail\]\n\[(?:Happy|Sad|Angry|Surprised|Relaxed)\]([^\n]+)',
-        raw_script
-    )
-    if m:
-        thumbnail_text = m.group(1).strip()[:15]
-        print(f"[サムネイル] 一言: {thumbnail_text}")
-        return raw_script, thumbnail_text, True
-    # 後方互換: ---THUMBNAIL--- 形式（---META---より前のみ取得）
-    if "---THUMBNAIL---" in raw_script:
-        parts = raw_script.split("---THUMBNAIL---", 1)
-        thumbnail_text = parts[1].split("---")[0].strip()[:15]
-        print(f"[サムネイル] 一言（旧形式）: {thumbnail_text}")
-        return parts[0].strip(), thumbnail_text, True
-    print("[サムネイル] 一言なし、デフォルト使用")
-    return raw_script, "今日も全肯定だよ！", False
 
 # ──────────────────────────────────────────────
 # Step 3: VOICEVOXで音声生成
@@ -282,41 +295,63 @@ def _synthesize(text: str, output_path: str, extra_params: dict = None) -> None:
         f.write(synth_res.content)
 
 
-def generate_voice(script: str, output_path: str, intro_text: str = "") -> None:
-    """VOICEVOXで音声ファイルを生成する。intro_text がある場合は冒頭一言を結合する"""
-    print(f"[VOICEVOX] 音声生成中... (speaker: {VOICEVOX_SPEAKER})")
+def valence_arousal_to_voicevox_params(valence: float, arousal: float) -> dict:
+    """valence/arousalをVOICEVOXの音声パラメータに変換する。
+    speedScaleは一定に保つ（YouTube視聴体験のため速さの変動を避ける）。
+    """
+    return {
+        "pitchScale":      round(arousal  * 0.08, 3),   # 興奮→高め
+        "intonationScale": round(1.0 + valence * 0.3, 3),  # ポジティブ→抑揚強め
+        "volumeScale":     round(1.0 + arousal * 0.1, 3),  # 興奮→大きめ
+    }
 
-    if intro_text:
-        intro_wav = output_path.replace(".wav", "_intro.wav")
-        main_tmp  = output_path + ".main_tmp.wav"
-        list_file = output_path + ".concat_list.txt"
-        try:
+
+def generate_voice(sentences: list[dict], output_path: str, intro_text: str = "") -> None:
+    """VOICEVOXで文ごとに音声合成し結合する。intro_textがある場合は冒頭一言を先頭に付ける。
+    sentences: [{"text": str, "valence": float, "arousal": float}, ...]
+    """
+    print(f"[VOICEVOX] 文ごと音声生成中... (speaker: {VOICEVOX_SPEAKER})")
+    tmp_dir = Path(tempfile.gettempdir())
+    part_paths = []
+    list_file = output_path + ".concat_list.txt"
+    intro_wav = output_path.replace(".wav", "_intro.wav")
+
+    try:
+        if intro_text:
             _synthesize(intro_text, intro_wav, {
                 "speedScale":      0.85,
                 "intonationScale": 1.4,
                 "volumeScale":     1.3,
                 "pitchScale":      0.05,
             })
-            _synthesize(script, main_tmp)
-            with open(list_file, "w") as f:
-                f.write(f"file '{intro_wav}'\nfile '{main_tmp}'\n")
-            subprocess.run(
-                ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                 "-i", list_file, "-c", "copy", output_path],
-                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            part_paths.append(intro_wav)
+
+        for i, sentence in enumerate(sentences):
+            part_path = str(tmp_dir / f"{Path(output_path).stem}_part{i:03d}.wav")
+            params = valence_arousal_to_voicevox_params(
+                sentence.get("valence", 0.0),
+                sentence.get("arousal", 0.0),
             )
-            print(f"[VOICEVOX] 冒頭+本編音声生成完了: {output_path}")
-            return
-        except Exception as e:
-            print(f"[VOICEVOX] 冒頭一言生成失敗、本編のみで続行: {e}")
-        finally:
-            for p in [main_tmp, list_file]:
+            _synthesize(sentence["text"], part_path, params)
+            part_paths.append(part_path)
+
+        with open(list_file, "w") as f:
+            for p in part_paths:
+                f.write(f"file '{p}'\n")
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+             "-i", list_file, "-c", "copy", output_path],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        print(f"[VOICEVOX] 音声生成完了: {output_path} ({len(sentences)}文)")
+
+    finally:
+        for p in part_paths:
+            if p != intro_wav:  # intro_wavはmain()でcleanup
                 if Path(p).exists():
                     Path(p).unlink()
-
-    # intro_text なし or 冒頭生成失敗時は本編のみ
-    _synthesize(script, output_path)
-    print(f"[VOICEVOX] 音声生成完了: {output_path}")
+        if Path(list_file).exists():
+            Path(list_file).unlink()
 
 # ──────────────────────────────────────────────
 # Step 3.5: 字幕タイミング生成
@@ -345,21 +380,25 @@ def _query_mora_times(text: str) -> tuple[list[dict], float]:
     return mora_times, total
 
 
+def split_sentences(script: str) -> list[str]:
+    """台本を句読点・改行で文に分割する（共通ユーティリティ）"""
+    sentences = re.split(r"(?<=[。！？\n])", script)
+    return [s.strip() for s in sentences if s.strip()]
+
+
 def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict]:
     """文ごとにaudio_queryを発行してタイミングを取得し、字幕データを生成する。
 
     文単位で独立したモーラ計測を行うことで、漢字とかなの混在による
     文字数比率ずれを排除する。
     """
-    import re
     print("[字幕] タイミング情報取得中...")
 
     # フルスクリプトのクエリで合計尺を取得（スケーリング基準）
     _, total_duration = _query_mora_times(script)
 
     # 台本を句読点・改行で文に分割
-    sentences = re.split(r"(?<=[。！？\n])", script)
-    sentences = [s.strip() for s in sentences if s.strip()]
+    sentences = split_sentences(script)
 
     # 各文のモーラタイミングと尺を取得
     sentence_data = []
@@ -417,24 +456,6 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict
     print(f"[字幕] {len(subtitles)}ブロック生成完了")
     return subtitles
 
-
-SECTION_TAGS = ['Thumbnail', 'FirstGreeting', 'CommentCorner', 'SelfAffirmationCorner', 'BlueskyCorner', 'Closing']
-
-
-def extract_section_starts(raw_script: str) -> dict[str, str]:
-    """セクションタグ直後の発話テキスト先頭8文字を返す（字幕検索キーワード用）"""
-    result = {}
-    tags_pattern = '|'.join(SECTION_TAGS)
-    section_re = re.compile(
-        r'\[(' + tags_pattern + r')\](.*?)(?=\[(?:' + tags_pattern + r')\]|---THUMBNAIL---|$)',
-        re.DOTALL
-    )
-    for m in section_re.finditer(raw_script):
-        tag = m.group(1)
-        text = re.sub(r'\[[^\]]*\]', '', m.group(2)).strip()
-        if text:
-            result[tag] = text[:8]
-    return result
 
 
 def _find_subtitle_time(subtitles: list[dict], keyword: str, start_from: float = 0.0) -> float | None:
@@ -983,12 +1004,17 @@ def _retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,)):
             print(f"[{label}] 試行{attempt}失敗、リトライします... ({e})")
 
 def _llm_create(attempts_per_model: int = 3, **kwargs):
-    """LLM_MODELS を左から順に attempts_per_model 回ずつ試す"""
+    """LLM_MODELS を左から順に attempts_per_model 回ずつ試す。
+    400/422 などリクエスト不正エラーは即時再送しても意味がないので1回で失敗させる。
+    """
     last_exc = None
     for model in LLM_MODELS:
         for attempt in range(1, attempts_per_model + 1):
             try:
                 return llm_client.chat.completions.create(model=model, **kwargs)
+            except _OpenAIBadRequestError as e:
+                # 400系はリトライ不要（プロンプトやスキーマの問題）
+                raise
             except Exception as e:
                 last_exc = e
                 if attempt < attempts_per_model:
@@ -1041,39 +1067,42 @@ def main():
         else:
             raw_script = _timed("Step2 台本生成", generate_script, data, comments, corner_context)
 
-        # Step 2.5: タグ抽出、クリーン台本作成
-        raw_script, script_meta = extract_script_meta(raw_script)  # ---META--- 分離（先に実行）
-        raw_script, thumbnail_text, thumbnail_in_script = extract_thumbnail_text(raw_script)
-        section_starts = extract_section_starts(raw_script)  # セクションタグ除去前に抽出
-        print(f"[セクション] 検出: {section_starts}")
-        clean_script, emotion_matches = extract_emotions_from_script(raw_script)
-
-        # 冒頭一言（thumbnail_text）をclean_scriptの先頭から除去してmain_scriptを作る
-        # ---THUMBNAIL--- がなく fallback テキストの場合はスキップ（誤削除防止）
-        main_script = clean_script
-        if thumbnail_in_script and thumbnail_text:
-            stripped = clean_script.strip()
-            if stripped.startswith(thumbnail_text):
-                main_script = stripped[len(thumbnail_text):].strip()
-            else:
-                m = re.match(r'^[^。！？\n]+[。！？\n]?', stripped)
-                if m:
-                    main_script = stripped[m.end():].strip()
+        # Step 2.5: JSONパース、クリーン台本作成
+        script_data = parse_script_json(raw_script)
+        sections = {s["section"]: s["sentences"] for s in script_data["sections"]}
+        script_meta = script_data["meta"]
+        print(f"[META] first_greeting_status={script_meta.get('first_greeting_status')}, "
+              f"self_affirmation_status={script_meta.get('self_affirmation_status')}, "
+              f"bluesky_themes={script_meta.get('bluesky_themes')}")
+        thumbnail_sentences = sections.get("Thumbnail", [])
+        thumbnail_text = thumbnail_sentences[0]["text"][:15] if thumbnail_sentences else "今日も全肯定だよ！"
+        print(f"[サムネイル] 一言: {thumbnail_text}")
+        # Thumbnail以外の全文をフラットなリストに
+        main_sentences = [
+            sent
+            for s in script_data["sections"]
+            if s["section"] != "Thumbnail"
+            for sent in s["sentences"]
+        ]
+        clean_script = "".join(s["text"] for s in main_sentences)
+        # コーナータイミング用: 各セクション先頭テキストの先頭8文字
+        section_starts = {k: v[0]["text"][:8] if v else "" for k, v in sections.items()}
+        print(f"[セクション] 検出: {list(sections.keys())}")
 
         # Step 3: 音声生成
-        _timed("Step3 音声生成", generate_voice, main_script, wav_path, thumbnail_text)
+        _timed("Step3 音声生成", generate_voice, main_sentences, wav_path, thumbnail_text)
 
         # 冒頭一言の音声時間を取得
         intro_duration = get_wav_duration(intro_wav_path) if thumbnail_text and Path(intro_wav_path).exists() else 0.0
 
         # Step 3.5: 字幕・コーナータイミング生成
-        subtitles = generate_subtitle_timing(main_script, time_offset=intro_duration)
+        subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration)
         if intro_duration > 0:
             subtitles = [{"start": 0.0, "end": round(intro_duration, 3), "text": thumbnail_text}] + subtitles
-        corners   = generate_corner_timing(main_script, subtitles, intro_duration, section_starts, has_comments)
+        corners   = generate_corner_timing(clean_script, subtitles, intro_duration, section_starts, has_comments)
 
         # 感情タイムライン生成
-        emotions, wave_time = build_emotion_timeline(emotion_matches, subtitles, intro_duration)
+        emotions, wave_time = build_emotion_timeline(main_sentences, subtitles, intro_duration)
 
         # トリガー発火時刻を字幕から算出
         # DoGreeting①: ②挨拶末尾の「botたんだよ」発話タイミング（セクション先頭ではなく末尾）

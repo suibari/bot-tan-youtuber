@@ -12,9 +12,10 @@ BLUE = (0, 133, 255)
 def capture_thumbnail_frame(input_webm: str, output_png: str, emotions: list[dict]) -> None:
     """動画からサムネイル用フレームを切り出す"""
     target_time = 2.0
-    non_happy = [e for e in emotions if e["emotion"] != "Happy"]
-    if non_happy:
-        chosen = random.choice(non_happy)
+    # バニラHappy（高valence・低arousal）以外の表情が出るフレームを優先する
+    expressive = [e for e in emotions if e.get("valence", 0.8) <= 0.6 or e.get("arousal", 0.3) >= 0.4]
+    if expressive:
+        chosen = random.choice(expressive)
         target_time = chosen["time"] + random.uniform(0.0, 1.5)
 
     cmd = ["ffmpeg", "-y", "-i", input_webm,

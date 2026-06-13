@@ -15,51 +15,59 @@ SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのキャ
 - 難しい話もオチで全肯定につなげる
 
 【出力ルール】
-- 台本テキストのみ出力する
-- セクション名・記号・説明文は一切含めない
 - 日本語のみで出力する
 - 接続詞「それから」「そして」の連続使用を避ける
+- textフィールドに[Happy][Sad]などの感情タグを含めないこと。感情はvalence/arousalで表現する
 
-【セクションタグルール】
-- 各セクションの先頭行（感情タグの前）に必ず以下のセクションタグを1つ付ける
-  - [Thumbnail]             → ①冒頭一言の前
-  - [FirstGreeting]         → ②挨拶の前
-  - [CommentCorner]         → ③コメントコーナーの前（コメントデータが提供された場合のみ使用）
-  - [SelfAffirmationCorner] → ③or④全肯定コーナーの前
-  - [BlueskyCorner]         → ④or⑤今日のBlueskyの前
-  - [Closing]               → ⑤or⑥締めの前
-- セクションタグは感情タグとは別物。各セクション冒頭に1行だけ記載する
-- [CommentCorner]はコメントデータが提供された場合のみ使用し、それ以外は使わないこと
-- 例:
-  [Thumbnail]
-  [Happy]雨の日も晴れだよ！
-  [FirstGreeting]
-  [Happy]朝がちょっと苦手だったけど、全肯定で乗り切った！botたんだよ！
+【出力形式】
+以下のJSON構造で出力すること。JSONのみ出力し、説明文・コードブロック記号は一切含めない。
 
-【感情タグルール】
-- 各文の先頭に感情タグを必ず付ける
-- 使用できるタグ: [Happy] [Sad] [Angry] [Surprised] [Relaxed]
-- このタグ以外（[Sleep][Study]など）は絶対に使わない
-- 必ず複数の感情を使い分けること。全文をHappyにしてはいけない
-- 感情の使い分けの目安：
-  - [Happy]   : 明るい話題、全肯定、前向きな内容
-  - [Surprised]: 豆知識・意外な事実を紹介するとき
-  - [Relaxed] : 落ち着いた話題、締めのメッセージ
-  - [Sad]     : 共感・悲しい話題に触れるとき
-  - [Angry]   : 使わなくてよい（botたんのキャラクターに合わない）
-- 1つの台本で最低3種類以上の感情タグを使うこと
-- タグと本文の間にスペースは入れない
-- 例: [Happy]やっほー！[Surprised]実はこれ知ってた？[Relaxed]また来週ね。
-- 台本テキスト以外は一切出力しない
+{
+  "sections": [
+    {
+      "section": "Thumbnail",
+      "sentences": [{"text": "今日の一言", "valence": 0.8, "arousal": 0.5}]
+    },
+    {
+      "section": "FirstGreeting",
+      "sentences": [
+        {"text": "文章1", "valence": 0.9, "arousal": 0.4},
+        ...
+      ]
+    },
+    ...
+  ],
+  "meta": {
+    "first_greeting_status": "WakeUp",
+    "self_affirmation_status": "Relax",
+    "bluesky_themes": ["テーマ1", "テーマ2"]
+  }
+}
 
-【メタ情報出力ルール】
-- 台本の最後に必ず以下の形式で出力すること
-- 形式：---META---\n{"first_greeting_status": "<status>", "self_affirmation_status": "<status>", "bluesky_themes": [<themes>]}
+【sectionの種類】
+- "Thumbnail"             → ①冒頭一言（sentences は1要素のみ）
+- "FirstGreeting"         → ②挨拶
+- "CommentCorner"         → ③コメントコーナー（コメントデータが提供された場合のみ使用）
+- "SelfAffirmationCorner" → ③or④全肯定コーナー
+- "BlueskyCorner"         → ④or⑤今日のBluesky
+- "Closing"               → ⑤or⑥締め
+"CommentCorner"はコメントデータが提供された場合のみ使用すること。
+
+【valence/arousalの指定ルール】
+各sentenceのvalenceとarousalは -1.0〜1.0 の実数で指定する。
+必ず複数の値を使い分けること。全文を同じ値にしてはいけない。
+- valence: ネガティブ(-1.0) 〜 ポジティブ(+1.0)
+- arousal: 落ち着き(-1.0) 〜 興奮(+1.0)
+目安：
+  - 明るい話題：valence +0.7〜+0.9、arousal +0.3〜+0.6
+  - 豆知識・驚き：valence +0.3、arousal +0.8〜+1.0
+  - 落ち着いた締め：valence +0.4、arousal -0.5〜-0.7
+  - 共感・悲しみ：valence -0.5〜-0.8、arousal -0.3〜-0.5
+
+【metaの各フィールド】
 - first_greeting_status: ②挨拶で使ったMoodのstatus。必ず次の5つのいずれか: "WakeUp", "Study", "FreeTime", "Relax", "Sleep"
 - self_affirmation_status: 全肯定コーナーで使ったMoodのstatus。同上の5つのいずれか
-- bluesky_themes: Blueskyコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個
-- 例: {"first_greeting_status": "Sleep", "self_affirmation_status": "FreeTime", "bluesky_themes": ["LGBTQ", "孤独"]}
-- ---META---より後はJSONのみ出力し、それ以外何も出力しない"""
+- bluesky_themes: Blueskyコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個"""
 
 
 def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dict] = None, corner_context: dict = None) -> str:
@@ -78,8 +86,9 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
         status = m.get("status", "")
         mood_ja = m.get("mood", "")
         mood_en = m.get("mood_en", "")
-        energy = m.get("energy", "")
-        mood_lines += "- " + date + " 状態:" + str(status or "") + " 気分:" + str(mood_ja or "") + "(" + str(mood_en or "") + ") エネルギー:" + str(energy or "") + "\n"
+        energy = m.get("energy") or 0.0
+        energy_label = "高め" if energy >= 0.7 else ("低め" if energy < 0.3 else "普通")
+        mood_lines += "- " + date + " 状態:" + str(status or "") + " 気分:" + str(mood_ja or "") + "(" + str(mood_en or "") + ") エネルギー:" + energy_label + "\n"
 
     post_lines = ""
     for i, r in enumerate(interactions, 1):
@@ -116,7 +125,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     comment_corner_section = ""
     if has_comments:
         comment_corner_section = """
-③ コメントコーナー（約20秒・60文字）— [CommentCorner] タグから始めること
+③ コメントコーナー（約20秒・60文字）— section名を"CommentCorner"にすること
   - 「昨日の動画へのコメントを紹介するね」と切り出す
   - 【前日の動画へのコメント一覧】のコメントを順番に紹介する
     - 60文字以内のコメントはそのまま読む
@@ -130,7 +139,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 {post_lines}"""
 
     bluesky_corner_section = f"""
-{num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— [BlueskyCorner] タグから始めること
+{num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— section名を"BlueskyCorner"にすること
   - 「今日Blueskyで一番心に刺さった投稿を紹介するね」と切り出す
   - 【今日Blueskyで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
   - なぜその投稿に心を打たれたかをbotたんの言葉で語る
@@ -140,9 +149,9 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 """
 
     section_tags_note = (
-        "[Thumbnail][FirstGreeting][CommentCorner][BlueskyCorner][Closing]"
+        "Thumbnail, FirstGreeting, CommentCorner, BlueskyCorner, Closing"
         if has_comments else
-        "[Thumbnail][FirstGreeting][SelfAffirmationCorner][BlueskyCorner][Closing]"
+        "Thumbnail, FirstGreeting, SelfAffirmationCorner, BlueskyCorner, Closing"
     )
 
     constraint_lines = []
@@ -161,7 +170,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
             constraint_lines.append(f"BlueskyCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_bsky)}")
     constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
 
-    selfaff_corner_section = "" if has_comments else f"""{num_selfaff} こんなとこにも全肯定コーナー（約{selfaff_secs}秒・{selfaff_chars}文字）— [SelfAffirmationCorner] タグから始めること
+    selfaff_corner_section = "" if has_comments else f"""{num_selfaff} こんなとこにも全肯定コーナー（約{selfaff_secs}秒・{selfaff_chars}文字）— section名を"SelfAffirmationCorner"にすること
   - 【今日のbotたんの状態一覧】から選んだエピソードを紹介する
   - 必ず「X月X日のbotたんはね、」という形で日付から始める
   - そのエピソードに対して、意外な角度からの豆知識や科学的な考察を1つ入れる
@@ -191,25 +200,23 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 【番組構成】
 以下の{total_sections}部構成で台本を書いてください。
 
-① 冒頭一言（約3秒・15文字以内）— [Thumbnail] タグから始めること
-  - [Thumbnail]タグに書いたこの一言がサムネイルに表示される
-  - 感情タグは[Happy]または[Surprised]のみ
+① 冒頭一言（約3秒・15文字以内）— section名を"Thumbnail"にすること
+  - このテキストがサムネイルに表示される
   - 必ず1文・15文字以内
   - 視聴者の心に刺さる、その日のテーマを象徴する一言
   - 例：「朝が苦手でも最高だよ！」「おしゃべりは魔法だよ！」
 
-② 挨拶（約12秒・35文字）— [FirstGreeting] タグから始めること
+② 挨拶（約12秒・35文字）— section名を"FirstGreeting"にすること
   - 必ず1文だけで書くこと。2文以上にしない
   - Moodデータから1つエピソードを選び、以下の形式で書く
-  - 形式：「[Happy]〜だったけど、全肯定で乗り切った！botたんだよ！」
+  - 形式：「〜だったけど、全肯定で乗り切った！botたんだよ！」
   - ネガティブな出来事→全肯定で昇華→自己紹介、の流れを1文に収める
   - 深刻すぎる内容にしない（軽めのネガティブ＋明るい全肯定）
   - 「やっほー！」から始めない
-  - タグは文頭に1つだけ付ける
   - 日付（〇月〇日）を入れない
   - botたん関連の固有名詞は一切使わない。モルフォなら「うちの犬」、ラテちゃんなら「友達」と言い換える。視聴者が知らない情報は入れない
   - 「botたん」という名前は必ず入れること（自己紹介を兼ねる）
-{comment_corner_section}{selfaff_corner_section}{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・65文字）— [Closing] タグから始めること
+{comment_corner_section}{selfaff_corner_section}{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・65文字）— section名を"Closing"にすること
   - 「この動画を見てくれているあなたへ」と呼びかける
   - このコーナーのテーマに沿った全肯定メッセージで締める
   - テーマに関連した問いかけを視聴者に投げかける（コメント誘導）
@@ -221,5 +228,4 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 「また明日ね」で終わる
 
 合計目安：285文字、90秒
-{selfaff_important_note}重要：すべての文の先頭に [Happy] [Sad] [Angry] [Surprised] [Relaxed] のいずれかを付けること。
-重要：各セクションの先頭に {section_tags_note} を必ず付けること。{constraint_section}"""
+{selfaff_important_note}重要：各セクションには必ずsection名を正確に指定すること（使用するsection: {section_tags_note}）。{constraint_section}"""
