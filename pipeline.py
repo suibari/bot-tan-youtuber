@@ -985,6 +985,18 @@ def save_youtube_upload_to_db(url: str, title: str, corners_metadata: list[dict]
     finally:
         conn.close()
 
+def notify_discord(yt_url: str, title: str) -> None:
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        return
+    payload = {"content": f"✅ YouTube投稿完了！\n**{title}**\n{yt_url}"}
+    try:
+        resp = requests.post(webhook_url, json=payload, timeout=10)
+        resp.raise_for_status()
+        print("[Discord] 通知送信完了")
+    except Exception as e:
+        print(f"[Discord] 通知失敗（続行）: {e}")
+
 def _timed(label, fn, *args):
     import time
     print(f"[{label}] 開始...")
@@ -1153,6 +1165,7 @@ def main():
                 if isinstance(bluesky_themes, list) and bluesky_themes:
                     corners_metadata.append({"corner_name": "BlueskyCorner", "theme": bluesky_themes})
                 save_youtube_upload_to_db(yt_url, title, corners_metadata)
+                notify_discord(yt_url, title)
         else:
             print("[YouTube] スキップ (SKIP_YOUTUBE=true)")
 
