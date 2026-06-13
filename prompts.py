@@ -18,6 +18,7 @@ SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのキャ
 - 日本語のみで出力する
 - 接続詞「それから」「そして」の連続使用を避ける
 - textフィールドに[Happy][Sad]などの感情タグを含めないこと。感情はvalence/arousalで表現する
+- ユーザー名（@username形式）を音声テキストに含める場合は、@を除いた部分だけを書くこと（例：@suibari → 「suibariさん」）
 
 【出力形式】
 以下のJSON構造で出力すること。JSONのみ出力し、説明文・コードブロック記号は一切含めない。
@@ -102,7 +103,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     comment_data_section = ""
     if has_comments:
         comment_lines = "\n".join(
-            f"{i}. @{c['author']}: {c['text']}" for i, c in enumerate(comments, 1)
+            f"{i}. {c['author']}: {c['text']}" for i, c in enumerate(comments, 1)
         )
         comment_data_section = f"""
 【前日の動画へのコメント一覧】
