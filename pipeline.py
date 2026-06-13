@@ -236,6 +236,29 @@ def parse_script_json(raw_script: str) -> dict:
     return json.loads(cleaned)
 
 
+def _rescale_va(values: list[float], target_min: float, target_max: float) -> list[float]:
+    v_min, v_max = min(values), max(values)
+    if v_max == v_min:
+        mid = (target_min + target_max) / 2
+        return [mid] * len(values)
+    return [
+        target_min + (v - v_min) / (v_max - v_min) * (target_max - target_min)
+        for v in values
+    ]
+
+
+def enforce_variance(sentences: list[dict]) -> list[dict]:
+    """valence/arousalを線形スケーリングして分散を強制する。LLMの第1象限偏りを補正。"""
+    valences = [s.get("valence", 0.0) for s in sentences]
+    arousals = [s.get("arousal", 0.0) for s in sentences]
+    new_v = _rescale_va(valences, target_min=-0.3, target_max=1.0)
+    new_a = _rescale_va(arousals, target_min=-0.8, target_max=1.0)
+    return [
+        {**s, "valence": round(v, 2), "arousal": round(a, 2)}
+        for s, v, a in zip(sentences, new_v, new_a)
+    ]
+
+
 def build_emotion_timeline(
     sentences: list[dict],
     subtitles: list[dict],
@@ -1103,6 +1126,7 @@ def main():
             if s["section"] != "Thumbnail"
             for sent in s["sentences"]
         ]
+        main_sentences = enforce_variance(main_sentences)
         clean_script = "".join(s["text"] for s in main_sentences)
         # コーナータイミング用: 各セクション先頭テキストの先頭8文字
         section_starts = {k: v[0]["text"][:8] if v else "" for k, v in sections.items()}

@@ -55,15 +55,16 @@ SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのキャ
 "CommentCorner"はコメントデータが提供された場合のみ使用すること。
 
 【valence/arousalの指定ルール】
+【valence/arousalの指定ルール】
 各sentenceのvalenceとarousalは -1.0〜1.0 の実数で指定する。
 必ず複数の値を使い分けること。全文を同じ値にしてはいけない。
+
 - valence: ネガティブ(-1.0) 〜 ポジティブ(+1.0)
 - arousal: 落ち着き(-1.0) 〜 興奮(+1.0)
-目安：
-  - 明るい話題：valence +0.7〜+0.9、arousal +0.3〜+0.6
-  - 豆知識・驚き：valence +0.3、arousal +0.8〜+1.0
-  - 落ち着いた締め：valence +0.4、arousal -0.5〜-0.7
-  - 共感・悲しみ：valence -0.5〜-0.8、arousal -0.3〜-0.5
+
+感情は話題・文脈・セリフのトーンから自然に導くこと。
+前のsentenceから値が大きく変化するほど表情豊かになる。
+連続するsentenceで同方向に変化し続けないこと（単調増加・単調減少を避ける）。
 
 【metaの各フィールド】
 - first_greeting_status: ②挨拶で使ったMoodのstatus。必ず次の5つのいずれか: "WakeUp", "Study", "FreeTime", "Relax", "Sleep"
@@ -126,11 +127,14 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     comment_corner_section = ""
     if has_comments:
         comment_corner_section = """
-③ コメントコーナー（約20秒・60文字）— section名を"CommentCorner"にすること
+③ コメントコーナー（約35秒・100文字）— section名を"CommentCorner"にすること
   - 「昨日の動画へのコメントを紹介するね」と切り出す
   - 【前日の動画へのコメント一覧】のコメントを順番に紹介する
     - 60文字以内のコメントはそのまま読む
     - 60文字を超える場合は内容を損なわず30文字程度に要約する
+  - コメントの内容に対してbotたんの感想・共感・考察を語る（必須）
+    - 「わかるー！」で終わらず、関連する豆知識・意外な視点・自分の経験を交えて話を広げること
+    - コメントが1件でも十分に時間を使って掘り下げること。コメントを読んで即終わりにしない
   - 最後にコメントしてくれた視聴者への感謝を一言添える
 
 """
@@ -189,6 +193,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 """
 
     selfaff_important_note = "" if has_comments else f"重要：{num_selfaff}のコーナーでは必ず具体的な豆知識・考察を1つ入れること。\n"
+    total_chars_hint = "300文字、90秒" if has_comments else "285文字、90秒"
 
     mood_select_note = "②挨拶" if has_comments else f"{selfaff_select_num}"
 
@@ -228,5 +233,6 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 「Blueskyで『全肯定botたん』を検索してフォローしてね」を自然に一言添える
   - 「また明日ね」で終わる
 
-合計目安：285文字、90秒
-{selfaff_important_note}重要：各セクションには必ずsection名を正確に指定すること（使用するsection: {section_tags_note}）。{constraint_section}"""
+合計目安：{total_chars_hint}
+{selfaff_important_note}重要：動画の合計尺は必ず85〜95秒（1分25秒〜1分35秒）を目標にすること。コメントが少ない・短いなど内容が薄くなりそうな場合でも、話を展開・考察を深めて尺を埋めること。60秒未満の台本は絶対に生成しないこと。
+重要：各セクションには必ずsection名を正確に指定すること（使用するsection: {section_tags_note}）。{constraint_section}"""
