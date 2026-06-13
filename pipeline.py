@@ -386,15 +386,17 @@ def split_sentences(script: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
-def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict]:
+def generate_subtitle_timing(script: str, time_offset: float = 0.0, actual_duration: float = None) -> list[dict]:
     """文ごとにaudio_queryを発行してタイミングを取得し、字幕データを生成する。
 
     文単位で独立したモーラ計測を行うことで、漢字とかなの混在による
     文字数比率ずれを排除する。
+    actual_duration: 実際の音声WAVの本編部分の長さ（秒）。渡された場合はそれを
+    スケーリング基準にする。各文個別合成+concatの場合はこれを使うと正確になる。
     """
     print("[字幕] タイミング情報取得中...")
 
-    # フルスクリプトのクエリで合計尺を取得（スケーリング基準）
+    # フルスクリプトのクエリで合計尺を取得（actual_duration未指定時のフォールバック用）
     _, total_duration = _query_mora_times(script)
 
     # 台本を句読点・改行で文に分割
@@ -406,10 +408,15 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0) -> list[dict
         mora_times, sent_dur = _query_mora_times(sentence)
         sentence_data.append((sentence, mora_times, sent_dur))
 
-    # 文ごとの尺の合計をフルスクリプトの合計尺にスケーリング
-    # （文ごとクエリはprePhoneme/postPhonemeが各文に付くため合計が実際より長くなる）
     total_sent = sum(d for _, _, d in sentence_data)
-    scale = total_duration / total_sent if total_sent > 0 else 1.0
+    # actual_durationが渡された場合は実際のWAV長さを基準にスケーリング
+    # （各文個別合成+concatでは total_sent が実際の音声長さに近い）
+    # フルスクリプトクエリは文境界の pause_mora を含むため total_duration > total_sent になり
+    # スケールが1.0を超えて字幕が遅れる問題が起きるため、actual_durationで補正する
+    if actual_duration is not None:
+        scale = actual_duration / total_sent if total_sent > 0 else 1.0
+    else:
+        scale = total_duration / total_sent if total_sent > 0 else 1.0
 
     subtitles = []
     current_time = 0.0
@@ -1107,8 +1114,14 @@ def main():
         # 冒頭一言の音声時間を取得
         intro_duration = get_wav_duration(intro_wav_path) if thumbnail_text and Path(intro_wav_path).exists() else 0.0
 
+        # 本編音声の実際の長さを取得（字幕タイミングのスケーリング基準に使用）
+        # 各文個別合成+concatの場合はtotal_sentが実際の音声長さに近い（フルスクリプト
+        # 1回クエリより正確）ため、実際のWAV長さを渡すことで字幕ずれを防ぐ
+        actual_main_duration = get_wav_duration(wav_path) - intro_duration if Path(wav_path).exists() else None
+        print(f"[字幕] 本編音声長さ: {actual_main_duration:.3f}s" if actual_main_duration else "[字幕] 本編音声長さ取得失敗、フォールバック使用")
+
         # Step 3.5: 字幕・コーナータイミング生成
-        subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration)
+        subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration, actual_duration=actual_main_duration)
         if intro_duration > 0:
             subtitles = [{"start": 0.0, "end": round(intro_duration, 3), "text": thumbnail_text}] + subtitles
         corners   = generate_corner_timing(clean_script, subtitles, intro_duration, section_starts, has_comments)
