@@ -101,11 +101,10 @@ SCRIPT_SCHEMA = {
         "meta": {
             "type": "object",
             "properties": {
-                "first_greeting_status":   {"type": "string"},
-                "self_affirmation_status": {"type": "string"},
-                "bluesky_themes":          {"type": "array", "items": {"type": "string"}},
+                "first_greeting_status": {"type": "string"},
+                "bluesky_themes":        {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["first_greeting_status", "self_affirmation_status", "bluesky_themes"],
+            "required": ["first_greeting_status", "bluesky_themes"],
         },
     },
     "required": ["sections", "meta"],
@@ -898,7 +897,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
         print("pip install google-api-python-client google-auth-oauthlib")
 
 def fetch_recent_corners(limit: int = 2) -> dict:
-    """直近N件のcornersからFirstGreeting/SelfAffirmationCornerの除外statusを取得する"""
+    """直近N件のcornersからFirstGreetingの除外statusを取得する"""
     conn = psycopg2.connect(**DB_CONFIG)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -911,7 +910,7 @@ def fetch_recent_corners(limit: int = 2) -> dict:
     finally:
         conn.close()
 
-    excluded_fg, excluded_sa = set(), set()
+    excluded_fg = set()
     for row in rows:
         corners_data = row.get("corners") or []
         if isinstance(corners_data, str):
@@ -920,17 +919,62 @@ def fetch_recent_corners(limit: int = 2) -> dict:
             status = corner.get("status")
             if not status:
                 continue
-            name = corner.get("corner_name", "")
-            if name == "FirstGreeting":
+            if corner.get("corner_name") == "FirstGreeting":
                 excluded_fg.add(status)
-            elif name == "SelfAffirmationCorner":
-                excluded_sa.add(status)
     result = {
         "excluded_first_greeting_statuses": list(excluded_fg),
-        "excluded_self_affirmation_statuses": list(excluded_sa),
     }
-    print(f"[corners] 除外status: FG={result['excluded_first_greeting_statuses']}, SA={result['excluded_self_affirmation_statuses']}")
+    print(f"[corners] 除外status: FG={result['excluded_first_greeting_statuses']}")
     return result
+
+def get_recent_video_stats(n: int = 3) -> list[dict]:
+    """DBの直近n本の動画について YouTube API で viewCount/commentCount を取得する"""
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT url FROM affirmative_bot.youtube_shorts ORDER BY id DESC LIMIT %s",
+                (n,)
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return []
+
+    yt = _get_youtube_client()
+    result = []
+    for row in rows:
+        vid_match = re.search(r'[?&]v=([^&]+)', row["url"])
+        if not vid_match:
+            continue
+        try:
+            resp = yt.videos().list(part="statistics", id=vid_match.group(1)).execute()
+            items = resp.get("items", [])
+            if items:
+                stats = items[0]["statistics"]
+                result.append({
+                    "view_count":    int(stats.get("viewCount",    0)),
+                    "comment_count": int(stats.get("commentCount", 0)),
+                })
+        except Exception as e:
+            print(f"[YouTube API] 動画統計取得失敗: {e}")
+    return result
+
+
+def should_enable_comment_corner(recent_videos: list[dict]) -> bool:
+    """直近3本の再生数・コメント数条件を満たす場合のみ True を返す"""
+    if len(recent_videos) < 3:
+        return False
+    avg_views = sum(v["view_count"] for v in recent_videos) / len(recent_videos)
+    if avg_views < 200:
+        return False
+    videos_with_comments = sum(1 for v in recent_videos if v["comment_count"] >= 1)
+    if videos_with_comments < 2:
+        return False
+    return True
+
 
 def fetch_bluesky_corner_context() -> dict:
     """BlueskyCornerの参考リスト（いいね上位3件）と除外リスト（直近3日間）を取得する"""
@@ -1087,8 +1131,14 @@ def main():
             print("[ERROR] データが取得できませんでした")
             return
 
-        # Step 1.5: 前日動画のコメント取得（CommentCornerの有無を決定）
-        comments = fetch_youtube_comments()
+        # Step 1.5: コメントコーナー有効化判定 → コメント取得
+        recent_stats = get_recent_video_stats(n=3)
+        use_comment_corner = should_enable_comment_corner(recent_stats)
+        print(f"[コメント] コメントコーナー有効化条件: {'満たした' if use_comment_corner else '未達 → スキップ'}")
+
+        comments = fetch_youtube_comments() if use_comment_corner else None
+        if not comments:
+            comments = None
         has_comments = bool(comments)
         print(f"[コメント] CommentCorner: {'あり (' + str(len(comments)) + '件)' if has_comments else 'なし → スキップ'}")
 
@@ -1114,7 +1164,6 @@ def main():
         sections = {s["section"]: s["sentences"] for s in script_data["sections"]}
         script_meta = script_data["meta"]
         print(f"[META] first_greeting_status={script_meta.get('first_greeting_status')}, "
-              f"self_affirmation_status={script_meta.get('self_affirmation_status')}, "
               f"bluesky_themes={script_meta.get('bluesky_themes')}")
         thumbnail_sentences = sections.get("Thumbnail", [])
         thumbnail_text = thumbnail_sentences[0]["text"][:15] if thumbnail_sentences else "今日も全肯定だよ！"
@@ -1196,8 +1245,6 @@ def main():
                     {"corner_name": "Thumbnail", "theme": thumbnail_text},
                     {"corner_name": "FirstGreeting", "status": script_meta.get("first_greeting_status", "")},
                 ]
-                if not has_comments:
-                    corners_metadata.append({"corner_name": "SelfAffirmationCorner", "status": script_meta.get("self_affirmation_status", "")})
                 bluesky_themes = script_meta.get("bluesky_themes", [])
                 if isinstance(bluesky_themes, list) and bluesky_themes:
                     corners_metadata.append({"corner_name": "BlueskyCorner", "theme": bluesky_themes})
