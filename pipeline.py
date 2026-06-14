@@ -350,11 +350,7 @@ def generate_voice(sentences: list[dict], output_path: str, intro_text: str = ""
 
         for i, sentence in enumerate(sentences):
             part_path = str(tmp_dir / f"{Path(output_path).stem}_part{i:03d}.wav")
-            params = valence_arousal_to_voicevox_params(
-                sentence.get("valence", 0.0),
-                sentence.get("arousal", 0.0),
-            )
-            _synthesize(sentence["text"], part_path, params)
+            _synthesize(sentence["text"], part_path)
             part_paths.append(part_path)
 
         with open(list_file, "w") as f:

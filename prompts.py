@@ -113,8 +113,8 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     total_sections = 5 if has_comments else 4
     num_bluesky    = "④" if has_comments else "③"
     num_closing    = "⑤" if has_comments else "④"
-    bluesky_secs   = "35"
-    bluesky_chars  = "100"
+    bluesky_secs   = "20" if has_comments else "45"
+    bluesky_chars  = "60" if has_comments else "140"
 
     comment_corner_section = ""
     if has_comments:
@@ -129,17 +129,20 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
 """
 
+    bluesky_pick_count = "1件" if has_comments else "3件"
     bluesky_data_section = f"""【今日Blueskyで心に残った投稿一覧】
-以下の中から{num_bluesky}コーナーで紹介したい投稿を1つ自分で選んでください。
+以下の中から{num_bluesky}コーナーで紹介したい投稿を{bluesky_pick_count}自分で選んでください。
 {post_lines}"""
 
-    bluesky_corner_section = f"""
+    if has_comments:
+        bluesky_corner_section = f"""
 {num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— section名を"BlueskyCorner"にすること
   - 「今日Blueskyで一番心に刺さった投稿を紹介するね」と切り出す
   - 【今日Blueskyで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
   - 英語の投稿はそのまま読まず、内容をbotたんの言葉で日本語に意訳して紹介する
+  - 投稿が特定のコミュニティ・社会的テーマ（LGBTQIA、障害、マイノリティ等）についてのものである場合、「〜についての投稿で」と最初に明示すること
   - 以下の流れで構成すること：
-    1. 投稿の内容を紹介する（そのまま or 意訳）
+    1. テーマの前置き（必要な場合） + 投稿の内容を紹介する（そのまま or 意訳）
     2. なぜ心に刺さったかをbotたんの言葉で一言語る
     3. その投稿のテーマに関連した豆知識・科学的な知見を1つ自然に添える
        例（孤独テーマ）：「実は人と話すだけで幸福感に関わるホルモンが出るって言われてて」
@@ -148,6 +151,19 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
        豆知識は断定せず「〜って言われてて」「〜らしくて」など柔らかい言い回しにすること
     4. 全肯定の一言で締める（毎回違う言い回しにすること）
   - 豆知識はテーマから自然に引き出すこと。無理に当てはめず、合わない場合は省略してよい
+
+"""
+    else:
+        bluesky_corner_section = f"""
+{num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— section名を"BlueskyCorner"にすること
+  - 「今日Blueskyで心に刺さった投稿を3件紹介するね」と切り出す
+  - 【今日Blueskyで心に残った投稿一覧】からbotたんが心を打たれた・視聴者の励ましになると感じた投稿を3件選ぶ
+  - 英語の投稿はそのまま読まず、内容をbotたんの言葉で日本語に意訳して紹介する
+  - 投稿が特定のコミュニティ・社会的テーマ（LGBTQIA、障害、マイノリティ等）についてのものである場合、「〜についての投稿で」と最初に明示すること
+  - 各投稿を以下の流れで紹介すること（1件あたり2〜3文）：
+    1. テーマの前置き（必要な場合） + 投稿の内容を紹介する（そのまま or 意訳）
+    2. botたんの一言感想（なぜ心に刺さったか）
+  - 3件すべて紹介した後、全肯定の一言で締める（毎回違う言い回しにすること）
 
 """
 
@@ -170,7 +186,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
             constraint_lines.append(f"BlueskyCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_bsky)}")
     constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
 
-    total_chars_hint = "220文字、65秒" if has_comments else "180文字、55秒"
+    total_chars_hint = "220文字、65秒" if has_comments else "260文字、70秒"
 
     mood_select_note = "②挨拶"
 
@@ -194,6 +210,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - Moodデータから1つエピソードを選び、以下の形式で書く
   - 形式：「〜だったけど、全肯定で乗り切った！botたんだよ！」
   - ネガティブな出来事→全肯定で昇華→自己紹介、の流れを1文に収める
+  - 選んだMoodの具体的な内容（何をしていたか・どんな気分だったか）を文中に必ず明示すること。「色々考えて」のような抽象的な表現は禁止。例：「勉強でつまずいたけど」「なかなか眠れなかったけど」「自由時間に将来のことをぐるぐる考えてたけど」のように具体的に書く
   - 深刻すぎる内容にしない（軽めのネガティブ＋明るい全肯定）
   - 「やっほー！」から始めない
   - 日付（〇月〇日）を入れない
@@ -201,10 +218,10 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 「botたん」という名前は必ず入れること（自己紹介を兼ねる）
 {comment_corner_section}{bluesky_corner_section}{num_closing} 締めの全肯定（約12秒・40文字）— section名を"Closing"にすること
   - 全肯定の一言で締める（「あなたへ」の呼びかけは省略可）
-  - 視聴者への問いかけを1つだけ入れる（短く・答えやすく）
+  - 視聴者への問いかけを1つだけ入れる（「あなたは〜かな？」のように視聴者に直接呼びかける形にすること。「今日、〜」で始めない）
   - 「高評価・チャンネル登録もめちゃくちゃ嬉しいよ！」を一言で入れる
   - 「また明日ね」で終わる
 
 合計目安：{total_chars_hint}
-重要：動画の合計尺は必ず50〜65秒を目標にすること。70秒を超える台本は生成しないこと。各コーナーは簡潔にまとめ、冗長な展開・考察の引き延ばしはしないこと。
+重要：動画の合計尺は必ず60〜70秒を目標にすること。75秒を超える台本は生成しないこと。各コーナーは簡潔にまとめ、冗長な展開・考察の引き延ばしはしないこと。
 重要：各セクションには必ずsection名を正確に指定すること（使用するsection: {section_tags_note}）。{constraint_section}"""
