@@ -127,7 +127,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     num_bluesky    = "④" if has_comments else "③"
     num_closing    = "⑤" if has_comments else "④"
     bluesky_secs   = "20" if has_comments else "40"
-    bluesky_chars  = "60" if has_comments else "120"
+    bluesky_chars  = "60" if has_comments else "90"
 
     comment_corner_section = ""
     if has_comments:
@@ -163,9 +163,9 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 以下の流れで構成すること：
     1. テーマの前置き（必要な場合） + 投稿の内容を紹介する（そのまま or 意訳）
        元の投稿にサブカルチャー・アニメ・ゲーム・ネットスラングの固有名詞や比喩が含まれる場合、
-       そのまま使ったうえで必ず一言説明を添えること
-       （例：「仙豆並みに回復するって書いてあって。仙豆っていうのはドラゴンボールに出てくる、
-       食べるだけで全回復できる豆のことなんだけど」）
+       そのまま使ったうえで必ず一言説明を添えること。
+       ただし投稿に実際に登場した語のみ対象にすること（投稿に出てこない語・例えを持ち込まない）。
+       （例：「○○って書いてあって。○○っていうのは××のことなんだけど」）
        説明はbotたんらしく自然な流れで入れること。解説口調にならないよう注意
     2. なぜ心に刺さったかをbotたんの言葉で一言語る
     3. その投稿のテーマに関連した豆知識・科学的な知見を1つ自然に添える
@@ -204,7 +204,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
             constraint_lines.append(f"BlueskyCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_bsky)}")
     constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
 
-    total_chars_hint = "220文字、65秒"
+    total_chars_hint = "185文字、60秒"
 
     mood_select_note = "②挨拶"
 
@@ -241,5 +241,5 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 「また明日ね」で終わる
 
 合計目安：{total_chars_hint}
-重要：動画の合計尺は必ず60〜70秒を目標にすること。75秒を超える台本は生成しないこと。各コーナーは簡潔にまとめ、冗長な展開・考察の引き延ばしはしないこと。
+重要：動画の合計尺は必ず60秒以内を目標にすること。65秒を超える台本は生成しないこと。各コーナーは簡潔にまとめ、冗長な展開・考察の引き延ばしはしないこと。
 重要：各セクションには必ずsection名を正確に指定すること（使用するsection: {section_tags_note}）。{constraint_section}"""
