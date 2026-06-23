@@ -188,7 +188,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
 
 
 def fetch_recent_corners(limit: int = 2) -> dict:
-    """直近N件のcornersからFirstGreetingの除外statusを取得する"""
+    """直近N件のcornersからClosingの除外statusを取得する"""
     conn = psycopg2.connect(**DB_CONFIG)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -210,7 +210,7 @@ def fetch_recent_corners(limit: int = 2) -> dict:
             status = corner.get("status")
             if not status:
                 continue
-            if corner.get("corner_name") == "FirstGreeting":
+            if corner.get("corner_name") == "Closing":
                 excluded_fg.add(status)
     result = {
         "excluded_first_greeting_statuses": list(excluded_fg),

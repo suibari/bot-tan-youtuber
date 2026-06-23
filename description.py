@@ -1,5 +1,3 @@
-from datetime import datetime
-
 def build_description() -> str:
     return """全肯定botたんが今週Blueskyで感じたことをお話しします。
 
@@ -32,6 +30,7 @@ https://maou.audio
 ━━━━━━━━━━━━━━━━━━"""
 
 
-def build_title() -> str:
-    date_label = datetime.now().strftime("%Y/%m/%d")
-    return f"botたんの全肯定ニュース! {date_label}"
+def build_title(thumbnail_text: str = "") -> str:
+    if thumbnail_text:
+        return f"{thumbnail_text} / 全肯定botたん"
+    return "botたんの全肯定ニュース! / 全肯定botたん"

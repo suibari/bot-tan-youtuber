@@ -43,9 +43,9 @@ botたんはかつて「全否定bot」だった過去がある。
       "sentences": [{"text": "今日の一言", "valence": 0.8, "arousal": 0.5}]
     },
     {
-      "section": "FirstGreeting",
+      "section": "OpeningAffirmation",
       "sentences": [
-        {"text": "文章1", "valence": 0.9, "arousal": 0.4},
+        {"text": "文章1", "valence": 0.8, "arousal": 0.4},
         ...
       ]
     },
@@ -58,11 +58,11 @@ botたんはかつて「全否定bot」だった過去がある。
 }
 
 【sectionの種類】
-- "Thumbnail"     → ①冒頭一言（sentences は1要素のみ）
-- "FirstGreeting" → ②挨拶
-- "CommentCorner" → ③コメントコーナー（コメントデータが提供された場合のみ使用）
-- "BlueskyCorner" → ③or④今日のBluesky
-- "Closing"       → ④or⑤締め
+- "Thumbnail"          → ①冒頭一言（sentences は1要素のみ）
+- "OpeningAffirmation" → ②視聴者への冒頭肯定
+- "BlueskyCorner"      → ③今日のBluesky
+- "CommentCorner"      → ④コメントコーナー（コメントデータが提供された場合のみ使用）
+- "Closing"            → ④or⑤締め（自己紹介を含む）
 "CommentCorner"はコメントデータが提供された場合のみ使用すること。
 
 【valence/arousalの指定ルール】
@@ -78,7 +78,7 @@ botたんはかつて「全否定bot」だった過去がある。
 連続するsentenceで同方向に変化し続けないこと（単調増加・単調減少を避ける）。
 
 【metaの各フィールド】
-- first_greeting_status: ②挨拶で使ったMoodのstatus。必ず次の5つのいずれか: "WakeUp", "Study", "FreeTime", "Relax", "Sleep"
+- first_greeting_status: ⑤/④締めで使ったMoodのstatus。必ず次の5つのいずれか: "WakeUp", "Study", "FreeTime", "Relax", "Sleep"
 - bluesky_themes: Blueskyコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個"""
 
 
@@ -124,7 +124,6 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
     # 番組構成の数値は CommentCorner の有無で変わる
     total_sections = 5 if has_comments else 4
-    num_bluesky    = "④" if has_comments else "③"
     num_closing    = "⑤" if has_comments else "④"
     bluesky_secs   = "20" if has_comments else "40"
     bluesky_chars  = "60" if has_comments else "90"
@@ -132,7 +131,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     comment_corner_section = ""
     if has_comments:
         comment_corner_section = """
-③ コメントコーナー（約20秒・60文字）— section名を"CommentCorner"にすること
+④ コメントコーナー（約20秒・60文字）— section名を"CommentCorner"にすること
   - 「昨日の動画へのコメントを紹介するね」と切り出す
   - 【前日の動画へのコメント一覧】のコメントを順番に紹介する
     - 60文字以内のコメントはそのまま読む
@@ -147,8 +146,9 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 {post_lines}"""
 
     bluesky_corner_section = f"""
-{num_bluesky} 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— section名を"BlueskyCorner"にすること
-  - 「今日Blueskyで一番心に刺さった投稿を紹介するね」と切り出す
+③ 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— section名を"BlueskyCorner"にすること
+  - 「実はね、Blueskyで〇〇という投稿を見たんだ」のような形で切り出す（〇〇は投稿の一言要約）
+  - このコーナー全体がOpeningAffirmationの肯定の「理由付け」として機能するように構成すること
   - 【今日Blueskyで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
     * 選ぶ際は以下を優先すること：
       - 具体的な体験や感情が書かれている投稿（「なぜか泣いた」「急に怖くなった」など）
@@ -186,9 +186,9 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 """
 
     section_tags_note = (
-        "Thumbnail, FirstGreeting, CommentCorner, BlueskyCorner, Closing"
+        "Thumbnail, OpeningAffirmation, BlueskyCorner, CommentCorner, Closing"
         if has_comments else
-        "Thumbnail, FirstGreeting, BlueskyCorner, Closing"
+        "Thumbnail, OpeningAffirmation, BlueskyCorner, Closing"
     )
 
     constraint_lines = []
@@ -197,16 +197,16 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
         ref_bsky = corner_context.get("reference_bluesky_themes", [])
         excl_bsky = corner_context.get("excluded_bluesky_themes", [])
         if excl_fg:
-            constraint_lines.append(f"重要：②挨拶では「{'・'.join(excl_fg)}」状態のエピソードを選ばないこと（直近2日間使用済み）")
+            constraint_lines.append(f"重要：⑤/④締めでは「{'・'.join(excl_fg)}」状態のエピソードを選ばないこと（直近2日間使用済み）")
         if ref_bsky:
             constraint_lines.append(f"BlueskyCorner参考：視聴者に受けているテーマ（優先的に参考にすること）：{'、'.join(ref_bsky)}")
         if excl_bsky:
             constraint_lines.append(f"BlueskyCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_bsky)}")
     constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
 
-    total_chars_hint = "185文字、60秒"
+    total_chars_hint = "200文字、60秒"
 
-    mood_select_note = "②挨拶"
+    mood_select_note = "⑤/④締め"
 
     return f"""以下のデータをもとに、YouTube Shorts用の台本を書いてください。
 
@@ -223,22 +223,26 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 視聴者の心に刺さる、その日のテーマを象徴する一言
   - 例：「朝が苦手でも最高だよ！」「おしゃべりは魔法だよ！」
 
-② 挨拶（約10秒・30文字）— section名を"FirstGreeting"にすること
-  - 必ず1文だけで書くこと。2文以上にしない
-  - Moodデータから1つエピソードを選び、以下の形式で書く
-  - 形式：「〜だったけど、全肯定で乗り切った！botたんだよ！」
-  - ネガティブな出来事→全肯定で昇華→自己紹介、の流れを1文に収める
-  - 選んだMoodの具体的な内容（何をしていたか・どんな気分だったか）を文中に必ず明示すること。「色々考えて」のような抽象的な表現は禁止。例：「勉強でつまずいたけど」「なかなか眠れなかったけど」「自由時間に将来のことをぐるぐる考えてたけど」のように具体的に書く
-  - 深刻すぎる内容にしない（軽めのネガティブ＋明るい全肯定）
-  - 「やっほー！」から始めない
-  - 日付（〇月〇日）を入れない
-  - botたん関連の固有名詞は一切使わない。モルフォなら「うちの犬」、ラテちゃんなら「友達」と言い換える。視聴者が知らない情報は入れない
-  - 「botたん」という名前は必ず入れること（自己紹介を兼ねる）
-{comment_corner_section}{bluesky_corner_section}{num_closing} 締めの全肯定（約12秒・40文字）— section名を"Closing"にすること
-  - 全肯定の一言で締める（「あなたへ」の呼びかけは省略可）
-  - 視聴者への問いかけを1つだけ入れる（「あなたは〜かな？」のように視聴者に直接呼びかける形にすること。「今日、〜」で始めない）
+② 冒頭の肯定（約10秒・30文字）— section名を"OpeningAffirmation"にすること
+  - 2文以内で書くこと
+  - 【今日Blueskyで心に残った投稿一覧】を読み、今日の「肯定ポイント」を先に決める
+  - いきなり視聴者を肯定する。挨拶・自己紹介は一切しない
+  - 「あなたは〜だよ」「〜することは、素晴らしいことだよ」のように視聴者に直接語りかける
+  - 「今日も〜だったね」と過去形で語りかけることで共感を呼ぶ言い方を優先する
+  - 次の③BlueskyCornerで紹介する投稿のテーマと必ずつながること（伏線として機能させる）
+  - 例：「助けを求めるのは、素晴らしい勇気だよ。今日も一人で抱え込まずによく頑張ったね。」
+  - 例：「眠れない夜も、ちゃんとそこにいるあなたが好きだよ。」
+  - 例：「頑張れない日があっても、それはあなたが弱いんじゃないよ。」
+{comment_corner_section}{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・55文字）— section名を"Closing"にすること
+  - 【今日のbotたんの状態一覧】からエピソードを1つ選び、一言触れる
+    形式：「botたんも今日〜だったけど、全肯定で乗り切ったよ！」など（軽めのネガティブ＋明るい全肯定）
+    選んだMoodのstatusをmetaのfirst_greeting_statusに記録すること
+  - 選んだMoodの具体的な内容を明示すること（「色々考えて」のような抽象的な表現は禁止）
+  - 「botたん」という名前を必ず言及し、自己紹介を兼ねる
   - 「高評価・チャンネル登録もめちゃくちゃ嬉しいよ！」を一言で入れる
   - 「また明日ね」で終わる
+  - 日付（〇月〇日）を入れない
+  - botたん関連の固有名詞は使わない。モルフォなら「うちの犬」、ラテちゃんなら「友達」と言い換える
 
 合計目安：{total_chars_hint}
 重要：動画の合計尺は必ず60秒以内を目標にすること。65秒を超える台本は生成しないこと。各コーナーは簡潔にまとめ、冗長な展開・考察の引き延ばしはしないこと。

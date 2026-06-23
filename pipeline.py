@@ -499,13 +499,10 @@ def generate_corner_timing(
     has_comments: bool = False,
 ) -> list[dict]:
     """セクションタグで確定したタイミングでコーナーラベルを生成する"""
-    corner_meta = [('FirstGreeting', "やっほー！botたんだよ", "#0085ff")]
+    corner_meta = [('OpeningAffirmation', "全肯定タイム", "#ff6b9d")]
+    corner_meta.append(('BlueskyCorner', "今日のBluesky", "#0085ff"))
     if has_comments:
         corner_meta.append(('CommentCorner', "コメントコーナー", "#ff9f43"))
-        corner_meta.append(('BlueskyCorner', "今日のBluesky", "#0085ff"))
-    else:
-        corner_meta.append(('SelfAffirmationCorner', "こんなとこにも全肯定コーナー", "#ff6b9d"))
-        corner_meta.append(('BlueskyCorner', "今日のBluesky", "#0085ff"))
     corner_meta.append(('Closing', "全肯定メッセージ", "#7ec8e3"))
     total_duration = subtitles[-1]["end"] if subtitles else 90
 
@@ -876,9 +873,9 @@ def main():
         emotions, wave_time = build_emotion_timeline(main_sentences, subtitles, intro_duration)
 
         # トリガー発火時刻を字幕から算出
-        # DoGreeting①: FirstGreetingセクション終了2秒前（フレーズに依存しないよう cornersベースで計算）
-        first_greeting_end = corners[0]["end"] if corners else 0.0
-        greeting_time1 = max(0.0, first_greeting_end - 2.0)
+        # DoGreeting①: OpeningAffirmationセクション終了2秒前（フレーズに依存しないよう cornersベースで計算）
+        opening_end = corners[0]["end"] if corners else 0.0
+        greeting_time1 = max(0.0, opening_end - 2.0)
         # DoGreeting②・DoThankful: ⑤/⑥締めセクション内に限定（corners末尾がClosing）
         closing_start = corners[-1]["start"] if corners else 0.0
         greeting_time2 = _find_subtitle_time(subtitles, "フォロー", start_from=closing_start) or 0.0
@@ -910,14 +907,14 @@ def main():
         _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners, intro_duration)
 
         # Step 6: YouTubeアップロード
-        title = build_title()
+        title = build_title(thumbnail_text)
         description = build_description()
         if os.getenv("SKIP_YOUTUBE") != "true":
             yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description, thumbnail_path)
             if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
                 corners_metadata = [
                     {"corner_name": "Thumbnail", "theme": thumbnail_text},
-                    {"corner_name": "FirstGreeting", "status": script_meta.get("first_greeting_status", "")},
+                    {"corner_name": "Closing", "status": script_meta.get("first_greeting_status", "")},
                 ]
                 bluesky_themes = script_meta.get("bluesky_themes", [])
                 if isinstance(bluesky_themes, list) and bluesky_themes:
