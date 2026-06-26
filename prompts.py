@@ -217,9 +217,9 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 【番組構成】
 以下の{total_sections}部構成で台本を書いてください。
 
-① 冒頭一言（約3秒・15文字以内）— section名を"Thumbnail"にすること
+① 冒頭一言（約3秒・20文字以内）— section名を"Thumbnail"にすること
   - このテキストがサムネイルに表示される
-  - 必ず1文・15文字以内
+  - 必ず1文・20文字以内
   - 視聴者の心に刺さる、その日のテーマを象徴する一言
   - 例：「朝が苦手でも最高だよ！」「おしゃべりは魔法だよ！」
 

@@ -262,9 +262,9 @@ def build_emotion_timeline(
     sentences: list[dict],
     subtitles: list[dict],
     intro_duration: float = 0.0
-) -> tuple[list[dict], float]:
+) -> list[dict]:
     """文ごとのvalence/arousalから感情タイムラインを生成する。
-    戻り値: (emotions, wave_time)
+    戻り値: emotions
     """
     total_duration = subtitles[-1]["end"] if subtitles else 90
     total_chars = sum(len(s["text"]) for s in sentences)
@@ -280,10 +280,8 @@ def build_emotion_timeline(
         })
         char_offset += len(sentence["text"])
 
-    wave_time = subtitles[-1]["start"] if subtitles else 0
-
-    print(f"[感情] {len(emotions)}件のタイムライン生成完了, waveTime: {wave_time}s")
-    return emotions, wave_time
+    print(f"[感情] {len(emotions)}件のタイムライン生成完了")
+    return emotions
 
 # ──────────────────────────────────────────────
 # Step 3: VOICEVOXで音声生成
@@ -836,7 +834,7 @@ def main():
         print(f"[META] first_greeting_status={script_meta.get('first_greeting_status')}, "
               f"bluesky_themes={script_meta.get('bluesky_themes')}")
         thumbnail_sentences = sections.get("Thumbnail", [])
-        thumbnail_text = thumbnail_sentences[0]["text"][:15] if thumbnail_sentences else "今日も全肯定だよ！"
+        thumbnail_text = thumbnail_sentences[0]["text"][:20] if thumbnail_sentences else "今日も全肯定だよ！"
         print(f"[サムネイル] 一言: {thumbnail_text}")
         # Thumbnail以外の全文をフラットなリストに
         main_sentences = [
@@ -870,7 +868,7 @@ def main():
         corners   = generate_corner_timing(clean_script, subtitles, intro_duration, section_starts, has_comments)
 
         # 感情タイムライン生成
-        emotions, wave_time = build_emotion_timeline(main_sentences, subtitles, intro_duration)
+        emotions = build_emotion_timeline(main_sentences, subtitles, intro_duration)
 
         # トリガー発火時刻を字幕から算出
         # DoGreeting①: OpeningAffirmationセクション終了2秒前（フレーズに依存しないよう cornersベースで計算）
@@ -887,7 +885,6 @@ def main():
         with open(emotion_path, "w") as f:
             json.dump({
                 "emotions":      emotions,
-                "waveTime":      wave_time,
                 "thankfulTime":  thankful_time,
                 "greetingTime1": greeting_time1,
                 "greetingTime2": greeting_time2,

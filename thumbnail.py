@@ -53,7 +53,13 @@ def generate_thumbnail(frame_png: str, output_png: str, thumbnail_text: str) -> 
                            outline_width=8)
 
     # 下部テキスト（青帯 + 白文字）
-    font_bottom = ImageFont.truetype(FONT_MARU, 90)
+    font_size = 90
+    font_bottom = ImageFont.truetype(FONT_MARU, font_size)
+    bbox = draw.textbbox((0, 0), thumbnail_text, font=font_bottom)
+    while bbox[2] - bbox[0] > W - 40 and font_size > 50:
+        font_size -= 5
+        font_bottom = ImageFont.truetype(FONT_MARU, font_size)
+        bbox = draw.textbbox((0, 0), thumbnail_text, font=font_bottom)
     box_y = H - 480
     box_h = 230
     draw.rectangle([0, box_y, W, box_y + box_h], fill=BLUE + (235,))
