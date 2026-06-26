@@ -262,9 +262,9 @@ def build_emotion_timeline(
     sentences: list[dict],
     subtitles: list[dict],
     intro_duration: float = 0.0
-) -> list[dict]:
+) -> tuple[list[dict], float]:
     """文ごとのvalence/arousalから感情タイムラインを生成する。
-    戻り値: emotions
+    戻り値: (emotions, wave_time)
     """
     total_duration = subtitles[-1]["end"] if subtitles else 90
     total_chars = sum(len(s["text"]) for s in sentences)
@@ -280,8 +280,10 @@ def build_emotion_timeline(
         })
         char_offset += len(sentence["text"])
 
-    print(f"[感情] {len(emotions)}件のタイムライン生成完了")
-    return emotions
+    wave_time = subtitles[-1]["start"] if subtitles else 0
+
+    print(f"[感情] {len(emotions)}件のタイムライン生成完了, waveTime: {wave_time}s")
+    return emotions, wave_time
 
 # ──────────────────────────────────────────────
 # Step 3: VOICEVOXで音声生成
@@ -868,26 +870,25 @@ def main():
         corners   = generate_corner_timing(clean_script, subtitles, intro_duration, section_starts, has_comments)
 
         # 感情タイムライン生成
-        emotions = build_emotion_timeline(main_sentences, subtitles, intro_duration)
+        emotions, wave_time = build_emotion_timeline(main_sentences, subtitles, intro_duration)
 
         # トリガー発火時刻を字幕から算出
         # DoGreeting①: OpeningAffirmationセクション終了2秒前（フレーズに依存しないよう cornersベースで計算）
         opening_end = corners[0]["end"] if corners else 0.0
         greeting_time1 = max(0.0, opening_end - 2.0)
-        # DoGreeting②・DoThankful: ⑤/⑥締めセクション内に限定（corners末尾がClosing）
+        # DoThankful: 締めセクション内に限定（corners末尾がClosing）
         closing_start = corners[-1]["start"] if corners else 0.0
-        greeting_time2 = _find_subtitle_time(subtitles, "フォロー", start_from=closing_start) or 0.0
         thankful_time  = _find_subtitle_time(subtitles, "高評価",   start_from=closing_start) or 0.0
-        print(f"[トリガー] greetingTime1: {greeting_time1}s, greetingTime2: {greeting_time2}s, thankfulTime: {thankful_time}s")
+        print(f"[トリガー] greetingTime1: {greeting_time1}s, waveTime: {wave_time}s, thankfulTime: {thankful_time}s")
 
         # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
         with open(emotion_path, "w") as f:
             json.dump({
                 "emotions":      emotions,
+                "waveTime":      wave_time,
                 "thankfulTime":  thankful_time,
                 "greetingTime1": greeting_time1,
-                "greetingTime2": greeting_time2,
             }, f, ensure_ascii=False)
         print(f"[感情] 保存: {emotion_path}")
 
