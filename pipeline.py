@@ -21,6 +21,7 @@ botたん YouTube Shorts 自動投稿パイプライン
 """
 
 import os
+import signal
 import subprocess
 import tempfile
 import json
@@ -588,7 +589,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> Non
         ]
         print(f"[Unity] コマンド: {' '.join(cmd)}")
 
-        unity_proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE)
+        unity_proc = subprocess.Popen(cmd, env=env, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
         deadline = time.time() + 300
         while time.time() < deadline:
             if Path(output_webm).exists() and os.path.getsize(output_webm) > 0:
@@ -603,20 +604,36 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> Non
                         print(f"[Unity] 書き込み完了を確認")
                         break
                     prev_size = current_size
-                unity_proc.terminate()
+                try:
+                    os.killpg(os.getpgid(unity_proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    unity_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(unity_proc.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        unity_proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass
                 break
             if unity_proc.poll() is not None:
                 break
             time.sleep(2)
         else:
-            unity_proc.kill()
+            try:
+                os.killpg(os.getpgid(unity_proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             raise TimeoutError("Unity録画タイムアウト (300秒)")
 
-        # SIGTERM(-15) は正常終了扱い（出力ファイル検知でterminateした場合）
-        if unity_proc.returncode not in (0, None, -15):
-            stderr_out = unity_proc.stderr.read().decode("utf-8", errors="replace") if unity_proc.stderr else ""
+        # SIGTERM(-15), SIGKILL(-9) は正常終了扱い（出力ファイル検知でkillした場合）
+        if unity_proc.returncode not in (0, None, -15, -9):
             raise RuntimeError(
-                f"Unity録画失敗 (returncode: {unity_proc.returncode})\n[Unity stderr]\n{stderr_out}"
+                f"Unity録画失敗 (returncode: {unity_proc.returncode})"
             )
         if not Path(output_webm).exists():
             raise FileNotFoundError(f"録画ファイルが見つかりません: {output_webm}")
@@ -626,11 +643,17 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> Non
 
     finally:
         if unity_proc and unity_proc.poll() is None:
-            unity_proc.terminate()
+            try:
+                os.killpg(os.getpgid(unity_proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 unity_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                unity_proc.kill()
+                try:
+                    os.killpg(os.getpgid(unity_proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         if xvfb_proc and xvfb_proc.poll() is None:
             xvfb_proc.terminate()
             try:
