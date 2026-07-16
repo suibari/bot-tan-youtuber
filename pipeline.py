@@ -564,10 +564,20 @@ def _start_xvfb() -> tuple:
 def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> None:
     """Unityを起動してVRM口パク録画を行う"""
     print(f"[Unity] 録画開始...")
-    # 既存のUnityプロセスを終了
+    # 既存のUnityプロセスとXvfbを終了
     import subprocess as sp
-    sp.run(["pkill", "-f", "Unity -projectPath"], capture_output=True)
-    time.sleep(2)
+    sp.run(["pkill", "-9", "-f", "Unity -projectPath"], capture_output=True)
+    sp.run(["pkill", "-9", "-f", "Xvfb :"], capture_output=True)
+    time.sleep(3)
+    # 残留Xvfbロックファイルを削除
+    for _lock_file in Path("/tmp").glob(".X*-lock"):
+        _lock_file.unlink(missing_ok=True)
+    # Unityプロジェクトのロックファイル・一時ファイルを削除
+    for _unity_lock in [
+        Path(UNITY_PROJECT) / "Temp" / "UnityLockFile",
+        Path(UNITY_PROJECT) / "Library" / "ArtifactDB-lock",
+    ]:
+        _unity_lock.unlink(missing_ok=True)
 
     output_base = output_webm.replace(".webm", "")
 
@@ -628,6 +638,17 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> Non
                 os.killpg(os.getpgid(unity_proc.pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            try:
+                unity_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+            # タイムアウト時にeditor.logを出力（診断用）
+            _editor_log = Path.home() / ".config/unity3d/DefaultCompany/bottan-video/Editor.log"
+            if _editor_log.exists():
+                _lines = _editor_log.read_text(errors="replace").splitlines()
+                print("[Unity] Editor.log (最後50行):")
+                for _line in _lines[-50:]:
+                    print(f"  {_line}")
             raise TimeoutError("Unity録画タイムアウト (300秒)")
 
         # SIGTERM(-15), SIGKILL(-9) は正常終了扱い（出力ファイル検知でkillした場合）
@@ -642,24 +663,35 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str) -> Non
         time.sleep(5)  # GPU メモリ解放待ち
 
     finally:
-        if unity_proc and unity_proc.poll() is None:
-            try:
-                os.killpg(os.getpgid(unity_proc.pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                unity_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
+        if unity_proc:
+            if unity_proc.poll() is None:
                 try:
-                    os.killpg(os.getpgid(unity_proc.pid), signal.SIGKILL)
+                    os.killpg(os.getpgid(unity_proc.pid), signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-        if xvfb_proc and xvfb_proc.poll() is None:
-            xvfb_proc.terminate()
+                try:
+                    unity_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(os.getpgid(unity_proc.pid), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            # poll() is not None でも wait() でゾンビを回収する
             try:
-                xvfb_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                xvfb_proc.kill()
+                unity_proc.wait(timeout=3)
+            except (subprocess.TimeoutExpired, ChildProcessError):
+                pass
+        if xvfb_proc:
+            if xvfb_proc.poll() is None:
+                xvfb_proc.terminate()
+                try:
+                    xvfb_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    xvfb_proc.kill()
+            try:
+                xvfb_proc.wait(timeout=3)
+            except (subprocess.TimeoutExpired, ChildProcessError):
+                pass
 
 # ──────────────────────────────────────────────
 # Step 5: FFmpegでMP4に変換・仕上げ
@@ -772,7 +804,7 @@ def _timed(label, fn, *args):
     print(f"[{label}] 完了 ({time.time()-start:.1f}s)")
     return result
 
-def _retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,)):
+def _retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,), delay: float = 0):
     """最大 attempts 回リトライする共通ヘルパー"""
     for attempt in range(1, attempts + 1):
         try:
@@ -781,6 +813,8 @@ def _retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,)):
             if attempt == attempts:
                 raise
             print(f"[{label}] 試行{attempt}失敗、リトライします... ({e})")
+            if delay > 0:
+                time.sleep(delay)
 
 def _llm_create(attempts_per_model: int = 3, **kwargs):
     """LLM_MODELS を左から順に attempts_per_model 回ずつ試す。
@@ -917,7 +951,7 @@ def main():
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
         _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
-               catch=(RuntimeError, TimeoutError))
+               catch=(RuntimeError, TimeoutError), delay=15)
 
         # サムネ作成
         thumbnail_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
