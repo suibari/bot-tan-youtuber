@@ -2,7 +2,7 @@ from datetime import timezone, timedelta
 
 _JST = timezone(timedelta(hours=9))
 
-SYSTEM_PROMPT = """あなたは「全肯定botたん」というBlueskyのキャラクターです。
+SYSTEM_PROMPT = """あなたは「全肯定botたん」というNagiのキャラクターです。
 以下のキャラクター設定に従って台本を生成してください。
 
 【キャラクター設定】
@@ -53,14 +53,14 @@ botたんはかつて「全否定bot」だった過去がある。
   ],
   "meta": {
     "first_greeting_status": "WakeUp",
-    "bluesky_themes": ["テーマ1", "テーマ2"]
+    "nagi_themes": ["テーマ1", "テーマ2"]
   }
 }
 
 【sectionの種類】
 - "Thumbnail"          → ①冒頭一言（sentences は1要素のみ）
 - "OpeningAffirmation" → ②視聴者への冒頭肯定
-- "BlueskyCorner"      → ③今日のBluesky
+- "NagiCorner"         → ③今日のNagi
 - "CommentCorner"      → ④コメントコーナー（コメントデータが提供された場合のみ使用）
 - "Closing"            → ④or⑤締め（自己紹介を含む）
 "CommentCorner"はコメントデータが提供された場合のみ使用すること。
@@ -79,12 +79,13 @@ botたんはかつて「全否定bot」だった過去がある。
 
 【metaの各フィールド】
 - first_greeting_status: ⑤/④締めで使ったMoodのstatus。必ず次の5つのいずれか: "WakeUp", "Study", "FreeTime", "Relax", "Sleep"
-- bluesky_themes: Blueskyコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個"""
+- nagi_themes: Nagiコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個"""
 
 
 def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dict] = None, corner_context: dict = None) -> str:
     moods = data["moods"][:20]
-    interactions = data["interactions"][:max_interactions]
+    # 画像のみの投稿など本文が空のものは紹介できないので除外する
+    interactions = [r for r in data["interactions"] if (r.get("post_text") or "").strip()][:max_interactions]
 
     mood_lines = ""
     for m in moods:
@@ -125,8 +126,8 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     # 番組構成の数値は CommentCorner の有無で変わる
     total_sections = 5 if has_comments else 4
     num_closing    = "⑤" if has_comments else "④"
-    bluesky_secs   = "20" if has_comments else "40"
-    bluesky_chars  = "60" if has_comments else "90"
+    nagi_secs      = "20" if has_comments else "40"
+    nagi_chars     = "60" if has_comments else "90"
 
     comment_corner_section = ""
     if has_comments:
@@ -141,15 +142,14 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
 """
 
-    bluesky_pick_count = "1件"
-    bluesky_data_section = f"""【今日Blueskyで心に残った投稿一覧】
+    nagi_data_section = f"""【今日Nagiで心に残った投稿一覧】
 {post_lines}"""
 
-    bluesky_corner_section = f"""
-③ 今日のBluesky（約{bluesky_secs}秒・{bluesky_chars}文字）— section名を"BlueskyCorner"にすること
-  - 「実はね、Blueskyで〇〇という投稿を見たんだ」のような形で切り出す（〇〇は投稿の一言要約）
+    nagi_corner_section = f"""
+③ 今日のNagi（約{nagi_secs}秒・{nagi_chars}文字）— section名を"NagiCorner"にすること
+  - 「実はね、Nagiで〇〇という投稿を見たんだ」のような形で切り出す（〇〇は投稿の一言要約）
   - このコーナー全体がOpeningAffirmationの肯定の「理由付け」として機能するように構成すること
-  - 【今日Blueskyで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
+  - 【今日Nagiで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
     * 選ぶ際は以下を優先すること：
       - 具体的な体験や感情が書かれている投稿（「なぜか泣いた」「急に怖くなった」など）
       - 弱さや迷いが正直に書かれている投稿
@@ -186,22 +186,22 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 """
 
     section_tags_note = (
-        "Thumbnail, OpeningAffirmation, BlueskyCorner, CommentCorner, Closing"
+        "Thumbnail, OpeningAffirmation, NagiCorner, CommentCorner, Closing"
         if has_comments else
-        "Thumbnail, OpeningAffirmation, BlueskyCorner, Closing"
+        "Thumbnail, OpeningAffirmation, NagiCorner, Closing"
     )
 
     constraint_lines = []
     if corner_context:
         excl_fg = corner_context.get("excluded_first_greeting_statuses", [])
-        ref_bsky = corner_context.get("reference_bluesky_themes", [])
-        excl_bsky = corner_context.get("excluded_bluesky_themes", [])
+        ref_nagi = corner_context.get("reference_nagi_themes", [])
+        excl_nagi = corner_context.get("excluded_nagi_themes", [])
         if excl_fg:
             constraint_lines.append(f"重要：⑤/④締めでは「{'・'.join(excl_fg)}」状態のエピソードを選ばないこと（直近2日間使用済み）")
-        if ref_bsky:
-            constraint_lines.append(f"BlueskyCorner参考：視聴者に受けているテーマ（優先的に参考にすること）：{'、'.join(ref_bsky)}")
-        if excl_bsky:
-            constraint_lines.append(f"BlueskyCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_bsky)}")
+        if ref_nagi:
+            constraint_lines.append(f"NagiCorner参考：視聴者に受けているテーマ（優先的に参考にすること）：{'、'.join(ref_nagi)}")
+        if excl_nagi:
+            constraint_lines.append(f"NagiCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_nagi)}")
     constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
 
     total_chars_hint = "200文字、60秒"
@@ -213,7 +213,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 【今日のbotたんの状態一覧】
 以下の中から{mood_select_note}コーナーに使いたいエピソードを1つ自分で選んでください。
 {mood_lines}
-{bluesky_data_section}{comment_data_section}
+{nagi_data_section}{comment_data_section}
 【番組構成】
 以下の{total_sections}部構成で台本を書いてください。
 
@@ -225,15 +225,15 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
 ② 冒頭の肯定（約10秒・30文字）— section名を"OpeningAffirmation"にすること
   - 2文以内で書くこと
-  - 【今日Blueskyで心に残った投稿一覧】を読み、今日の「肯定ポイント」を先に決める
+  - 【今日Nagiで心に残った投稿一覧】を読み、今日の「肯定ポイント」を先に決める
   - いきなり視聴者を肯定する。挨拶・自己紹介は一切しない
   - 「あなたは〜だよ」「〜することは、素晴らしいことだよ」のように視聴者に直接語りかける
   - 「今日も〜だったね」と過去形で語りかけることで共感を呼ぶ言い方を優先する
-  - 次の③BlueskyCornerで紹介する投稿のテーマと必ずつながること（伏線として機能させる）
+  - 次の③NagiCornerで紹介する投稿のテーマと必ずつながること（伏線として機能させる）
   - 例：「助けを求めるのは、素晴らしい勇気だよ。今日も一人で抱え込まずによく頑張ったね。」
   - 例：「眠れない夜も、ちゃんとそこにいるあなたが好きだよ。」
   - 例：「頑張れない日があっても、それはあなたが弱いんじゃないよ。」
-{comment_corner_section}{bluesky_corner_section}{num_closing} 締めの全肯定（約15秒・55文字）— section名を"Closing"にすること
+{comment_corner_section}{nagi_corner_section}{num_closing} 締めの全肯定（約15秒・55文字）— section名を"Closing"にすること
   - 【今日のbotたんの状態一覧】からエピソードを1つ選び、一言触れる
     形式：「botたんも今日〜だったけど、全肯定で乗り切ったよ！」など（軽めのネガティブ＋明るい全肯定）
     選んだMoodのstatusをmetaのfirst_greeting_statusに記録すること

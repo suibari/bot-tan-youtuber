@@ -30,6 +30,9 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", ""),
 }
 
+# SNSコーナーのcorner_name。"BlueskyCorner"はNagi移行前に保存された過去データとの互換用
+SNS_CORNER_NAMES = ("NagiCorner", "BlueskyCorner")
+
 
 def _get_youtube_client():
     """YouTube API クライアントを返す（OAuth2認証）。失敗時は None。"""
@@ -147,7 +150,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
             "snippet": {
                 "title": title,
                 "description": description,
-                "tags": ["botたん", "全肯定", "Bluesky", "VTuber"],
+                "tags": ["botたん", "全肯定", "Nagi", "VTuber"],
                 "categoryId": "22",
             },
             "status": {
@@ -268,8 +271,8 @@ def should_enable_comment_corner(recent_videos: list[dict]) -> bool:
     return True
 
 
-def fetch_bluesky_corner_context() -> dict:
-    """BlueskyCornerの参考リスト（いいね上位3件）と除外リスト（直近3日間）を取得する"""
+def fetch_nagi_corner_context() -> dict:
+    """NagiCornerの参考リスト（いいね上位3件）と除外リスト（直近3日間）を取得する"""
     conn = psycopg2.connect(**DB_CONFIG)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -288,16 +291,16 @@ def fetch_bluesky_corner_context() -> dict:
     finally:
         conn.close()
 
-    # 除外リスト（直近3日間のBlueskyCornerテーマ）
+    # 除外リスト（直近3日間のNagiCornerテーマ）
     excluded_themes = []
     for row in videos_3d:
         for corner in (row.get("corners") or []):
-            if corner.get("corner_name") == "BlueskyCorner":
+            if corner.get("corner_name") in SNS_CORNER_NAMES:
                 themes = corner.get("theme", [])
                 if isinstance(themes, list):
                     excluded_themes.extend(themes)
 
-    # 参考リスト: YouTube APIでいいね数取得 → 上位3件のBlueskyCornerテーマ
+    # 参考リスト: YouTube APIでいいね数取得 → 上位3件のNagiCornerテーマ
     reference_themes = []
     if videos_14d:
         try:
@@ -318,7 +321,7 @@ def fetch_bluesky_corner_context() -> dict:
             video_likes.sort(key=lambda x: x["like_count"], reverse=True)
             for v in video_likes[:3]:
                 for corner in (v["corners"] or []):
-                    if corner.get("corner_name") == "BlueskyCorner":
+                    if corner.get("corner_name") in SNS_CORNER_NAMES:
                         themes = corner.get("theme", [])
                         if isinstance(themes, list):
                             reference_themes.extend(themes)
@@ -326,10 +329,10 @@ def fetch_bluesky_corner_context() -> dict:
             print(f"[YouTube API] 参考リスト取得失敗（スキップ）: {e}")
 
     result = {
-        "reference_bluesky_themes": list(dict.fromkeys(reference_themes)),
-        "excluded_bluesky_themes": list(dict.fromkeys(excluded_themes)),
+        "reference_nagi_themes": list(dict.fromkeys(reference_themes)),
+        "excluded_nagi_themes": list(dict.fromkeys(excluded_themes)),
     }
-    print(f"[corners] BlueskyCorner参考={result['reference_bluesky_themes']}, 除外={result['excluded_bluesky_themes']}")
+    print(f"[corners] NagiCorner参考={result['reference_nagi_themes']}, 除外={result['excluded_nagi_themes']}")
     return result
 
 

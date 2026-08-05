@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 FONT_MARU = "/usr/share/fonts/truetype/keifont/keifont.ttf"
 W, H = 1080, 1920
-BLUE = (0, 133, 255)
+MINT = (0, 168, 138)
 
 
 def capture_thumbnail_frame(input_webm: str, output_png: str, emotions: list[dict]) -> None:
@@ -48,11 +48,11 @@ def generate_thumbnail(frame_png: str, output_png: str, thumbnail_text: str) -> 
     x = (W - text_w) // 2
     y = 190
     draw_text_with_outline(draw, top_text, font_top, x, y,
-                           text_color=BLUE,
+                           text_color=MINT,
                            outline_color=(255, 255, 255),
                            outline_width=8)
 
-    # 下部テキスト（青帯 + 白文字）
+    # 下部テキスト（ミント帯 + 白文字）
     font_size = 90
     font_bottom = ImageFont.truetype(FONT_MARU, font_size)
     bbox = draw.textbbox((0, 0), thumbnail_text, font=font_bottom)
@@ -62,7 +62,7 @@ def generate_thumbnail(frame_png: str, output_png: str, thumbnail_text: str) -> 
         bbox = draw.textbbox((0, 0), thumbnail_text, font=font_bottom)
     box_y = H - 480
     box_h = 230
-    draw.rectangle([0, box_y, W, box_y + box_h], fill=BLUE + (235,))
+    draw.rectangle([0, box_y, W, box_y + box_h], fill=MINT + (235,))
     bbox = draw.textbbox((0, 0), thumbnail_text, font=font_bottom)
     text_w = bbox[2] - bbox[0]
     text_h = bbox[3] - bbox[1]

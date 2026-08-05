@@ -3,8 +3,6 @@
 botたん YouTube Shorts 自動投稿パイプライン
 
 環境変数:
-  BLUESKY_HANDLE      : Blueskyハンドル (例: bot-tan.bsky.social)
-  BLUESKY_PASSWORD    : Blueskyアプリパスワード
   GEMINI_API_KEY      : Gemini APIキー (USE_LOCAL_LLM=false時)
   YOUTUBE_CLIENT_ID   : YouTube OAuth2 クライアントID
   YOUTUBE_CLIENT_SECRET: YouTube OAuth2 クライアントシークレット
@@ -31,7 +29,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
-from atproto import Client
 from openai import OpenAI, BadRequestError as _OpenAIBadRequestError
 
 from dotenv import load_dotenv
@@ -46,8 +43,6 @@ from thumbnail import capture_thumbnail_frame, generate_thumbnail
 # 設定
 # ──────────────────────────────────────────────
 
-BLUESKY_HANDLE   = os.getenv("BLUESKY_HANDLE", "bot-tan.suibari.com")
-BLUESKY_PASSWORD = os.getenv("BLUESKY_PASSWORD", "")
 VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
 VOICEVOX_SPEAKER = int(os.getenv("VOICEVOX_SPEAKER", "8"))
 UNITY_EXE        = os.getenv("UNITY_EXE", "/home/suibari/Unity/Hub/Editor/6000.0.76f1/Editor/Unity")
@@ -103,9 +98,9 @@ SCRIPT_SCHEMA = {
             "type": "object",
             "properties": {
                 "first_greeting_status": {"type": "string"},
-                "bluesky_themes":        {"type": "array", "items": {"type": "string"}},
+                "nagi_themes":           {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["first_greeting_status", "bluesky_themes"],
+            "required": ["first_greeting_status", "nagi_themes"],
         },
     },
     "required": ["sections", "meta"],
@@ -127,25 +122,27 @@ DB_CONFIG = {
 }
 
 def fetch_from_bot_db() -> dict:
-    """ラズパイDBからインタラクションとMood履歴を取得する"""
+    """ラズパイDBからNagiのポストとMood履歴を取得する"""
     print("[DB] ラズパイDBに接続中...")
 
     conn = psycopg2.connect(**DB_CONFIG)
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
 
-            # 今週のAIリプライ
+            # 今日のNagiの高得点ポスト
             cur.execute("""
                 SELECT
-                    did,
-                    details->>'text'         AS post_text,
-                    (details->>'score')::int AS score,
-                    created_at
-                FROM affirmative_bot.interaction
-                WHERE type = 'NormalReply'
-                  AND (details->>'score')::int >= 88
-                  AND created_at >= NOW() - INTERVAL '1 days'
-                ORDER BY score DESC
+                    p.did,
+                    p.text                AS post_text,
+                    s.score               AS score,
+                    p.record_created_at   AS created_at
+                FROM nagi.post_scores s
+                JOIN nagi.posts p ON s.post_uri = p.uri
+                WHERE s.score >= 88
+                  AND p.record_created_at >= NOW() - INTERVAL '1 days'
+                  AND p.deleted_at IS NULL
+                  AND p.kossori = false
+                ORDER BY s.score DESC
             """)
             interactions = cur.fetchall()
 
@@ -166,7 +163,7 @@ def fetch_from_bot_db() -> dict:
     finally:
         conn.close()
 
-    print(f"[DB] インタラクション: {len(interactions)}件, Mood履歴: {len(moods)}件")
+    print(f"[DB] Nagiポスト: {len(interactions)}件, Mood履歴: {len(moods)}件")
     all_moods = [dict(r) for r in moods]
     # statusごとに1件ずつランダムサンプリング
     import random
@@ -501,7 +498,7 @@ def generate_corner_timing(
 ) -> list[dict]:
     """セクションタグで確定したタイミングでコーナーラベルを生成する"""
     corner_meta = [('OpeningAffirmation', "全肯定タイム", "#ff6b9d")]
-    corner_meta.append(('BlueskyCorner', "今日のBluesky", "#0085ff"))
+    corner_meta.append(('NagiCorner', "今日のNagi", "#00A88A"))
     if has_comments:
         corner_meta.append(('CommentCorner', "コメントコーナー", "#ff9f43"))
     corner_meta.append(('Closing', "全肯定メッセージ", "#7ec8e3"))
@@ -705,7 +702,7 @@ def finalize_video(input_webm: str, output_mp4: str,
     print(f"[FFmpeg] MP4変換中...")
 
     if intro_duration > 0 and corners is not None:
-        corners = [{"start": 0, "end": intro_duration, "label": "今日の全肯定", "color": "#0085ff"}] + corners
+        corners = [{"start": 0, "end": intro_duration, "label": "今日の全肯定", "color": "#00A88A"}] + corners
 
     FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
     W, H = 1080, 1920
@@ -722,9 +719,9 @@ def finalize_video(input_webm: str, output_mp4: str,
             start = sub["start"]
             end   = sub["end"]
             text  = sub["text"].replace("'", "\\'").replace(":", "\\:")
-            # 青背景ボックス + 白文字
+            # ミント背景ボックス + 白文字
             vf_parts.append(
-                f"drawbox=x=0:y={H-420}:w={W}:h=160:color=0x0085ff@0.92:t=fill"
+                f"drawbox=x=0:y={H-420}:w={W}:h=160:color=0x00A88A@0.92:t=fill"
                 f":enable='between(t,{start},{end})'"
             )
             vf_parts.append(
@@ -791,7 +788,7 @@ from youtube import (
     fetch_recent_corners,
     get_recent_video_stats,
     should_enable_comment_corner,
-    fetch_bluesky_corner_context,
+    fetch_nagi_corner_context,
     save_youtube_upload_to_db,
     notify_discord,
 )
@@ -846,10 +843,6 @@ def main():
     mp4_path    = str(tmp_dir / f"bottan_{ts}.mp4")
     screenshot_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
 
-    date_label  = datetime.now().strftime("%Y/%m/%d")
-    title       = f"botたんの今週のひとこと {date_label}"
-    description = "全肯定botたんが今週Blueskyで感じたことをお話しします。\n#botたん #全肯定 #Bluesky"
-
     total_start = time.time()
     try:
         # Step 1: DBからデータ取得
@@ -869,12 +862,12 @@ def main():
         has_comments = bool(comments)
         print(f"[コメント] CommentCorner: {'あり (' + str(len(comments)) + '件)' if has_comments else 'なし → スキップ'}")
 
-        # corner_context取得（直近status除外・Bluesky参考/除外リスト）
+        # corner_context取得（直近status除外・Nagi参考/除外リスト）
         corner_context = {}
         try:
             recent_corners = fetch_recent_corners(limit=2)
-            bsky_context = fetch_bluesky_corner_context()
-            corner_context = {**recent_corners, **bsky_context}
+            nagi_context = fetch_nagi_corner_context()
+            corner_context = {**recent_corners, **nagi_context}
         except Exception as e:
             print(f"[corner_context] 取得失敗（スキップ）: {e}")
 
@@ -891,7 +884,7 @@ def main():
         sections = {s["section"]: s["sentences"] for s in script_data["sections"]}
         script_meta = script_data["meta"]
         print(f"[META] first_greeting_status={script_meta.get('first_greeting_status')}, "
-              f"bluesky_themes={script_meta.get('bluesky_themes')}")
+              f"nagi_themes={script_meta.get('nagi_themes')}")
         thumbnail_sentences = sections.get("Thumbnail", [])
         thumbnail_text = thumbnail_sentences[0]["text"][:20] if thumbnail_sentences else "今日も全肯定だよ！"
         print(f"[サムネイル] 一言: {thumbnail_text}")
@@ -971,9 +964,9 @@ def main():
                     {"corner_name": "Thumbnail", "theme": thumbnail_text},
                     {"corner_name": "Closing", "status": script_meta.get("first_greeting_status", "")},
                 ]
-                bluesky_themes = script_meta.get("bluesky_themes", [])
-                if isinstance(bluesky_themes, list) and bluesky_themes:
-                    corners_metadata.append({"corner_name": "BlueskyCorner", "theme": bluesky_themes})
+                nagi_themes = script_meta.get("nagi_themes", [])
+                if isinstance(nagi_themes, list) and nagi_themes:
+                    corners_metadata.append({"corner_name": "NagiCorner", "theme": nagi_themes})
                 save_youtube_upload_to_db(yt_url, title, corners_metadata)
                 notify_discord(yt_url, title)
         else:

@@ -1,5 +1,5 @@
 def build_description() -> str:
-    return """全肯定botたんが今週Blueskyで感じたことをお話しします。
+    return """全肯定botたんが今日Nagiで感じたことをお話しします。
 
 🤖 この動画はAIによる完全自動投稿です
 台本作成・動画撮影・YouTubeアップロードまで全て自動で行っています。
@@ -8,19 +8,19 @@ def build_description() -> str:
 👧 全肯定botたんとは？
 SNSで活動中の、みんなを励ますのが大好きなJKです
 リプライするとなんでも全肯定してくれます
-https://suibari.com/character
+http://bot-tan.com
 
-🌐 Blueskyアカウントはこちら
+🌐 SNS「Nagi」はこちら
 botたんの活動場所です
-フォローすると全肯定リプライが届きます！💬
-https://bsky.app/profile/bot-tan.suibari.com
+投稿すると全肯定リプライが届きます！💬
+https://nagi.suibari.com
 
 😎 本プロジェクトについてはこちら
 世界中を全肯定したい！
 全肯定botたんは開発者すいばりが運営しています
 https://note.com/suibari/n/n36e699f32479
 ━━━━━━━━━━━━━━━━━━
-#botたん #全肯定 #Bluesky #VTuber
+#botたん #全肯定 #Nagi #VTuber
 
 ━━━━━━━━━━━━━━━━━━
 【クレジット】
