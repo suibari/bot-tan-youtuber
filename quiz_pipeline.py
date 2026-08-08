@@ -18,6 +18,7 @@ JST 6:00 に起動し、約55秒のクイズ動画を生成して YouTube に投
   QUIZ_COOLDOWN_DAYS  : 再利用までの日数 (デフォルト: 30)
   QUIZ_NO_CONSUME     : true で消費台帳に記録しない（テスト用）
   MORNING_CAMERA_OFFSET_Y : Unityカメラの上方向オフセット (デフォルト: 0.16)
+  MORNING_MOUTH_CLOSE     : 無音時に表情の口成分を打ち消す強さ 0〜1 (デフォルト: 1.0)
   SKIP_YOUTUBE        : true で投稿をスキップ
   KEEP_TEMP           : true で一時ファイルを残す
   YOUTUBE_PRIVACY     : public/private/unlisted
@@ -55,6 +56,12 @@ PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "EN
 # Unityカメラを鉛直に上げる量[m]。quiz_layout.PANEL_H と連動しているので
 # 片方だけ変えないこと（実測 3647px/m、PANEL_H=470 → Δy≒0.11）
 CAMERA_OFFSET_Y = float(os.getenv("MORNING_CAMERA_OFFSET_Y", "0.11"))
+# 表情プリセット(Fcl_ALL_*)は口が開くモーフを含むため、発話していない間も口が開いたまま
+# になる。朝版はシンキングタイムなど無音区間が長いので、Unity 側で表情の口成分だけを
+# 打ち消す。眉と目の表情は残るので表情が抜けて見えることはない。
+# 1.0 で口面積が 639〜3738px → 9〜63px になることを check_face.py で実測した。
+# 夜版は引数自体を渡さないので影響を受けない。
+MOUTH_CLOSE = float(os.getenv("MORNING_MOUTH_CLOSE", "1.0"))
 
 
 # ──────────────────────────────────────────────
@@ -254,13 +261,16 @@ def build_subtitles(segments: list[dict], max_chars: int = 20) -> list[dict]:
 # パートごとの表情の方向性。毎回同じ顔にならないよう複数用意して抽選する。
 # VRM1FaceAnimation の内積配分:
 #   Happy(1.0,-0.3) Relaxed(0.5,-0.8) Sad(-0.8,-0.5) Angry(-0.7,0.8) Surprised(0.3,1.0)
+# arousal が高いほど Surprised/Happy が乗って口が開く（check_face.py で実測）。
+# Q/A は発話中で口が動いているので高いままでよいが、長い EXPL/AFF/END は
+# 落ち着かせて夜版と同じくらいの開き具合にする。
 EMOTION_VARIANTS = {
     "Q":     [(0.70, 0.70), (0.50, 0.85), (0.85, 0.55)],   # わくわく問いかけ
     "THINK": [(0.50, 0.80), (0.30, 0.60), (0.60, 0.90)],   # そわそわ待つ
     "A":     [(0.90, 0.90), (0.75, 1.00), (1.00, 0.75)],   # びっくり嬉しい
-    "EXPL":  [(0.70, -0.20), (0.60, 0.10), (0.80, -0.35)], # 落ち着いた解説
-    "AFF":   [(1.00, 0.00), (0.90, 0.25), (1.00, -0.20)],  # まっすぐな全肯定
-    "END":   [(0.80, 0.50), (0.90, 0.35), (0.70, 0.60)],   # 明るい送り出し
+    "EXPL":  [(0.65, -0.60), (0.55, -0.80), (0.75, -0.45)],  # 落ち着いた解説
+    "AFF":   [(1.00, -0.30), (0.90, -0.10), (0.95, -0.50)],  # まっすぐな全肯定
+    "END":   [(0.80, 0.15), (0.90, 0.00), (0.70, 0.25)],     # 明るい送り出し
 }
 
 JITTER = 0.12        # valence/arousal の微細ゆらぎ幅
@@ -433,7 +443,8 @@ def main(argv=None):
         else:
             core._retry("Step5 Unity録画", core.record_with_unity,
                         wav_path, webm_path, emotion_path,
-                        extra_args=["-cameraOffsetY", f"{CAMERA_OFFSET_Y}"],
+                        extra_args=["-cameraOffsetY", f"{CAMERA_OFFSET_Y}",
+                                    "-mouthCloseOnSilence", f"{MOUTH_CLOSE}"],
                         catch=(RuntimeError, TimeoutError), delay=15)
             source_webm = webm_path
             cleanup_targets.append(webm_path)

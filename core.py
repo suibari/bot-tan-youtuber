@@ -390,6 +390,9 @@ def split_sentences(script: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+SUBTITLE_GAP = 0.06   # 隣り合う字幕の間に必ず空ける秒数
+
+
 def generate_subtitle_timing(script: str, time_offset: float = 0.0,
                              actual_duration: float = None,
                              max_chars: int = 15,
@@ -463,7 +466,11 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0,
         for chunk in final_chunks:
             if n_sent_moras > 0 and sentence_chars > 0:
                 s_idx = min(int(char_offset * n_sent_moras / sentence_chars), n_sent_moras - 1)
-                e_idx = min(int((char_offset + len(chunk)) * n_sent_moras / sentence_chars), n_sent_moras - 1)
+                # 終端は「次のチャンクの先頭モーラの1つ手前」。
+                # -1 を忘れると e_idx(N) == s_idx(N+1) となり、前後の字幕が
+                # そのモーラ長ぶん重なって同じ位置に2枚描画される。
+                idx_end = int((char_offset + len(chunk)) * n_sent_moras / sentence_chars)
+                e_idx   = max(s_idx, min(idx_end, n_sent_moras) - 1)
                 start_t = current_time + sent_moras[s_idx]["start"] * mora_scale
                 end_t   = current_time + (sent_moras[e_idx]["start"] + sent_moras[e_idx]["duration"]) * mora_scale + 0.05
             else:
@@ -480,8 +487,24 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0,
 
         current_time += scaled_dur
 
+    _dedupe_subtitle_overlaps(subtitles)
+
     print(f"[字幕] {len(subtitles)}ブロック生成完了")
     return subtitles
+
+
+def _dedupe_subtitle_overlaps(subtitles: list[dict]) -> None:
+    """隣り合う字幕の表示時間が重ならないよう end を切り詰める（in-place）。
+
+    drawtext の enable='between(t,s,e)' は両端を含むため、隣接するだけでも
+    境界フレームで2枚描画される。SUBTITLE_GAP ぶん明示的に空ける。
+    モーラ配分の丸めで再発しうるので、インデックス修正とは別に安全網として置く。
+    """
+    for cur, nxt in zip(subtitles, subtitles[1:]):
+        limit = nxt["start"] - SUBTITLE_GAP
+        if cur["end"] > limit:
+            # 詰まったチャンクが表示0秒に潰れないよう下限を設ける
+            cur["end"] = round(max(cur["start"] + 0.15, limit), 3)
 
 
 def _find_subtitle_time(subtitles: list[dict], keyword: str, start_from: float = 0.0) -> float | None:
