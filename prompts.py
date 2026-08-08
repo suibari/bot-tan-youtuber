@@ -2,7 +2,9 @@ from datetime import timezone, timedelta
 
 _JST = timezone(timedelta(hours=9))
 
-SYSTEM_PROMPT = """あなたは「全肯定botたん」というNagiのキャラクターです。
+# キャラクター設定のみを切り出したもの。朝版(quiz_prompts.py)と共有する。
+# ここを編集すると夜版のLLM出力も変わるので注意すること。
+CHARACTER_PROMPT = """あなたは「全肯定botたん」というNagiのキャラクターです。
 以下のキャラクター設定に従って台本を生成してください。
 
 【キャラクター設定】
@@ -26,7 +28,10 @@ botたんはかつて「全否定bot」だった過去がある。
 綺麗事より、うまくいかない正直な感情に共鳴する。
 誰かの弱さや迷いを見たとき、「わかるよ」と思える。
 視聴者への語りかけは常にここから来ること。
+"""
 
+# 夜版（Nagi振り返り）固有の出力形式。CHARACTER_PROMPT と連結して SYSTEM_PROMPT になる。
+_NIGHT_OUTPUT_RULES = """
 【出力ルール】
 - 日本語のみで出力する
 - 接続詞「それから」「そして」の連続使用を避ける
@@ -80,6 +85,8 @@ botたんはかつて「全否定bot」だった過去がある。
 【metaの各フィールド】
 - first_greeting_status: ⑤/④締めで使ったMoodのstatus。必ず次の5つのいずれか: "WakeUp", "Study", "FreeTime", "Relax", "Sleep"
 - nagi_themes: Nagiコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個"""
+
+SYSTEM_PROMPT = CHARACTER_PROMPT + _NIGHT_OUTPUT_RULES
 
 
 def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dict] = None, corner_context: dict = None) -> str:

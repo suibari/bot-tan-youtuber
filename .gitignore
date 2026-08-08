@@ -223,3 +223,5 @@ __marimo__/
 unity-scripts/*.meta
 
 test*.py
+# クイズ消費台帳（機械が追記するので git 管理しない）
+data/quiz_used.csv
