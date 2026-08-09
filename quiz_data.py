@@ -124,6 +124,25 @@ def wrong_text(quiz: dict) -> str:
     return quiz["選択肢B"] if quiz["正解"] == "A" else quiz["選択肢A"]
 
 
+def shuffle_choices(quiz: dict, now=None) -> dict:
+    """選択肢A/Bを入れ替えたコピーを返す（入れ替えないこともある）。
+
+    CSVは「誤解されている説がA・正しい説がB」という作問パターンのせいで
+    正解がBに偏っているので、ここで均す。日付とidをシードにした決定論的な
+    入れ替えなので、同じ日の再実行では同じ並びになる（Unity録画のリトライや
+    --stage ffmpeg での再合成で正解位置がズレない）。
+    """
+    now = now or datetime.now(_JST)
+    rng = random.Random(f"{now.strftime('%Y-%m-%d')}-{quiz['id']}")
+    if not rng.getrandbits(1):
+        return dict(quiz)
+
+    swapped = dict(quiz)
+    swapped["選択肢A"], swapped["選択肢B"] = quiz["選択肢B"], quiz["選択肢A"]
+    swapped["正解"] = "B" if quiz["正解"] == "A" else "A"
+    return swapped
+
+
 # ──────────────────────────────────────────────
 # 消費台帳
 # ──────────────────────────────────────────────
@@ -171,16 +190,20 @@ def next_quiz(quiz_id: int = None, now=None, quizzes: list[dict] = None) -> dict
 
     日付をシードにしているので、同じ日に再実行すると同じ問題が選ばれる
     （Unity録画のリトライで別の問題にすり替わらない）。
+
+    返す直前に shuffle_choices() を通すので、選択肢A/Bの並びはCSVのままとは
+    限らない。下流（描画・台本・概要欄）はこの dict の内容しか見ないため、
+    ここで入れ替えておけば全体の整合が取れる。
     """
     quizzes = quizzes if quizzes is not None else load_quizzes()
+    now = now or datetime.now(_JST)
 
     if quiz_id is not None:
         for q in quizzes:
             if q["id"] == quiz_id:
-                return q
+                return shuffle_choices(q, now)
         raise QuizDataError(f"id={quiz_id} のクイズが見つかりません")
 
-    now = now or datetime.now(_JST)
     last_used = load_last_used()
     rng = random.Random(now.strftime("%Y-%m-%d"))
 
@@ -188,7 +211,7 @@ def next_quiz(quiz_id: int = None, now=None, quizzes: list[dict] = None) -> dict
     if unused:
         chosen = rng.choice(unused)
         print(f"[クイズ] 未使用から選択: id={chosen['id']} (未使用 {len(unused)}/{len(quizzes)}件)")
-        return chosen
+        return shuffle_choices(chosen, now)
 
     cooled = [q for q in quizzes
               if (now - last_used[q["id"]]).days >= COOLDOWN_DAYS]
@@ -196,12 +219,12 @@ def next_quiz(quiz_id: int = None, now=None, quizzes: list[dict] = None) -> dict
         chosen = rng.choice(cooled)
         print(f"[クイズ] 再利用可能から選択: id={chosen['id']} "
               f"(クールダウン明け {len(cooled)}/{len(quizzes)}件)")
-        return chosen
+        return shuffle_choices(chosen, now)
 
     chosen = min(quizzes, key=lambda q: last_used[q["id"]])
     print(f"[クイズ] 全問クールダウン中のため最古を再利用: id={chosen['id']} "
           f"(最終使用 {last_used[chosen['id']].date()})")
-    return chosen
+    return shuffle_choices(chosen, now)
 
 
 # ──────────────────────────────────────────────
