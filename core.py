@@ -21,6 +21,7 @@ botたん動画パイプライン 共通処理
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)
   UNITY_EXE           : Unityエディタのパス
   UNITY_PROJECT       : Unityプロジェクトのパス
+  VRMA_MOTION_DIR     : AI生成モーション(.vrma)を置いたディレクトリ (省略時は従来のMixamoモーション)
   BGM_PATH            : BGM音声ファイルのパス (省略可)
   DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD : PostgreSQL接続情報
 """
@@ -52,6 +53,9 @@ VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
 VOICEVOX_SPEAKER = int(os.getenv("VOICEVOX_SPEAKER", "8"))
 UNITY_EXE        = os.getenv("UNITY_EXE", "/home/suibari/Unity/Hub/Editor/6000.0.76f1/Editor/Unity")
 UNITY_PROJECT    = os.getenv("UNITY_PROJECT", "/home/suibari/bottan-video")
+# 指定するとUnityへ -vrmaMotionDir が渡り、VrmaMotionPlayer が該当モーションを差し替える。
+# 未指定なら Unity 側は完全な no-op で、従来のMixamoモーションのまま。
+VRMA_MOTION_DIR  = os.getenv("VRMA_MOTION_DIR", "")
 BGM_PATH         = os.getenv("BGM_PATH", "")
 USE_LOCAL_LLM    = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
 
@@ -589,11 +593,16 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
             "-outputFile", output_base,
             "-emotionFile", emotion_path,
         ]
+        if VRMA_MOTION_DIR:
+            cmd += ["-vrmaMotionDir", VRMA_MOTION_DIR]
         if extra_args:
             cmd += list(extra_args)
         print(f"[Unity] コマンド: {' '.join(cmd)}")
 
         unity_proc = subprocess.Popen(cmd, env=env, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+        # 「書き込み完了を確認してから自分でkillした」= 録画は成功、を表すフラグ。
+        # この経路を通った場合、Unityの終了コードは我々がkillした結果でしかなく、判定に使えない。
+        write_completed = False
         deadline = time.time() + 300
         while time.time() < deadline:
             if Path(output_webm).exists() and os.path.getsize(output_webm) > 0:
@@ -623,6 +632,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
                         unity_proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         pass
+                write_completed = True
                 break
             if unity_proc.poll() is not None:
                 break
@@ -647,13 +657,21 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
                     print(f"  {_line}")
             raise TimeoutError("Unity録画タイムアウト (300秒)")
 
-        # SIGTERM(-15), SIGKILL(-9) は正常終了扱い（出力ファイル検知でkillした場合）
-        if unity_proc.returncode not in (0, None, -15, -9):
-            raise RuntimeError(
-                f"Unity録画失敗 (returncode: {unity_proc.returncode})"
-            )
+        # 判定は終了コードではなく成果物で行う。
+        # Unityは録画完了後のシャットダウンで mono が SIGSEGV し、恒常的に 255 を返す
+        # （VRMA無効のベースラインでも再現。Editor.log に "Exiting early due to double fault"）。
+        # 以前はこれを失敗扱いにしていたため、毎回リトライで録画を2回走らせていた。
         if not Path(output_webm).exists():
             raise FileNotFoundError(f"録画ファイルが見つかりません: {output_webm}")
+        if not write_completed:
+            # 書き込み完了を確認する前にUnityが自滅した = 出力が途中の可能性がある
+            raise RuntimeError(
+                f"Unity録画失敗 (書き込み完了を確認できず, returncode: {unity_proc.returncode})"
+            )
+        # SIGTERM(-15), SIGKILL(-9) は我々がkillした結果なので正常
+        if unity_proc.returncode not in (0, None, -15, -9):
+            print(f"[Unity] 終了コード {unity_proc.returncode} "
+                  f"(録画完了後のシャットダウン時クラッシュ。出力は正常なので続行)")
 
         print(f"[Unity] 録画完了: {output_webm}")
         time.sleep(5)  # GPU メモリ解放待ち
