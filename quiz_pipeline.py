@@ -17,6 +17,9 @@ JST 6:00 に起動し、約55秒のクイズ動画を生成して YouTube に投
   QUIZ_USED_CSV       : 消費台帳のパス  (デフォルト: ./data/quiz_used.csv)
   QUIZ_COOLDOWN_DAYS  : 再利用までの日数 (デフォルト: 30)
   QUIZ_NO_CONSUME     : true で消費台帳に記録しない（テスト用）
+  THINK_VRMA          : シンキングタイムで流すAI生成モーションのファイル名 (既定 think.vrma)
+  THINK_VRMA_PULLBACK : そのモーション再生中にカメラを引く量[m] (既定 0.7)
+  THINK_VRMA_DELAY    : THINK開始からの遅延[秒] (既定 0.3)
   MORNING_CAMERA_OFFSET_Y : Unityカメラの上方向オフセット (デフォルト: 0.16)
   MORNING_MOUTH_CLOSE     : 無音時に表情の口成分を打ち消す強さ 0〜1 (デフォルト: 1.0)
   SKIP_YOUTUBE        : true で投稿をスキップ
@@ -52,6 +55,14 @@ COUNTDOWN_WORDS = ["ご", "よん", "さん", "にー", "いち"]
 
 # パート間に入れる無音（秒）。THINK後の溜めを長めにして「正解は……」を引き立てる
 PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "END": 0.0}
+
+# シンキングタイム(発話が無く現行モーションも無い5秒)で流すAI生成モーション。
+# core.VRMA_MOTION_DIR が設定されているときだけ有効。ファイルが無ければUnity側が黙って飛ばす。
+THINK_VRMA          = os.getenv("THINK_VRMA", "think.vrma")
+# 生成モーション再生中だけカメラを引く量[m]。0で引かない
+THINK_VRMA_PULLBACK = float(os.getenv("THINK_VRMA_PULLBACK", "0.7"))
+# THINK開始からの遅延[秒]。カウントダウンが始まってから動き出す
+THINK_VRMA_DELAY    = float(os.getenv("THINK_VRMA_DELAY", "0.3"))
 
 # Unityカメラを鉛直に上げる量[m]。quiz_layout.PANEL_H と連動しているので
 # 片方だけ変えないこと（実測 3647px/m、PANEL_H=470 → Δy≒0.11）
@@ -336,10 +347,22 @@ def build_emotion_file(segments: list[dict], emotions: list[dict], path: str) ->
         "greetingTime2": round(seg["END"]["start"] + 0.2, 2),
         "waveTime":      round(wave_time, 2),
     }
+
+    # AI生成モーション。既存のMixamoトリガー4つとは独立していて干渉しない。
+    # 現状はシンキングタイムのみ（発話も現行モーションも無い5秒間）。
+    if core.VRMA_MOTION_DIR and THINK_VRMA:
+        data["vrmaMotions"] = [{
+            "time":     round(seg["THINK"]["start"] + THINK_VRMA_DELAY, 2),
+            "file":     THINK_VRMA,
+            "pullback": THINK_VRMA_PULLBACK,
+        }]
     Path(path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     print(f"[感情] 保存: {path} "
           f"(greeting1={data['greetingTime1']}s thankful={data['thankfulTime']}s "
           f"greeting2={data['greetingTime2']}s wave={data['waveTime']}s)")
+    for m in data.get("vrmaMotions", []):
+        print(f"[モーション] 生成モーション: {m['file']} @{m['time']}s "
+              f"(カメラ引き {m['pullback']}m)")
 
 
 # ──────────────────────────────────────────────
