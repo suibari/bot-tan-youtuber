@@ -17,9 +17,8 @@ JST 6:00 に起動し、約55秒のクイズ動画を生成して YouTube に投
   QUIZ_USED_CSV       : 消費台帳のパス  (デフォルト: ./data/quiz_used.csv)
   QUIZ_COOLDOWN_DAYS  : 再利用までの日数 (デフォルト: 30)
   QUIZ_NO_CONSUME     : true で消費台帳に記録しない（テスト用）
-  THINK_VRMA          : シンキングタイムで流すAI生成モーションのファイル名 (既定 think.vrma)
-  THINK_VRMA_PULLBACK : そのモーション再生中にカメラを引く量[m] (既定 0.7)
-  THINK_VRMA_DELAY    : THINK開始からの遅延[秒] (既定 0.3)
+  VRMA_MAX_SEC        : AI生成モーション1本の最大長[秒] (既定 5.0)
+  VRMA_PULLBACK       : シンキングタイム以降カメラを引く量[m] (既定 0.7)
   MORNING_CAMERA_OFFSET_Y : Unityカメラの上方向オフセット (デフォルト: 0.16)
   MORNING_MOUTH_CLOSE     : 無音時に表情の口成分を打ち消す強さ 0〜1 (デフォルト: 1.0)
   SKIP_YOUTUBE        : true で投稿をスキップ
@@ -56,13 +55,18 @@ COUNTDOWN_WORDS = ["ご", "よん", "さん", "にー", "いち"]
 # パート間に入れる無音（秒）。THINK後の溜めを長めにして「正解は……」を引き立てる
 PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "END": 0.0}
 
-# シンキングタイム(発話が無く現行モーションも無い5秒)で流すAI生成モーション。
-# core.VRMA_MOTION_DIR が設定されているときだけ有効。ファイルが無ければUnity側が黙って飛ばす。
-THINK_VRMA          = os.getenv("THINK_VRMA", "think.vrma")
-# 生成モーション再生中だけカメラを引く量[m]。0で引かない
-THINK_VRMA_PULLBACK = float(os.getenv("THINK_VRMA_PULLBACK", "0.7"))
-# THINK開始からの遅延[秒]。カウントダウンが始まってから動き出す
-THINK_VRMA_DELAY    = float(os.getenv("THINK_VRMA_DELAY", "0.3"))
+# AI生成モーションを入れるパート。Mixamoのトリガーが無いところだけを対象にする。
+#   Q   → 既定ステートの Blow A Kiss が流れる（4.57秒）
+#   AFF → DoThankful,  END → DoGreeting + DoWave
+# 残る THINK / A / EXPL の冒頭に1本ずつ置く。値は「パート開始からの遅延[秒]」。
+VRMA_PARTS = {"THINK": 0.3, "A": 0.1, "EXPL": 0.4}
+# ARDYは20fpsなので、これより短いと数十フレームしか無く動きとして成立しない。
+# 実測: 1.15秒のモーションはIdleとほぼ見分けがつかなかった
+VRMA_MIN_SEC = 2.5
+# 生成モーションの最大長[秒]。長いほど破綻しやすいので上限を切る
+VRMA_MAX_SEC = float(os.getenv("VRMA_MAX_SEC", "5.0"))
+# 生成モーションが始まる THINK からカメラを引く。引く量[m]
+VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.7"))
 
 # Unityカメラを鉛直に上げる量[m]。quiz_layout.PANEL_H と連動しているので
 # 片方だけ変えないこと（実測 3647px/m、PANEL_H=470 → Δy≒0.11）
@@ -323,12 +327,50 @@ def build_emotions(segments: list[dict], rng) -> list[dict]:
     return emotions
 
 
-def build_emotion_file(segments: list[dict], emotions: list[dict], path: str) -> None:
-    """Unityへ渡すJSON。モーショントリガーは4つとも使う。
+def build_vrma_specs(segments: list[dict], script: dict) -> list[dict]:
+    """台本のmotions（英文）とセグメント時刻から、生成モーションの仕様を組む。
+
+    VRMA_PARTS のパートだけを対象にする（Mixamoが動いているパートは避ける）。
+    尺はパート長からはみ出さないようクランプする。
+    """
+    motions = (script.get("motions") or {})
+    key_of = {"THINK": "think", "A": "answer", "EXPL": "explanation"}
+    seg = {x["id"]: x for x in segments}
+    specs = []
+
+    for pid, delay in VRMA_PARTS.items():
+        text = (motions.get(key_of[pid]) or "").strip()
+        if not text:
+            print(f"[モーション] {pid}: 台本にmotionsが無いのでスキップ")
+            continue
+        if pid not in seg:
+            continue
+        s = seg[pid]
+        # パートの残り時間に収める。0.4秒は末尾の余白
+        avail = s["duration"] - delay - 0.4
+        if avail < VRMA_MIN_SEC:
+            print(f"[モーション] {pid}: 尺が足りない({avail:.1f}秒)のでスキップ")
+            continue
+        specs.append({
+            "name":     pid.lower(),
+            "time":     round(s["start"] + delay, 2),
+            "duration": round(min(avail, VRMA_MAX_SEC), 2),
+            "text":     text,
+        })
+    return specs
+
+
+def build_emotion_file(segments: list[dict], emotions: list[dict], path: str,
+                       vrma_motions: list[dict] = None) -> None:
+    """Unityへ渡すJSON。
 
     greetingTime2 は Unity 側に実装済みだが Python が書き出していなかった
     デッドコード。ここで埋めることで Unity 無改修のままエンディングの
     挨拶モーションが発火する。
+
+    greetingTime1 は書き出さない。greetingTime2 と同じ DoGreeting を撃つ重複であり、
+    Q.start+0.3 という早さで発火するため Animator の既定ステート
+    Blow A Kiss（4.57秒）を0.3秒で断ち切っていた。省くと投げキッスが最後まで流れる。
     """
     seg = {s["id"]: s for s in segments}
 
@@ -342,27 +384,20 @@ def build_emotion_file(segments: list[dict], emotions: list[dict], path: str) ->
     data = {
         "emotions":      emotions,
         # 0だと VRM1LipSync が発火しないので必ず正の値にする
-        "greetingTime1": round(seg["Q"]["start"] + 0.3, 2),
         "thankfulTime":  round(seg["AFF"]["start"] + 0.2, 2),
         "greetingTime2": round(seg["END"]["start"] + 0.2, 2),
         "waveTime":      round(wave_time, 2),
     }
 
-    # AI生成モーション。既存のMixamoトリガー4つとは独立していて干渉しない。
-    # 現状はシンキングタイムのみ（発話も現行モーションも無い5秒間）。
-    if core.VRMA_MOTION_DIR and THINK_VRMA:
-        data["vrmaMotions"] = [{
-            "time":     round(seg["THINK"]["start"] + THINK_VRMA_DELAY, 2),
-            "file":     THINK_VRMA,
-            "pullback": THINK_VRMA_PULLBACK,
-        }]
+    # AI生成モーション。既存のMixamoトリガーとは独立していて干渉しない
+    if vrma_motions:
+        data["vrmaMotions"] = vrma_motions
     Path(path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     print(f"[感情] 保存: {path} "
-          f"(greeting1={data['greetingTime1']}s thankful={data['thankfulTime']}s "
+          f"(thankful={data['thankfulTime']}s "
           f"greeting2={data['greetingTime2']}s wave={data['waveTime']}s)")
     for m in data.get("vrmaMotions", []):
-        print(f"[モーション] 生成モーション: {m['file']} @{m['time']}s "
-              f"(カメラ引き {m['pullback']}m)")
+        print(f"[モーション] 生成: {m['file']} @{m['time']}s")
 
 
 # ──────────────────────────────────────────────
@@ -423,6 +458,12 @@ def main(argv=None):
         quiz = core._timed("Step1 クイズ選択", quiz_data.next_quiz, quiz_id=args.quiz_id)
         print(f"[クイズ] id={quiz['id']} 「{quiz['問題']}」 正解={quiz['正解']}")
 
+        # ── ARDYサーバーを先に起動しておく。
+        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる
+        ardy_proc = None
+        if core.VRMA_MOTION_DIR and not args.preview:
+            ardy_proc = core.ardy_start()
+
         # ── Step 2: 台本生成
         script = core._timed("Step2 台本生成", generate_quiz_script, quiz)
         ending = quiz_data.build_ending_sentences()
@@ -452,11 +493,28 @@ def main(argv=None):
             cleanup_targets.clear()   # 検証用に残す
             return 0
 
+        # ── Step 3.8: AI生成モーション
+        # 失敗しても動画は作る。生成モーションのためにその日の投稿を落とさない
+        vrma_motions = []
+        if core.VRMA_MOTION_DIR and not args.preview:
+            try:
+                specs = build_vrma_specs(segments, script)
+                if specs and core.ardy_wait_ready():
+                    vrma_motions = core._timed(
+                        "Step3.8 モーション生成", core.build_vrma_motions,
+                        specs, core.VRMA_MOTION_DIR,
+                        f"{datetime.now().strftime('%Y-%m-%d')}-{quiz['id']}")
+            except Exception as e:
+                print(f"[モーション] 生成に失敗しました（動画は続行）: {e}")
+            finally:
+                core.ardy_stop(ardy_proc)
+                ardy_proc = None
+
         # ── Step 4: 表情タイムライン
         import random
         rng = random.Random(f"{datetime.now().strftime('%Y-%m-%d')}-{quiz['id']}")
         emotions = build_emotions(segments, rng)
-        build_emotion_file(segments, emotions, emotion_path)
+        build_emotion_file(segments, emotions, emotion_path, vrma_motions)
         cleanup_targets.append(emotion_path)
 
         # ── Step 5: Unity録画
@@ -464,10 +522,17 @@ def main(argv=None):
             print("[Unity] --preview のためスキップ")
             source_webm = ""
         else:
+            extra = ["-cameraOffsetY", f"{CAMERA_OFFSET_Y}",
+                     "-mouthCloseOnSilence", f"{MOUTH_CLOSE}"]
+            # 生成モーションがあるときだけ、シンキングタイムからカメラを引く。
+            # フック(Q)はアップのまま＝サムネもアップで撮れる
+            if vrma_motions and VRMA_PULLBACK > 0:
+                think_start = next(s["start"] for s in segments if s["id"] == "THINK")
+                extra += ["-cameraPullbackAt", f"{think_start:.2f}",
+                          "-cameraPullbackZ", f"{VRMA_PULLBACK}"]
             core._retry("Step5 Unity録画", core.record_with_unity,
                         wav_path, webm_path, emotion_path,
-                        extra_args=["-cameraOffsetY", f"{CAMERA_OFFSET_Y}",
-                                    "-mouthCloseOnSilence", f"{MOUTH_CLOSE}"],
+                        extra_args=extra,
                         catch=(RuntimeError, TimeoutError), delay=15)
             source_webm = webm_path
             cleanup_targets.append(webm_path)
@@ -481,8 +546,11 @@ def main(argv=None):
         if source_webm:
             try:
                 import thumbnail
-                a_start = next(s["start"] for s in segments if s["id"] == "A")
-                thumbnail.capture_frame(source_webm, frame_path, a_start + 0.8)
+                # フック(Q)の終盤から撮る。「AとB、どっちだと思う？」の高揚した表情が出る位置。
+                # THINK以降はカメラが引くので、アップの画で撮れるのはここまで
+                q = next(s for s in segments if s["id"] == "Q")
+                thumbnail.capture_frame(source_webm, frame_path,
+                                        max(q["start"] + 0.5, q["end"] - 0.5))
                 thumbnail.generate_quiz_thumbnail(frame_path, thumbnail_path, quiz["問題"])
                 thumb_ok = True
                 cleanup_targets.append(frame_path)

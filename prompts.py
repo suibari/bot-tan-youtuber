@@ -49,6 +49,7 @@ _NIGHT_OUTPUT_RULES = """
     },
     {
       "section": "OpeningAffirmation",
+      "motion": "A person stands in place facing forward and ...",
       "sentences": [
         {"text": "文章1", "valence": 0.8, "arousal": 0.4},
         ...
@@ -69,6 +70,25 @@ _NIGHT_OUTPUT_RULES = """
 - "CommentCorner"      → ④コメントコーナー（コメントデータが提供された場合のみ使用）
 - "Closing"            → ④or⑤締め（自己紹介を含む）
 "CommentCorner"はコメントデータが提供された場合のみ使用すること。
+
+【motion（体の動き）】
+"Thumbnail" と "Closing" 以外の各sectionに "motion" を付けること。
+AIが3Dモデルを動かすための指示文で、**必ず英語**で書く（日本語だと翻訳で崩れる）。
+
+書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
+- 必ず "A person stands in place facing forward" で始め、その場から動かない動作にする
+- **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない
+- **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
+  良い例: raises one hand to their chin / waves one hand above their head /
+      claps their hands in front of their chest / crosses their arms over their chest /
+      raises both arms straight up
+- **抽象的な動詞と表情の描写は禁止**。モーション生成AIは体しか動かせないので、
+  書いても棒立ちになる（実測で腕の動きがほぼゼロだった）
+  禁止例: gestures / expresses / shows / indicates / smiles / looks / feels
+- **手は必ず胸より上に来る動作にする**。腰の高さの動きは画面外に出て見えない
+- 全体で15語程度まで
+- そのsectionで話す内容に具体的に結びつける。どの回でも使い回せる動きにしない
+  （例: 猫の話題 → raises both hands beside their face like cat paws）
 
 【valence/arousalの指定ルール】
 【valence/arousalの指定ルール】

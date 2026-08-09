@@ -45,10 +45,22 @@ from core import (  # noqa: F401
     get_wav_duration, _synthesize, valence_arousal_to_voicevox_params,
     synthesize_sentences, make_silence_wav, concat_wavs, generate_voice,
     _query_mora_times, split_sentences, generate_subtitle_timing, _find_subtitle_time,
-    _start_xvfb, record_with_unity,
+    _start_xvfb, record_with_unity, VRMA_MOTION_DIR,
+    ardy_start, ardy_wait_ready, ardy_stop, build_vrma_motions,
     esc_drawtext, base_vf_parts, build_subtitle_filters, build_corner_filters,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
+
+# Animatorの既定ステート Blow A Kiss は、トリガー無しで冒頭から4.57秒流れる
+# （Assets/Animations/Blow A Kiss.fbx, firstFrame:0 lastFrame:137 @30fps）。
+# 生成モーションを被せると尻切れになるので、これが終わるまでは置かない
+HOOK_MOTION_SEC = 4.6
+# 生成モーション1本の最大長[秒]
+VRMA_MAX_SEC    = float(os.getenv("VRMA_MAX_SEC", "5.0"))
+# 引き開始以降カメラを引く量[m]
+VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.7"))
+# コーナー開始からの遅延[秒]
+VRMA_DELAY      = float(os.getenv("VRMA_DELAY", "0.4"))
 
 # Gemini response_schema: 台本をJSONとして構造化出力させるスキーマ
 SCRIPT_SCHEMA = {
@@ -60,6 +72,9 @@ SCRIPT_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "section": {"type": "string"},
+                    # AI(ARDY)で生成する体の動き。英語で書かせる:
+                    # 日本語だと FuguMT の英訳が崩れ、その英文がモーションの条件になってしまう
+                    "motion":  {"type": "string"},
                     "sentences": {
                         "type": "array",
                         "items": {
@@ -228,13 +243,50 @@ def generate_corner_timing(
     body_duration = total_duration - intro_duration
     quarter = body_duration / 4
     corners = []
-    for i, (_tag, label, color) in enumerate(corner_meta):
+    for i, (tag, label, color) in enumerate(corner_meta):
         start = resolved_starts[i] if resolved_starts[i] is not None else round(quarter * i + intro_duration, 3)
         next_start = next((resolved_starts[j] for j in range(i + 1, len(resolved_starts)) if resolved_starts[j] is not None), None)
         end = next_start if next_start is not None else total_duration
-        corners.append({"start": round(start, 3), "end": round(end, 3), "label": label, "color": color})
+        # tag は section 名。生成モーションの割り当てに使う（ffmpeg側は label/color しか見ない）
+        corners.append({"start": round(start, 3), "end": round(end, 3),
+                        "label": label, "color": color, "tag": tag,
+                        "detected": resolved_starts[i] is not None})
 
     return corners
+
+def build_vrma_specs(corners: list[dict], sections: dict, script_data: dict) -> list[dict]:
+    """コーナー冒頭に置く生成モーションの仕様を組む。
+
+    Closing は DoThankful / DoWave があるので入れない。
+    1本目は冒頭の Blow A Kiss（4.57秒）が終わってから始める。
+    """
+    motion_of = {sec.get("section"): (sec.get("motion") or "").strip()
+                 for sec in script_data.get("sections", [])}
+    specs = []
+
+    for c in corners:
+        tag = c.get("tag")
+        if tag in (None, "Closing"):
+            continue
+        text = motion_of.get(tag, "")
+        if not text:
+            print(f"[モーション] {tag}: 台本に motion が無いのでスキップ")
+            continue
+
+        start = max(c["start"] + VRMA_DELAY, HOOK_MOTION_SEC)
+        avail = c["end"] - start - 0.4
+        if avail < 1.5:
+            print(f"[モーション] {tag}: 尺が足りない({avail:.1f}秒)のでスキップ")
+            continue
+
+        specs.append({
+            "name":     tag.lower(),
+            "time":     round(start, 2),
+            "duration": round(min(avail, VRMA_MAX_SEC), 2),
+            "text":     text,
+        })
+    return specs
+
 
 # ──────────────────────────────────────────────
 # Step 5: FFmpegでMP4に変換・仕上げ
@@ -312,6 +364,12 @@ def main():
         except Exception as e:
             print(f"[corner_context] 取得失敗（スキップ）: {e}")
 
+        # ARDYサーバーを先に起動しておく。
+        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる
+        ardy_proc = None
+        if VRMA_MOTION_DIR:
+            ardy_proc = ardy_start()
+
         # Step 2: 台本生成
         script_cache = os.getenv("SCRIPT_CACHE", "")
         if script_cache and Path(script_cache).exists():
@@ -372,24 +430,55 @@ def main():
         thankful_time  = _find_subtitle_time(subtitles, "高評価",   start_from=closing_start) or 0.0
         print(f"[トリガー] greetingTime1: {greeting_time1}s, waveTime: {wave_time}s, thankfulTime: {thankful_time}s")
 
+        # AI生成モーション。失敗しても動画は作る
+        vrma_motions = []
+        if VRMA_MOTION_DIR:
+            try:
+                specs = build_vrma_specs(corners, sections, script_data)
+                if specs and ardy_wait_ready():
+                    vrma_motions = _timed(
+                        "Step3.8 モーション生成", build_vrma_motions,
+                        specs, VRMA_MOTION_DIR, datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d"))
+            except Exception as e:
+                print(f"[モーション] 生成に失敗しました（動画は続行）: {e}")
+            finally:
+                ardy_stop(ardy_proc)
+                ardy_proc = None
+
         # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
+        payload = {
+            "emotions":      emotions,
+            "waveTime":      wave_time,
+            "thankfulTime":  thankful_time,
+            "greetingTime1": greeting_time1,
+        }
+        if vrma_motions:
+            payload["vrmaMotions"] = vrma_motions
         with open(emotion_path, "w") as f:
-            json.dump({
-                "emotions":      emotions,
-                "waveTime":      wave_time,
-                "thankfulTime":  thankful_time,
-                "greetingTime1": greeting_time1,
-            }, f, ensure_ascii=False)
+            json.dump(payload, f, ensure_ascii=False)
         print(f"[感情] 保存: {emotion_path}")
+        for m in vrma_motions:
+            print(f"[モーション] 生成: {m['file']} @{m['time']}s")
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
+        # 生成モーションがあるときだけ、フックの次のコーナーからカメラを引く。
+        # 冒頭は Blow A Kiss（手を顔に持っていく動き）なのでアップのままが合う
+        extra = []
+        if vrma_motions and VRMA_PULLBACK > 0:
+            pullback_at = max(corners[0]["start"], HOOK_MOTION_SEC) if corners else HOOK_MOTION_SEC
+            extra = ["-cameraPullbackAt", f"{pullback_at:.2f}",
+                     "-cameraPullbackZ", f"{VRMA_PULLBACK}"]
         _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
+               extra_args=extra or None,
                catch=(RuntimeError, TimeoutError), delay=15)
 
         # サムネ作成
         thumbnail_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
-        capture_thumbnail_frame(webm_path, screenshot_path, emotions)
+        # 生成モーションを使うときは、カメラが引く前（フック内）からサムネを撮る
+        thumb_before = (max(corners[0]["start"], HOOK_MOTION_SEC)
+                        if (vrma_motions and corners and VRMA_PULLBACK > 0) else None)
+        capture_thumbnail_frame(webm_path, screenshot_path, emotions, before=thumb_before)
         generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
 
         # Step 5: MP4変換

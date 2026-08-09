@@ -17,14 +17,24 @@ def capture_frame(input_webm: str, output_png: str, target_time: float) -> None:
     print(f"[サムネイル] {target_time}秒のフレーム切り出し: {output_png}")
 
 
-def capture_thumbnail_frame(input_webm: str, output_png: str, emotions: list[dict]) -> None:
-    """動画からサムネイル用フレームを切り出す"""
+def capture_thumbnail_frame(input_webm: str, output_png: str, emotions: list[dict],
+                            before: float = None) -> None:
+    """動画からサムネイル用フレームを切り出す
+
+    before: この時刻より前から選ぶ。生成モーション導入後はここでカメラが引くため、
+            サムネをアップの画で撮るには冒頭（フック）に限定する必要がある。
+    """
     target_time = 2.0
     # バニラHappy（高valence・低arousal）以外の表情が出るフレームを優先する
     expressive = [e for e in emotions if e.get("valence", 0.8) <= 0.6 or e.get("arousal", 0.3) >= 0.4]
+    if before is not None:
+        # 余白1.5秒ぶんを見込んで、切り出し位置が before を超えないものだけ残す
+        expressive = [e for e in expressive if e["time"] + 1.5 <= before]
     if expressive:
         chosen = random.choice(expressive)
         target_time = chosen["time"] + random.uniform(0.0, 1.5)
+    if before is not None:
+        target_time = min(target_time, max(0.3, before - 0.3))
 
     capture_frame(input_webm, output_png, target_time)
 

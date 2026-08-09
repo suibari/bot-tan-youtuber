@@ -21,7 +21,10 @@ botたん動画パイプライン 共通処理
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)
   UNITY_EXE           : Unityエディタのパス
   UNITY_PROJECT       : Unityプロジェクトのパス
-  VRMA_MOTION_DIR     : AI生成モーション(.vrma)を置いたディレクトリ (省略時は従来のMixamoモーション)
+  VRMA_MOTION_DIR     : AI生成モーション(.vrma)の出力先 (省略時は従来のMixamoモーションのみ)
+  ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /media/suibari/.../ardy-engine)
+  ARDY_REPO           : text-to-vrma のリポジトリパス
+  ARDY_PORT           : ARDYサーバーのポート (既定 2337)
   BGM_PATH            : BGM音声ファイルのパス (省略可)
   DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD : PostgreSQL接続情報
 """
@@ -32,6 +35,7 @@ import json
 import time
 import wave
 import signal
+import hashlib
 import subprocess
 import tempfile
 from datetime import timezone, timedelta
@@ -706,6 +710,323 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
                 xvfb_proc.wait(timeout=3)
             except (subprocess.TimeoutExpired, ChildProcessError):
                 pass
+
+
+# ──────────────────────────────────────────────
+# AI生成モーション (ARDY ローカルエンジン)
+# ──────────────────────────────────────────────
+#
+# text-to-vrma の ARDY エンジンをローカルHTTPサーバーとして起動し、
+# 英語の動作説明文からモーションspecを生成して .vrma に変換する。
+#
+#   英文 → POST /generate → spec JSON → spec2vrma.mjs → .vrma → Unity
+#
+# サーバーは RSS 約9.5GB を占有するため常駐させず、パイプライン実行中だけ起動する。
+# モデル読み込みに4〜5分かかるので、台本生成・音声合成の前に起動しておくこと。
+
+# /mnt/data は sda1(ext4, 1.2TB) で /etc/fstab に nofail 付きで登録済み。
+# 以前は NTFS(sda2) 上にあったが、udisks2 の自動マウントはデスクトップセッション依存で
+# systemd timer からの無人実行では未マウントになり生成が丸ごとスキップされていた。
+# ext4 化で FUSE のオーバーヘッドも外れる（ただし同じHDDなので速度改善は限定的）
+ARDY_ENGINE_ROOT   = os.getenv("ARDY_ENGINE_ROOT", "/mnt/data/ardy-engine")
+ARDY_REPO          = os.getenv("ARDY_REPO", "/home/suibari/work/text-to-vrma")
+ARDY_PORT          = int(os.getenv("ARDY_PORT", "2337"))
+# true にすると既にポートで動いているサーバーをそのまま使う（開発時用）。
+# 既定は false で、古いサーバーは落として起動し直す
+ARDY_REUSE         = os.getenv("ARDY_REUSE", "false").lower() == "true"
+ARDY_READY_TIMEOUT = float(os.getenv("ARDY_READY_TIMEOUT", "600"))
+# 3秒のモーションで実測3〜4秒。ただしGPUが混んでいると20秒、稀に140秒まで伸びる。
+# さらに長時間アイドルだったサーバーは最初のリクエストで固まることがある
+# （GPU使用率0%のまま返らない）ため、待ち続けずに諦めて動画を優先する。
+# パイプラインは生成後にサーバーを落とすので、途中で切って壊れても影響はない。
+ARDY_GEN_TIMEOUT   = float(os.getenv("ARDY_GEN_TIMEOUT", "300"))
+
+
+def _ardy_url(path: str) -> str:
+    return f"http://127.0.0.1:{ARDY_PORT}{path}"
+
+
+# ARDYサーバーは RSS 約15GB を使う（CPU側に載せる8Bエンコーダが大半）。
+# 空きがこれを下回るとスワップスラッシングを起こし、生成がGPU使用率0%のまま返らなくなる。
+# 実測: ollama の llama-server が 9.2GB 常駐していた状態で 300秒タイムアウトした
+# swap を増設した場合はスワップで吸収できるので低めでよい。
+# swap 2GB のときは 18GB 必要だったが、17GB に増設したため 13GB まで下げている
+ARDY_MIN_AVAIL_GB = float(os.getenv("ARDY_MIN_AVAIL_GB", "13"))
+
+# classifier-free guidance（1.0〜6.0）。テキスト追従の強さ。
+# 実測: 3.0→4.5→6.0 と上げても腕の振れ幅は 1.8→1.4→1.0度 とむしろ減った。
+# 「動かないプロンプト」を追従で救うことはできないので server.py の既定3.0のまま使う。
+# 動きの有無を決めるのはプロンプトの語彙（具体的な身体動作か抽象語か）だった
+ARDY_CFG = float(os.getenv("ARDY_CFG", "3.0"))
+# 腕の開き具合[度]（0〜20）。モーションではなく静的なオフセットで、
+# 実測で 6→12→18 が腕の角度 70→64→58度（体側から離れる方向）に対応した。
+# 腕が体に張り付いて見えるのを緩和するため既定より少し開く
+ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "12"))
+
+
+# 空きメモリが足りないとき、ここまで待つ[秒]。
+# ollama は既定5分のkeep_aliveでモデルを自動解放するので、待てば空くことが多い
+ARDY_MEM_WAIT_SEC = float(os.getenv("ARDY_MEM_WAIT_SEC", "360"))
+# true にすると生成前に ollama のモデルをアンロードさせる。
+# ollama は次のリクエストで自動的に読み直すので停止はしないが、
+# そちらのサービスの次回応答が数秒遅くなる。既定は無効（他サービスに触らない）
+ARDY_FREE_OLLAMA = os.getenv("ARDY_FREE_OLLAMA", "false").lower() == "true"
+OLLAMA_URL       = os.getenv("OLLAMA_URL", "http://localhost:11434")
+
+
+def _free_ollama() -> None:
+    """ollama に読み込み済みモデルを解放させる（keep_alive=0）。失敗しても無視する。"""
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
+        for m in r.json().get("models", []):
+            name = m.get("name")
+            if not name:
+                continue
+            requests.post(f"{OLLAMA_URL}/api/generate",
+                          json={"model": name, "keep_alive": 0}, timeout=30)
+            print(f"[ARDY] ollama のモデルを解放しました: {name} "
+                  f"({m.get('size', 0) / 1e9:.1f}GB) — 次のリクエストで自動的に読み直されます")
+    except Exception as e:
+        print(f"[ARDY] ollama の解放をスキップ（無視）: {e}")
+
+
+def ardy_wait_memory(timeout: float = None) -> bool:
+    """空きメモリが閾値を超えるまで待つ。超えたら True。"""
+    if ARDY_FREE_OLLAMA:
+        _free_ollama()
+
+    limit = ARDY_MEM_WAIT_SEC if timeout is None else timeout
+    deadline = time.time() + limit
+    warned = False
+    while True:
+        avail = _mem_available_gb()
+        if avail >= ARDY_MIN_AVAIL_GB:
+            return True
+        if time.time() >= deadline:
+            print(f"[ARDY] 空きメモリが回復しませんでした ({avail:.1f}GB < {ARDY_MIN_AVAIL_GB}GB)。"
+                  f"生成モーションをスキップします")
+            return False
+        if not warned:
+            print(f"[ARDY] 空きメモリ待ち ({avail:.1f}GB < {ARDY_MIN_AVAIL_GB}GB, 最大{limit:.0f}秒)")
+            warned = True
+        time.sleep(15)
+
+
+def _mem_available_gb() -> float:
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 1024 / 1024
+    except Exception:
+        pass
+    return float("inf")   # 読めないなら判定しない
+
+
+def ardy_available() -> bool:
+    """エンジン一式が揃っているか。NTFS未マウント時などに False になる。"""
+    root = Path(ARDY_ENGINE_ROOT)
+    ok = ((root / "venv/bin/python").exists()
+          and (root / "llm2vec-base-merged").is_dir()
+          and (Path(ARDY_REPO) / "tools/ardy-engine/server.py").exists()
+          and (Path(ARDY_REPO) / "tools/spec2vrma.mjs").exists())
+    if not ok:
+        print(f"[ARDY] エンジンが見つかりません（{ARDY_ENGINE_ROOT}）。生成モーションはスキップします")
+    return ok
+
+
+def ardy_health() -> dict | None:
+    try:
+        return requests.get(_ardy_url("/health"), timeout=5).json()
+    except Exception:
+        return None
+
+
+def _kill_stray_server() -> None:
+    """ポートを掴んでいる ARDY サーバーを落とす。自分が起動したものでなくても止める。"""
+    marker = f"{ARDY_ENGINE_ROOT}/venv/bin/python"
+    try:
+        out = subprocess.run(["ps", "-eo", "pid,cmd"], capture_output=True, text=True).stdout
+    except Exception:
+        return
+    for line in out.splitlines():
+        if "server.py" in line and ("--port" in line) and (marker in line or "ardy-engine" in line):
+            pid = line.split(None, 1)[0]
+            if not pid.isdigit():
+                continue
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+                print(f"[ARDY] 既存サーバー PID={pid} を停止しました")
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+    # ポートが解放されるまで少し待つ
+    for _ in range(10):
+        if ardy_health() is None:
+            return
+        time.sleep(1)
+
+
+def ardy_start():
+    """ARDYサーバーを起動する。
+
+    既に起動済みならそれを再利用し None を返す（そのサーバーは ardy_stop で落とさない）。
+    エンジンが無い場合も None を返す。起動できたかどうかは ardy_wait_ready() で判定すること。
+    """
+    if not ardy_available():
+        return None
+
+    # サーバーは約15GB必要。足りないまま起動すると読み込み自体がスワップで
+    # 10分以上かかる（実測: 600秒待っても準備完了にならず）ので、空くまで待つ
+    if not ardy_wait_memory():
+        return None
+
+    h = ardy_health()
+    if h is not None:
+        if ARDY_REUSE:
+            print(f"[ARDY] 既存のサーバーを再利用します (status={h.get('status')})。"
+                  f"このサーバーはパイプライン終了時に停止しません")
+            return None
+        # 既定では再利用しない。長く生きたサーバーは生成が返らなくなることがあり
+        # （GPU使用率0%のままタイムアウト）、それを掴むと丸ごと生成を落とすため、
+        # 落として自分で起動し直す。ポートはこのパイプライン専用とみなす
+        print("[ARDY] 既存のサーバーを停止して起動し直します "
+              "（古いサーバーは生成が返らないことがあるため。ARDY_REUSE=true で再利用可）")
+        _kill_stray_server()
+
+    root = Path(ARDY_ENGINE_ROOT)
+    env = os.environ.copy()
+    # これが無いと 8B のテキストエンコーダが GPU に載って CUDA OOM になる。
+    # Electron版も同じ値を渡している (electron/ardy-client.cjs)
+    env["TEXT_ENCODER_DEVICE"] = "cpu"
+    env["HF_HOME"] = str(root / "hf-cache")
+
+    cmd = [str(root / "venv/bin/python"),
+           str(Path(ARDY_REPO) / "tools/ardy-engine/server.py"),
+           "--port", str(ARDY_PORT),
+           "--merged-base", str(root / "llm2vec-base-merged")]
+    print(f"[ARDY] サーバー起動: {' '.join(cmd)}")
+    return subprocess.Popen(cmd, env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            preexec_fn=os.setsid)
+
+
+def ardy_wait_ready(timeout: float = None) -> bool:
+    """GET /health が status=ok になるまで待つ。モデル読み込みに4〜5分かかる。"""
+    # サーバーも立っておらずエンジンも無いなら、待っても上がらない。
+    # ここで即抜けないと NTFS 未マウント時に毎回10分止まる
+    if ardy_health() is None and (not ardy_available()
+                                  or _mem_available_gb() < ARDY_MIN_AVAIL_GB):
+        return False
+
+    deadline = time.time() + (ARDY_READY_TIMEOUT if timeout is None else timeout)
+    last = None
+    while time.time() < deadline:
+        h = ardy_health()
+        if h is not None:
+            status = h.get("status")
+            if status == "ok":
+                print(f"[ARDY] 準備完了 (model={h.get('model')} device={h.get('device')})")
+                return True
+            if status == "error":
+                print(f"[ARDY] 起動に失敗しました: {h.get('error')}")
+                return False
+            cur = (h.get("stage"), round(h.get("progress") or 0, 2))
+            if cur != last:
+                print(f"[ARDY] 読み込み中... stage={cur[0]} progress={cur[1]}")
+                last = cur
+        time.sleep(5)
+    print(f"[ARDY] 準備完了になりませんでした（{ARDY_READY_TIMEOUT if timeout is None else timeout:.0f}秒待機）")
+    return False
+
+
+def ardy_generate(text: str, duration: float, seed: int, out_json: str) -> bool:
+    """英語の動作説明文からモーションspec JSONを生成する。"""
+    try:
+        r = requests.post(_ardy_url("/generate"),
+                          json={"text": text, "duration": float(duration), "seed": int(seed),
+                                "cfg": ARDY_CFG, "armSpread": ARDY_ARM_SPREAD},
+                          timeout=ARDY_GEN_TIMEOUT)
+        spec = r.json()
+    except Exception as e:
+        print(f"[ARDY] 生成に失敗: {e}")
+        return False
+
+    if "tracks" not in spec:
+        print(f"[ARDY] 生成結果が不正です: {str(spec)[:200]}")
+        return False
+
+    Path(out_json).write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    print(f"[ARDY] 生成: {spec.get('duration')}秒 / {len(spec['tracks'])}ボーン / "
+          f"seed={seed} cfg={ARDY_CFG} armSpread={ARDY_ARM_SPREAD}")
+    return True
+
+
+def ardy_to_vrma(spec_json: str, out_vrma: str) -> bool:
+    """spec JSON を .vrma (GLB) に変換する。three.js しか使わない純JSなのでNodeだけで動く。"""
+    try:
+        subprocess.run(
+            ["node", str(Path(ARDY_REPO) / "tools/spec2vrma.mjs"), spec_json, out_vrma],
+            check=True, capture_output=True, timeout=120)
+        return True
+    except Exception as e:
+        detail = getattr(e, "stderr", b"")
+        print(f"[ARDY] .vrma 変換に失敗: {e} {detail[:200] if detail else ''}")
+        return False
+
+
+def ardy_stop(proc) -> None:
+    """ardy_start が起動したサーバーを落とす。None（再利用時）なら何もしない。"""
+    if proc is None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=20)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[ARDY] 停止時のエラー（無視）: {e}")
+    print("[ARDY] サーバーを停止しました")
+
+
+def build_vrma_motions(specs: list[dict], out_dir: str, seed_base: str) -> list[dict]:
+    """モーションを一括生成して emotions.json の vrmaMotions 用リストを返す。
+
+    specs: [{"name": str, "time": float, "text": str, "duration": float}, ...]
+           text は英語の動作説明文。日本語だと FuguMT の英訳が崩れて品質が落ちる。
+    戻り値: [{"time": float, "file": str}, ...]  生成に失敗したものは黙って除く。
+
+    生成モーションはビルド成果物なので out_dir を毎回上書きする。
+    """
+    if not specs:
+        return []
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.gettempdir())
+    result = []
+
+    for spec in specs:
+        name = spec["name"]
+        # 同じ台本でも日付が変われば別の動きになるよう seed_base を混ぜる
+        seed = int(hashlib.sha1(f"{seed_base}-{name}".encode()).hexdigest()[:8], 16) % (2 ** 31)
+        spec_json = str(tmp_dir / f"ardy_spec_{name}.json")
+        vrma_path = out / f"{name}.vrma"
+
+        t0 = time.time()
+        if not ardy_generate(spec["text"], spec["duration"], seed, spec_json):
+            continue
+        if not ardy_to_vrma(spec_json, str(vrma_path)):
+            continue
+        Path(spec_json).unlink(missing_ok=True)
+
+        result.append({"time": round(float(spec["time"]), 2), "file": vrma_path.name})
+        print(f"[ARDY] {name}.vrma @{spec['time']:.2f}s ({time.time() - t0:.1f}秒) "
+              f"← {spec['text'][:60]}")
+
+    return result
 
 
 # ──────────────────────────────────────────────

@@ -46,6 +46,18 @@ _SENTENCE = {
     "required": ["text", "valence", "arousal"],
 }
 
+# AI(ARDY)で毎回生成する体の動き。英語で書かせる:
+# 日本語を投げると FuguMT の英訳が崩れ、その崩れた英文がモーションの条件になってしまう
+_MOTIONS = {
+    "type": "object",
+    "properties": {
+        "think":       {"type": "string"},
+        "answer":      {"type": "string"},
+        "explanation": {"type": "string"},
+    },
+    "required": ["think", "answer", "explanation"],
+}
+
 QUIZ_SCRIPT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -55,9 +67,10 @@ QUIZ_SCRIPT_SCHEMA = {
         "affirmation":    {"type": "array", "items": _SENTENCE},
         "thumbnail_text": {"type": "string"},
         "title_hook":     {"type": "string"},
+        "motions":        _MOTIONS,
     },
     "required": ["question_intro", "answer_reveal", "explanation",
-                 "affirmation", "thumbnail_text", "title_hook"],
+                 "affirmation", "thumbnail_text", "title_hook", "motions"],
 }
 
 
@@ -104,6 +117,27 @@ def build_quiz_user_prompt(quiz: dict) -> str:
 ⑥ title_hook（25文字以内）
   - YouTubeタイトル用の引きのある一言
 
+⑦ motions — botたんの体の動き。**英語で**書くこと（日本語だと翻訳で崩れる）
+  AIが3Dモデルを動かすための指示文です。次の3つを、それぞれ英語1文で書いてください。
+  - think       : シンキングタイム中の動き。答えを考えている様子
+  - answer      : 正解発表の瞬間の動き。驚きや納得が伝わるもの
+  - explanation : 解説中の動き。**このクイズの題材そのものを体で表現する**
+
+  書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
+  - 必ず "A person stands in place facing forward" で始め、その場から動かない動作にする
+  - **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない
+  - **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
+    良い例: raises one hand to their chin / waves one hand above their head /
+            claps their hands in front of their chest / crosses their arms over their chest /
+            raises both arms straight up
+  - **抽象的な動詞と表情の描写は禁止**。モーション生成AIは体しか動かせないので、
+    書いても棒立ちになる（実測で腕の動きがほぼゼロだった）
+    禁止例: gestures / expresses / shows / indicates / smiles / looks / feels
+  - **手は必ず胸より上に来る動作にする**。腰の高さの動きは画面外に出て見えない
+  - 全体で15語程度まで
+  - 題材に具体的に結びつける。どのクイズでも使い回せる動きにしない
+    （例: 猫がテーマ → raises both hands beside their face like cat paws）
+
 重要：合計の尺は55秒以内。各パートの文字数の目安を大きく超えないこと。
 """
 
@@ -133,6 +167,15 @@ def build_fallback_script(quiz: dict) -> dict:
         ],
         "thumbnail_text": quiz["問題"][:20],
         "title_hook":     quiz["問題"][:25],
+        # LLMが落ちたときは題材に紐づけられないので、どのクイズでも成立する汎用動作にする
+        "motions": {
+            "think": ("A person stands in place facing forward, tilts their head to one side "
+                      "and raises a hand to their chin, thinking hard."),
+            "answer": ("A person stands in place facing forward, opens both hands beside their "
+                       "face in surprise, then nods once."),
+            "explanation": ("A person stands in place facing forward and gestures with both "
+                            "hands at chest height while explaining."),
+        },
     }
 
 
@@ -151,6 +194,15 @@ def validate_script(script: dict, quiz: dict) -> list[str]:
         for s in sents:
             if not (s.get("text") or "").strip():
                 warnings.append(f"{key} に空のtextがあります")
+
+    motions = script.get("motions") or {}
+    for key in ("think", "answer", "explanation"):
+        text = (motions.get(key) or "").strip()
+        if not text:
+            warnings.append(f"motions.{key} が空です")
+        elif not text.isascii():
+            # 日本語のまま返ってくると FuguMT の英訳が崩れて品質が落ちる
+            warnings.append(f"motions.{key} が英語ではありません: {text[:40]!r}")
 
     # 正解発表に正解のラベルが含まれているか
     reveal = "".join(s.get("text", "") for s in script.get("answer_reveal", []))
