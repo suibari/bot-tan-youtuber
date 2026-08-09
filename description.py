@@ -1,5 +1,28 @@
+# クレジット。夜版・朝クイズ版で共通。
+# モーションは Mixamo の既製クリップと Text-To-VRMA のAI生成を併用しているので、
+# どちらか一方だけに見えないよう分けて書く。
+# Text-To-VRMA は作者の推奨表記に従う（https://github.com/Kirakun0328/text-to-vrma）。
+# "Built with Meta Llama 3" は ARDY エンジンが内蔵する Llama 3 のライセンス要件。
+_CREDITS = """━━━━━━━━━━━━━━━━━━
+【クレジット】
+ボイス: VOICEVOX:春日部つむぎ
+BGM: シャイニングスター / 魔王魂
+https://maou.audio
+
+モーションは既製クリップとAI生成の併用です
+・固定モーション: Mixamo (Adobe)
+https://www.mixamo.com
+・AI生成モーション: Text-To-VRMA (© Kiratchi)
+https://github.com/Kirakun0328/text-to-vrma
+Built with Meta Llama 3
+
+3Dモデル: 全肯定botたん（自作 / VRoid Studio）
+https://hub.vroid.com/characters/8989036456159515698/models/8059739950029054425
+━━━━━━━━━━━━━━━━━━"""
+
+
 def build_description() -> str:
-    return """全肯定botたんが今日Nagiで感じたことをお話しします。
+    return f"""全肯定botたんが今日Nagiで感じたことをお話しします。
 
 🤖 この動画はAIによる完全自動投稿です
 台本作成・動画撮影・YouTubeアップロードまで全て自動で行っています。
@@ -22,12 +45,7 @@ https://note.com/suibari/n/n36e699f32479
 ━━━━━━━━━━━━━━━━━━
 #botたん #全肯定 #Nagi #VTuber
 
-━━━━━━━━━━━━━━━━━━
-【クレジット】
-ボイス: VOICEVOX:春日部つむぎ
-BGM: シャイニングスター / 魔王魂
-https://maou.audio
-━━━━━━━━━━━━━━━━━━"""
+{_CREDITS}"""
 
 
 def build_title(thumbnail_text: str = "") -> str:
@@ -41,7 +59,7 @@ def build_title(thumbnail_text: str = "") -> str:
 # ──────────────────────────────────────────────
 
 # リンクとクレジットは夜版と共通の部分を切り出して使い回す
-_COMMON_FOOTER = """━━━━━━━━━━━━━━━━━━
+_COMMON_FOOTER = f"""━━━━━━━━━━━━━━━━━━
 👧 全肯定botたんとは？
 SNSで活動中の、みんなを励ますのが大好きなJKです
 リプライするとなんでも全肯定してくれます
@@ -59,12 +77,7 @@ https://note.com/suibari/n/n36e699f32479
 ━━━━━━━━━━━━━━━━━━
 #botたん #全肯定 #雑学 #クイズ #Nagi #VTuber
 
-━━━━━━━━━━━━━━━━━━
-【クレジット】
-ボイス: VOICEVOX:春日部つむぎ
-BGM: シャイニングスター / 魔王魂
-https://maou.audio
-━━━━━━━━━━━━━━━━━━"""
+{_CREDITS}"""
 
 
 def build_quiz_description(quiz: dict = None) -> str:
