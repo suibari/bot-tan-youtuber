@@ -48,12 +48,25 @@ _SENTENCE = {
 
 # AI(ARDY)で毎回生成する体の動き。英語で書かせる:
 # 日本語を投げると FuguMT の英訳が崩れ、その崩れた英文がモーションの条件になってしまう
+# 各パートの尺を分け合って順番に再生されるので、1つではなく並べて出させる
+_MOTION_LIST = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "text":     {"type": "string"},
+            "emphasis": {"type": "string", "enum": ["big", "small"]},
+        },
+        "required": ["text", "emphasis"],
+    },
+}
+
 _MOTIONS = {
     "type": "object",
     "properties": {
-        "think":       {"type": "string"},
-        "answer":      {"type": "string"},
-        "explanation": {"type": "string"},
+        "think":       _MOTION_LIST,
+        "answer":      _MOTION_LIST,
+        "explanation": _MOTION_LIST,
     },
     "required": ["think", "answer", "explanation"],
 }
@@ -118,24 +131,36 @@ def build_quiz_user_prompt(quiz: dict) -> str:
   - YouTubeタイトル用の引きのある一言
 
 ⑦ motions — botたんの体の動き。**英語で**書くこと（日本語だと翻訳で崩れる）
-  AIが3Dモデルを動かすための指示文です。次の3つを、それぞれ英語1文で書いてください。
+  AIが3Dモデルを動かすための指示文です。次の3つのキーそれぞれに、
+  {"text": 英文, "emphasis": "big" または "small"} を**3〜4個ずつ**並べてください。
+  パートの尺を分け合って順番に再生されます。足りないぶんは汎用の待機動作で
+  埋められてしまうので、多めに出してください。
   - think       : シンキングタイム中の動き。答えを考えている様子
   - answer      : 正解発表の瞬間の動き。驚きや納得が伝わるもの
   - explanation : 解説中の動き。**このクイズの題材そのものを体で表現する**
+    （解説はいちばん長いので、ここは特に多めに）
+
+  emphasis で緩急をつける:
+  - "big"   → 話の山場に置く明確なジェスチャー。**1キーにつき1〜2個まで**
+  - "small" → その間をつなぐ待機動作。体重移動・うなずき・手を組み直す等
 
   書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
   - 必ず "A person stands in place facing forward" で始め、その場から動かない動作にする
   - **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない
   - **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
-    良い例: raises one hand to their chin / waves one hand above their head /
+    big の良い例: raises one hand to their chin / waves one hand above their head /
             claps their hands in front of their chest / crosses their arms over their chest /
             raises both arms straight up
+    small の良い例: shifts their weight onto their left foot /
+            nods their head down to their chest / tilts their head toward their right shoulder /
+            clasps both hands together at their waist
   - **抽象的な動詞と表情の描写は禁止**。モーション生成AIは体しか動かせないので、
     書いても棒立ちになる（実測で腕の動きがほぼゼロだった）
     禁止例: gestures / expresses / shows / indicates / smiles / looks / feels
-  - **手は必ず胸より上に来る動作にする**。腰の高さの動きは画面外に出て見えない
-  - 全体で15語程度まで
-  - 題材に具体的に結びつける。どのクイズでも使い回せる動きにしない
+  - **big は手が必ず胸より上に来る動作にする**。腰の高さの動きは画面外に出て見えない
+    （small は待機動作なので胸より上でなくてよい）
+  - 1つあたり15語程度まで
+  - big は題材に具体的に結びつける。どのクイズでも使い回せる動きにしない
     （例: 猫がテーマ → raises both hands beside their face like cat paws）
 
 重要：合計の尺は55秒以内。各パートの文字数の目安を大きく超えないこと。
@@ -169,12 +194,26 @@ def build_fallback_script(quiz: dict) -> dict:
         "title_hook":     quiz["問題"][:25],
         # LLMが落ちたときは題材に紐づけられないので、どのクイズでも成立する汎用動作にする
         "motions": {
-            "think": ("A person stands in place facing forward, tilts their head to one side "
-                      "and raises a hand to their chin, thinking hard."),
-            "answer": ("A person stands in place facing forward, opens both hands beside their "
-                       "face in surprise, then nods once."),
-            "explanation": ("A person stands in place facing forward and gestures with both "
-                            "hands at chest height while explaining."),
+            "think": [
+                {"text": "A person stands in place facing forward and raises one hand to their chin.",
+                 "emphasis": "big"},
+                {"text": "A person stands in place facing forward and tilts their head toward their right shoulder.",
+                 "emphasis": "small"},
+            ],
+            "answer": [
+                {"text": "A person stands in place facing forward and opens both hands beside their face.",
+                 "emphasis": "big"},
+                {"text": "A person stands in place facing forward and nods their head down to their chest.",
+                 "emphasis": "small"},
+            ],
+            "explanation": [
+                {"text": "A person stands in place facing forward and raises both hands in front of their chest.",
+                 "emphasis": "big"},
+                {"text": "A person stands in place facing forward and shifts their weight onto their left foot.",
+                 "emphasis": "small"},
+                {"text": "A person stands in place facing forward and clasps both hands together at their waist.",
+                 "emphasis": "small"},
+            ],
         },
     }
 
@@ -197,12 +236,17 @@ def validate_script(script: dict, quiz: dict) -> list[str]:
 
     motions = script.get("motions") or {}
     for key in ("think", "answer", "explanation"):
-        text = (motions.get(key) or "").strip()
-        if not text:
+        items = motions.get(key)
+        if not isinstance(items, list) or not items:
             warnings.append(f"motions.{key} が空です")
-        elif not text.isascii():
-            # 日本語のまま返ってくると FuguMT の英訳が崩れて品質が落ちる
-            warnings.append(f"motions.{key} が英語ではありません: {text[:40]!r}")
+            continue
+        for i, m in enumerate(items):
+            text = ((m or {}).get("text") or "").strip()
+            if not text:
+                warnings.append(f"motions.{key}[{i}] が空です")
+            elif not text.isascii():
+                # 日本語のまま返ってくると FuguMT の英訳が崩れて品質が落ちる
+                warnings.append(f"motions.{key}[{i}] が英語ではありません: {text[:40]!r}")
 
     # 正解発表に正解のラベルが含まれているか
     reveal = "".join(s.get("text", "") for s in script.get("answer_reveal", []))

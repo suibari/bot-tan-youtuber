@@ -25,6 +25,9 @@ botたん動画パイプライン 共通処理
   ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /mnt/data/ardy-engine)
   ARDY_REPO           : text-to-vrma のリポジトリパス
   ARDY_PORT           : ARDYサーバーのポート (既定 2337)
+  VRMA_BIG_SEC        : 山場のジェスチャー1本の目安の長さ[秒] (既定 4.5)
+  VRMA_SMALL_SEC      : つなぎの待機動作1本の目安の長さ[秒] (既定 3.0)
+  VRMA_SEG_MIN_SEC    : 1セグメントの下限[秒]。これ未満は動きとして成立しない (既定 2.5)
   BGM_PATH            : BGM音声ファイルのパス (省略可)
   DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD : PostgreSQL接続情報
 """
@@ -763,6 +766,37 @@ ARDY_CFG = float(os.getenv("ARDY_CFG", "3.0"))
 # 腕が体に張り付いて見えるのを緩和するため既定より少し開く
 ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "12"))
 
+# 1リクエストで渡せるセグメント数の上限。server.py の _resolve_segments が
+# segments_req[:12] で黙って切り捨てるので、こちら側で必ず守る
+ARDY_MAX_SEGMENTS = 12
+# 生成1秒あたりの所要[秒]の見積り。タイムアウト算出にしか使わないので多めに取る。
+# 実測はサーバー起動後の1本目が約10秒/秒（CUDAカーネルの初回コンパイル込み）、
+# 2本目以降は約1.6秒/秒（24.75秒の生成に38.9秒）。
+# ARDY_GEN_TIMEOUT の既定300秒では長いブロックの1本目が溢れるので、尺から動的に伸ばす
+ARDY_GEN_SEC_PER_SEC = float(os.getenv("ARDY_GEN_SEC_PER_SEC", "10"))
+
+# 1セグメントの目安の長さ[秒]。big は明確なジェスチャー、small は待機動作。
+# この比で実尺を按分するだけなので、合計が尺に合わなくても構わない
+VRMA_BIG_SEC   = float(os.getenv("VRMA_BIG_SEC", "4.5"))
+VRMA_SMALL_SEC = float(os.getenv("VRMA_SMALL_SEC", "3.0"))
+# ARDYは20fpsなので、これより短いと数十フレームしか無く動きとして成立しない。
+# 実測: 1.15秒のモーションはIdleとほぼ見分けがつかなかった
+VRMA_SEG_MIN_SEC = float(os.getenv("VRMA_SEG_MIN_SEC", "2.5"))
+# ブロック末尾に残す余白[秒]。次のMixamoモーションに食い込ませない
+VRMA_TAIL_PAD = 0.4
+
+# 台本の motions が尺に足りないときに挟む待機動作。
+# プロンプトのルール（その場から動かない・動作は1つ・到達点を書く）に従うこと。
+# big と違って手が胸より上に来る必要はない。これが「棒立ち」を埋める部分
+VRMA_IDLE_MOTIONS = [
+    "A person stands in place facing forward and shifts their weight onto their left foot.",
+    "A person stands in place facing forward and slowly nods their head down to their chest.",
+    "A person stands in place facing forward and clasps both hands together at their waist.",
+    "A person stands in place facing forward and tilts their head toward their right shoulder.",
+    "A person stands in place facing forward and brings their right hand up to their chin.",
+    "A person stands in place facing forward and shifts their weight onto their right foot.",
+]
+
 
 # 空きメモリが足りないとき、ここまで待つ[秒]。
 # ollama は既定5分のkeep_aliveでモデルを自動解放するので、待てば空くことが多い
@@ -983,6 +1017,46 @@ def ardy_generate(text: str, duration: float, seed: int, out_json: str) -> bool:
     return True
 
 
+def ardy_generate_segments(segments: list[dict], seed: int, out_json: str) -> float | None:
+    """複数の動作説明文をつないだ1本の連続モーションspecを生成する。
+
+    segments: [{"text": 英文, "duration": 秒}, ...]
+    戻り値: 生成された長さ[秒]。失敗時は None。
+
+    ARDY側は各セグメントを履歴なしで独立生成し、終端の位置・向きに次を整列して
+    0.3秒でクロスフェードする（server.py の _generate_stitched）。履歴を引き継ぐ方式と
+    違って前の動きの慣性に負けないので、単発生成と同じテキスト追従度のまま
+    つなぎ目の無い長いモーションが得られる。
+    """
+    if not segments:
+        return None
+    segments = segments[:ARDY_MAX_SEGMENTS]
+    total = sum(float(s["duration"]) for s in segments)
+    # 実測の倍を見ておく。既定300秒では50秒のブロックが必ず溢れる
+    timeout = max(ARDY_GEN_TIMEOUT, total * ARDY_GEN_SEC_PER_SEC * 2)
+
+    try:
+        r = requests.post(_ardy_url("/generate"),
+                          json={"segments": [{"text": s["text"], "duration": float(s["duration"])}
+                                             for s in segments],
+                                "seed": int(seed),
+                                "cfg": ARDY_CFG, "armSpread": ARDY_ARM_SPREAD},
+                          timeout=timeout)
+        spec = r.json()
+    except Exception as e:
+        print(f"[ARDY] 生成に失敗: {e}")
+        return None
+
+    if "tracks" not in spec:
+        print(f"[ARDY] 生成結果が不正です: {str(spec)[:200]}")
+        return None
+
+    Path(out_json).write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    print(f"[ARDY] 生成: {spec.get('duration')}秒 / {len(segments)}セグメント / "
+          f"{len(spec['tracks'])}ボーン / seed={seed} cfg={ARDY_CFG} armSpread={ARDY_ARM_SPREAD}")
+    return float(spec.get("duration") or total)
+
+
 def ardy_to_vrma(spec_json: str, out_vrma: str) -> bool:
     """spec JSON を .vrma (GLB) に変換する。three.js しか使わない純JSなのでNodeだけで動く。"""
     try:
@@ -1014,40 +1088,129 @@ def ardy_stop(proc) -> None:
     print("[ARDY] サーバーを停止しました")
 
 
-def build_vrma_motions(specs: list[dict], out_dir: str, seed_base: str) -> list[dict]:
-    """モーションを一括生成して emotions.json の vrmaMotions 用リストを返す。
+def plan_vrma_segments(motions: list[dict], available_sec: float,
+                       max_segments: int = ARDY_MAX_SEGMENTS,
+                       tail_pad: float = VRMA_TAIL_PAD) -> list[dict]:
+    """台本の motions と区間の尺から、ardy_generate_segments 用の segments を組む。
 
-    specs: [{"name": str, "time": float, "text": str, "duration": float}, ...]
-           text は英語の動作説明文。日本語だと FuguMT の英訳が崩れて品質が落ちる。
-    戻り値: [{"time": float, "file": str}, ...]  生成に失敗したものは黙って除く。
+    motions: [{"text": 英文, "emphasis": "big"|"small"}, ...]（空でもよい）
+    available_sec: この区間に使える秒数
+    max_segments: 分割数の上限。1ブロックを複数区間で分け合うときに配分する
+    tail_pad: 末尾に残す余白[秒]。区間が連続していて余白が要らないなら0
+    戻り値: [{"text": str, "duration": float}, ...]  尺が足りなければ空リスト。
 
-    生成モーションはビルド成果物なので out_dir を毎回上書きする。
+    台本のモーションだけでは尺が埋まらないので、足りない分は VRMA_IDLE_MOTIONS の
+    待機動作で埋める。これが「棒立ちを作らない」ための本体。
     """
-    if not specs:
+    avail = float(available_sec) - tail_pad
+    max_segments = max(1, min(int(max_segments), ARDY_MAX_SEGMENTS))
+    if avail < VRMA_SEG_MIN_SEC:
+        return []
+
+    items = [{"text": text, "emphasis": (m.get("emphasis") or "small")}
+             for m in (motions or [])
+             if (text := (m.get("text") or "").strip())]
+
+    def target(it):
+        return VRMA_BIG_SEC if it["emphasis"] == "big" else VRMA_SMALL_SEC
+
+    # 目安の尺に届くまで待機動作を足す
+    while sum(target(it) for it in items) < avail and len(items) < max_segments:
+        items.append({"text": VRMA_IDLE_MOTIONS[len(items) % len(VRMA_IDLE_MOTIONS)],
+                      "emphasis": "small"})
+    if not items:
+        return []
+    items = items[:max_segments]
+
+    # 1本が短すぎると動きとして成立しないので、そうなる分は末尾から落とす
+    while len(items) > 1:
+        weights = [target(it) for it in items]
+        if avail * min(weights) / sum(weights) >= VRMA_SEG_MIN_SEC:
+            break
+        items.pop()
+
+    weights = [target(it) for it in items]
+    total_w = sum(weights)
+    return [{"text": it["text"], "duration": round(avail * w / total_w, 2)}
+            for it, w in zip(items, weights)]
+
+
+def merge_vrma_spans(spans: list[tuple]) -> list[tuple]:
+    """連続した (label, start, end, motions) から、短すぎる区間を隣に吸収して穴を無くす。
+
+    コーナーやパート単位で切ると、朝版の A（正解発表・実測1.8秒）のように
+    1本のモーションとして成立しない区間が出る。落とすと連続再生に穴が空くので、
+    後ろの区間とまとめてしまう（吸収された区間の motions もそのまま引き継ぐ）。
+    区間は隙間なく並んでいる前提。
+    """
+    out, cur = [], None
+    for label, start, end, motions in spans:
+        if cur is None:
+            cur = [label, start, end, list(motions or [])]
+        else:
+            cur[0] += f"+{label}"
+            cur[2] = end
+            cur[3] += list(motions or [])
+        if cur[2] - cur[1] >= VRMA_SEG_MIN_SEC:
+            out.append(tuple(cur))
+            cur = None
+    if cur is not None and out:
+        # 末尾の余りは直前の区間に足す（新しく区間を作ると短すぎる）
+        label, start, end, motions = out[-1]
+        out[-1] = (f"{label}+{cur[0]}", start, cur[2], motions + cur[3])
+    return out
+
+
+def build_vrma_motions(blocks: list[dict], out_dir: str, seed_base: str) -> list[dict]:
+    """ブロックごとに連続モーションを生成して emotions.json の vrmaMotions 用リストを返す。
+
+    blocks: [{"name": str, "time": float, "segments": [{"text", "duration"}, ...]}, ...]
+            time はブロックの開始時刻[秒]。text は英語の動作説明文
+            （日本語だと FuguMT の英訳が崩れて品質が落ちる）。
+    戻り値: [{"time": float, "file": str}, ...]  生成に失敗したブロックは黙って除く。
+
+    ARDY_MAX_SEGMENTS を超えるブロックは複数の .vrma に分け、2本目以降は実際の
+    生成長を足した時刻に置いて隣接させる（Unity側は隣接なら1フレームIdleが挟まるだけ）。
+    生成モーションはビルド成果物なので out_dir を毎回作り直す。
+    """
+    if not blocks:
         return []
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    # 消さないと emotions.json に載らない過去の .vrma が溜まり続ける
+    for old in out.glob("*.vrma"):
+        old.unlink()
     tmp_dir = Path(tempfile.gettempdir())
     result = []
 
-    for spec in specs:
-        name = spec["name"]
-        # 同じ台本でも日付が変われば別の動きになるよう seed_base を混ぜる
-        seed = int(hashlib.sha1(f"{seed_base}-{name}".encode()).hexdigest()[:8], 16) % (2 ** 31)
-        spec_json = str(tmp_dir / f"ardy_spec_{name}.json")
-        vrma_path = out / f"{name}.vrma"
+    for block in blocks:
+        name = block["name"]
+        segments = block["segments"]
+        cursor = float(block["time"])
+        chunks = [segments[i:i + ARDY_MAX_SEGMENTS]
+                  for i in range(0, len(segments), ARDY_MAX_SEGMENTS)]
 
-        t0 = time.time()
-        if not ardy_generate(spec["text"], spec["duration"], seed, spec_json):
-            continue
-        if not ardy_to_vrma(spec_json, str(vrma_path)):
-            continue
-        Path(spec_json).unlink(missing_ok=True)
+        for idx, segs in enumerate(chunks):
+            part = name if len(chunks) == 1 else f"{name}{idx + 1}"
+            # 同じ台本でも日付が変われば別の動きになるよう seed_base を混ぜる
+            seed = int(hashlib.sha1(f"{seed_base}-{part}".encode()).hexdigest()[:8], 16) % (2 ** 31)
+            spec_json = str(tmp_dir / f"ardy_spec_{part}.json")
+            vrma_path = out / f"{part}.vrma"
 
-        result.append({"time": round(float(spec["time"]), 2), "file": vrma_path.name})
-        print(f"[ARDY] {name}.vrma @{spec['time']:.2f}s ({time.time() - t0:.1f}秒) "
-              f"← {spec['text'][:60]}")
+            t0 = time.time()
+            length = ardy_generate_segments(segs, seed, spec_json)
+            if length is None or not ardy_to_vrma(spec_json, str(vrma_path)):
+                # 続きを繋げる位置が決まらないので、このブロックはここで打ち切る
+                break
+            Path(spec_json).unlink(missing_ok=True)
+
+            result.append({"time": round(cursor, 2), "file": vrma_path.name})
+            print(f"[ARDY] {vrma_path.name} @{cursor:.2f}s "
+                  f"({length:.1f}秒 / {len(segs)}セグメント / 生成{time.time() - t0:.1f}秒)")
+            for seg in segs:
+                print(f"[ARDY]   {seg['duration']:.1f}s ← {seg['text'][:70]}")
+            cursor += length
 
     return result
 

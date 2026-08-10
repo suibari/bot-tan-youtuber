@@ -47,6 +47,7 @@ from core import (  # noqa: F401
     _query_mora_times, split_sentences, generate_subtitle_timing, _find_subtitle_time,
     _start_xvfb, record_with_unity, VRMA_MOTION_DIR,
     ardy_start, ardy_wait_ready, ardy_stop, build_vrma_motions,
+    plan_vrma_segments, merge_vrma_spans, ARDY_MAX_SEGMENTS, VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD,
     esc_drawtext, base_vf_parts, build_subtitle_filters, build_corner_filters,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
@@ -55,12 +56,12 @@ from core import (  # noqa: F401
 # （Assets/Animations/Blow A Kiss.fbx, firstFrame:0 lastFrame:137 @30fps）。
 # 生成モーションを被せると尻切れになるので、これが終わるまでは置かない
 HOOK_MOTION_SEC = 4.6
-# 生成モーション1本の最大長[秒]
-VRMA_MAX_SEC    = float(os.getenv("VRMA_MAX_SEC", "5.0"))
+# DoGreeting① で流れる Standing Greeting の長さ
+# （Assets/Animations/Standing Greeting.fbx, lastFrame:153 @30fps = 5.10秒）。
+# 生成モーションを被せるとこちらが見えなくなるので、この間は空ける
+GREETING_MOTION_SEC = 5.2
 # 引き開始以降カメラを引く量[m]
 VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.7"))
-# コーナー開始からの遅延[秒]
-VRMA_DELAY      = float(os.getenv("VRMA_DELAY", "0.4"))
 
 # Gemini response_schema: 台本をJSONとして構造化出力させるスキーマ
 SCRIPT_SCHEMA = {
@@ -73,8 +74,19 @@ SCRIPT_SCHEMA = {
                 "properties": {
                     "section": {"type": "string"},
                     # AI(ARDY)で生成する体の動き。英語で書かせる:
-                    # 日本語だと FuguMT の英訳が崩れ、その英文がモーションの条件になってしまう
-                    "motion":  {"type": "string"},
+                    # 日本語だと FuguMT の英訳が崩れ、その英文がモーションの条件になってしまう。
+                    # セクションの尺を分け合うので、1つではなく並べて出させる
+                    "motions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text":     {"type": "string"},
+                                "emphasis": {"type": "string", "enum": ["big", "small"]},
+                            },
+                            "required": ["text", "emphasis"],
+                        },
+                    },
                     "sentences": {
                         "type": "array",
                         "items": {
@@ -254,38 +266,59 @@ def generate_corner_timing(
 
     return corners
 
-def build_vrma_specs(corners: list[dict], sections: dict, script_data: dict) -> list[dict]:
-    """コーナー冒頭に置く生成モーションの仕様を組む。
+def build_vrma_blocks(corners: list[dict], script_data: dict,
+                      greeting_time1: float, closing_start: float) -> list[dict]:
+    """Mixamoが動かない区間を丸ごと埋める、連続モーションのブロックを組む。
 
-    Closing は DoThankful / DoWave があるので入れない。
-    1本目は冒頭の Blow A Kiss（4.57秒）が終わってから始める。
+    夜版でMixamoが走るのは 冒頭の Blow A Kiss（4.57秒）/ DoGreeting①（Opening
+    終了2秒前から Standing Greeting 5.10秒）/ Closing の DoThankful・DoWave。
+    その隙間を1本ずつの長いモーションで埋める。コーナー境界をセグメントの
+    切れ目にして、各コーナーの motions を尺で分け合う。
     """
-    motion_of = {sec.get("section"): (sec.get("motion") or "").strip()
-                 for sec in script_data.get("sections", [])}
-    specs = []
+    motions_of = {sec.get("section"): (sec.get("motions") or [])
+                  for sec in script_data.get("sections", [])}
 
-    for c in corners:
-        tag = c.get("tag")
-        if tag in (None, "Closing"):
-            continue
-        text = motion_of.get(tag, "")
-        if not text:
-            print(f"[モーション] {tag}: 台本に motion が無いのでスキップ")
-            continue
+    # 埋める対象の窓。DoGreeting① を挟んで前後に分かれる
+    windows = [(HOOK_MOTION_SEC, float(greeting_time1)),
+               (float(greeting_time1) + GREETING_MOTION_SEC, float(closing_start))]
 
-        start = max(c["start"] + VRMA_DELAY, HOOK_MOTION_SEC)
-        avail = c["end"] - start - 0.4
-        if avail < 1.5:
-            print(f"[モーション] {tag}: 尺が足りない({avail:.1f}秒)のでスキップ")
+    blocks = []
+    for idx, (w_start, w_end) in enumerate(windows):
+        # 末尾の余白は次のMixamoモーションに食い込ませないため
+        w_end -= VRMA_TAIL_PAD
+        if w_end - w_start < VRMA_SEG_MIN_SEC:
             continue
 
-        specs.append({
-            "name":     tag.lower(),
-            "time":     round(start, 2),
-            "duration": round(min(avail, VRMA_MAX_SEC), 2),
-            "text":     text,
-        })
-    return specs
+        # Closing は Mixamo に任せるので対象外。
+        # 区切りには corners の end ではなく次のコーナーの start を使う。
+        # end は「次に検出できたコーナーの start」なので、未検出のコーナーを
+        # 飛び越して隣と重なる（実測で NagiCorner は毎回未検出）
+        ordered = [c for c in corners if c.get("tag") not in (None, "Closing")]
+        bounds = [float(c["start"]) for c in ordered] + [float(closing_start)]
+        raw = [(c["tag"], max(bounds[i], w_start), min(bounds[i + 1], w_end),
+                motions_of.get(c["tag"], []))
+               for i, c in enumerate(ordered)]
+        spans = merge_vrma_spans([r for r in raw if r[2] > r[1]])
+        if not spans:
+            continue
+
+        # 12セグメントを超えると .vrma が分割されて継ぎ目ができるので、
+        # ブロック全体で12に収まるようコーナーの尺に比例して配分する
+        block_len = sum(e - s for _, s, e, _ in spans)
+        segments = []
+        for tag, c_start, c_end, motions in spans:
+            quota = max(1, round(ARDY_MAX_SEGMENTS * (c_end - c_start) / block_len))
+            segs = plan_vrma_segments(motions, c_end - c_start,
+                                      max_segments=quota, tail_pad=0.0)
+            print(f"[モーション] {tag}: {c_start:.1f}〜{c_end:.1f}秒 → {len(segs)}セグメント")
+            segments += segs
+        if segments:
+            blocks.append({"name": f"body{idx + 1}",
+                           "time": round(spans[0][1], 2), "segments": segments})
+
+    if not blocks:
+        print("[モーション] 埋められる区間がありません")
+    return blocks
 
 
 # ──────────────────────────────────────────────
@@ -434,11 +467,11 @@ def main():
         vrma_motions = []
         if VRMA_MOTION_DIR:
             try:
-                specs = build_vrma_specs(corners, sections, script_data)
-                if specs and ardy_wait_ready():
+                blocks = build_vrma_blocks(corners, script_data, greeting_time1, closing_start)
+                if blocks and ardy_wait_ready():
                     vrma_motions = _timed(
                         "Step3.8 モーション生成", build_vrma_motions,
-                        specs, VRMA_MOTION_DIR, datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d"))
+                        blocks, VRMA_MOTION_DIR, datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d"))
             except Exception as e:
                 print(f"[モーション] 生成に失敗しました（動画は続行）: {e}")
             finally:

@@ -17,7 +17,8 @@ JST 6:00 に起動し、約55秒のクイズ動画を生成して YouTube に投
   QUIZ_USED_CSV       : 消費台帳のパス  (デフォルト: ./data/quiz_used.csv)
   QUIZ_COOLDOWN_DAYS  : 再利用までの日数 (デフォルト: 30)
   QUIZ_NO_CONSUME     : true で消費台帳に記録しない（テスト用）
-  VRMA_MAX_SEC        : AI生成モーション1本の最大長[秒] (既定 5.0)
+  VRMA_BIG_SEC        : 山場のジェスチャー1本の目安の長さ[秒] (既定 4.5)
+  VRMA_SMALL_SEC      : つなぎの待機動作1本の目安の長さ[秒] (既定 3.0)
   VRMA_PULLBACK       : シンキングタイム以降カメラを引く量[m] (既定 0.7)
   MORNING_CAMERA_OFFSET_Y : Unityカメラの上方向オフセット (デフォルト: 0.16)
   MORNING_MOUTH_CLOSE     : 無音時に表情の口成分を打ち消す強さ 0〜1 (デフォルト: 1.0)
@@ -55,16 +56,12 @@ COUNTDOWN_WORDS = ["ご", "よん", "さん", "にー", "いち"]
 # パート間に入れる無音（秒）。THINK後の溜めを長めにして「正解は……」を引き立てる
 PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "END": 0.0}
 
-# AI生成モーションを入れるパート。Mixamoのトリガーが無いところだけを対象にする。
-#   Q   → 既定ステートの Blow A Kiss が流れる（4.57秒）
+# AI生成モーションを敷くパート。Mixamoのトリガーが無いところだけを対象にする。
+#   Q   → 既定ステートの Blow A Kiss が流れる（4.57秒）。残りもサムネを撮る
+#         アップの画なので触らない（下の thumbnail.capture_frame を参照）
 #   AFF → DoThankful,  END → DoGreeting + DoWave
-# 残る THINK / A / EXPL の冒頭に1本ずつ置く。値は「パート開始からの遅延[秒]」。
-VRMA_PARTS = {"THINK": 0.3, "A": 0.1, "EXPL": 0.4}
-# ARDYは20fpsなので、これより短いと数十フレームしか無く動きとして成立しない。
-# 実測: 1.15秒のモーションはIdleとほぼ見分けがつかなかった
-VRMA_MIN_SEC = 2.5
-# 生成モーションの最大長[秒]。長いほど破綻しやすいので上限を切る
-VRMA_MAX_SEC = float(os.getenv("VRMA_MAX_SEC", "5.0"))
+# THINK 開始から AFF 開始までを、1本の連続モーションで途切れさせずに埋める。
+VRMA_PARTS = ("THINK", "A", "EXPL")
 # 生成モーションが始まる THINK からカメラを引く。引く量[m]
 VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.7"))
 
@@ -327,37 +324,51 @@ def build_emotions(segments: list[dict], rng) -> list[dict]:
     return emotions
 
 
-def build_vrma_specs(segments: list[dict], script: dict) -> list[dict]:
-    """台本のmotions（英文）とセグメント時刻から、生成モーションの仕様を組む。
+def build_vrma_blocks(segments: list[dict], script: dict) -> list[dict]:
+    """THINK〜AFF直前を丸ごと埋める、連続モーションのブロックを組む。
 
-    VRMA_PARTS のパートだけを対象にする（Mixamoが動いているパートは避ける）。
-    尺はパート長からはみ出さないようクランプする。
+    パートごとに孤立した短いクリップを置くと、EXPL の後半のように長いパートで
+    棒立ちが残る（実測で17秒のうち動くのは5秒だけだった）。パート境界を
+    セグメントの切れ目にして1本につなぎ、尺は台本の motions で分け合う。
     """
     motions = (script.get("motions") or {})
     key_of = {"THINK": "think", "A": "answer", "EXPL": "explanation"}
     seg = {x["id"]: x for x in segments}
-    specs = []
+    if "THINK" not in seg or "AFF" not in seg:
+        return []
 
-    for pid, delay in VRMA_PARTS.items():
-        text = (motions.get(key_of[pid]) or "").strip()
-        if not text:
-            print(f"[モーション] {pid}: 台本にmotionsが無いのでスキップ")
-            continue
-        if pid not in seg:
-            continue
-        s = seg[pid]
-        # パートの残り時間に収める。0.4秒は末尾の余白
-        avail = s["duration"] - delay - 0.4
-        if avail < VRMA_MIN_SEC:
-            print(f"[モーション] {pid}: 尺が足りない({avail:.1f}秒)のでスキップ")
-            continue
-        specs.append({
-            "name":     pid.lower(),
-            "time":     round(s["start"] + delay, 2),
-            "duration": round(min(avail, VRMA_MAX_SEC), 2),
-            "text":     text,
-        })
-    return specs
+    start = float(seg["THINK"]["start"])
+    # 末尾の余白は DoThankful（AFF.start+0.2）に食い込ませないため
+    end = float(seg["AFF"]["start"]) - core.VRMA_TAIL_PAD
+    if end - start < core.VRMA_SEG_MIN_SEC:
+        print(f"[モーション] ブロックの尺が足りない({end - start:.1f}秒)のでスキップ")
+        return []
+
+    # パート間のパディング（PAD_AFTER）も前のパートの区間に含めて、隙間を作らない。
+    # A（正解発表）は実測1.8秒で単独では成立しないので、merge_vrma_spans が隣に吸収する
+    parts = [pid for pid in VRMA_PARTS if pid in seg]
+    bounds = [float(seg[pid]["start"]) for pid in parts] + [end]
+    spans = core.merge_vrma_spans([
+        (pid, bounds[i], bounds[i + 1], motions.get(key_of[pid]) or [])
+        for i, pid in enumerate(parts) if bounds[i + 1] > bounds[i]
+    ])
+    if not spans:
+        return []
+
+    # 12セグメントを超えると .vrma が分割されて継ぎ目ができるので、
+    # ブロック全体で12に収まるようパートの尺に比例して配分する
+    block_len = sum(e - s for _, s, e, _ in spans)
+    seg_list = []
+    for pid, p_start, p_end, part_motions in spans:
+        quota = max(1, round(core.ARDY_MAX_SEGMENTS * (p_end - p_start) / block_len))
+        segs = core.plan_vrma_segments(part_motions, p_end - p_start,
+                                       max_segments=quota, tail_pad=0.0)
+        print(f"[モーション] {pid}: {p_start:.1f}〜{p_end:.1f}秒 → {len(segs)}セグメント")
+        seg_list += segs
+    if not seg_list:
+        return []
+
+    return [{"name": "body", "time": round(start, 2), "segments": seg_list}]
 
 
 def build_emotion_file(segments: list[dict], emotions: list[dict], path: str,
@@ -498,11 +509,11 @@ def main(argv=None):
         vrma_motions = []
         if core.VRMA_MOTION_DIR and not args.preview:
             try:
-                specs = build_vrma_specs(segments, script)
-                if specs and core.ardy_wait_ready():
+                blocks = build_vrma_blocks(segments, script)
+                if blocks and core.ardy_wait_ready():
                     vrma_motions = core._timed(
                         "Step3.8 モーション生成", core.build_vrma_motions,
-                        specs, core.VRMA_MOTION_DIR,
+                        blocks, core.VRMA_MOTION_DIR,
                         f"{datetime.now().strftime('%Y-%m-%d')}-{quiz['id']}")
             except Exception as e:
                 print(f"[モーション] 生成に失敗しました（動画は続行）: {e}")
