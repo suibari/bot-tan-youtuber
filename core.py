@@ -22,7 +22,7 @@ botたん動画パイプライン 共通処理
   UNITY_EXE           : Unityエディタのパス
   UNITY_PROJECT       : Unityプロジェクトのパス
   VRMA_MOTION_DIR     : AI生成モーション(.vrma)の出力先 (省略時は従来のMixamoモーションのみ)
-  ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /media/suibari/.../ardy-engine)
+  ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /mnt/data/ardy-engine)
   ARDY_REPO           : text-to-vrma のリポジトリパス
   ARDY_PORT           : ARDYサーバーのポート (既定 2337)
   BGM_PATH            : BGM音声ファイルのパス (省略可)
@@ -831,7 +831,25 @@ def ardy_available() -> bool:
           and (Path(ARDY_REPO) / "tools/spec2vrma.mjs").exists())
     if not ok:
         print(f"[ARDY] エンジンが見つかりません（{ARDY_ENGINE_ROOT}）。生成モーションはスキップします")
-    return ok
+        return False
+
+    # ファイルが揃っていても、venv の editable install が旧パスを指していると
+    # import だけが落ちる（エンジンを別ドライブへ移設したときに実際に起きた）。
+    # サーバーはモデル読み込みに4〜5分かけてから /health で error を返すので、
+    # 先に import だけ試して即座に切り分ける。
+    try:
+        r = subprocess.run([str(root / "venv/bin/python"), "-c", "import ardy"],
+                           capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"[ARDY] エンジンのimport確認ができませんでした: {e}。生成モーションはスキップします")
+        return False
+    if r.returncode != 0:
+        lines = (r.stderr or "").strip().splitlines()
+        print(f"[ARDY] エンジンのimportに失敗しました: {lines[-1] if lines else '原因不明'} "
+              f"（{root}/venv に `pip install -e {root}/ardy` で貼り直してください）。"
+              f"生成モーションはスキップします")
+        return False
+    return True
 
 
 def ardy_health() -> dict | None:
@@ -904,8 +922,13 @@ def ardy_start():
            "--port", str(ARDY_PORT),
            "--merged-base", str(root / "llm2vec-base-merged")]
     print(f"[ARDY] サーバー起動: {' '.join(cmd)}")
+    # 出力を捨てると起動に失敗したとき /health の error 文字列しか手掛かりが無くなる。
+    # トレースバックを残す（プロセス終了時にOSが閉じるのでfpは持ち回らない）
+    log_path = Path(__file__).resolve().parent / "logs" / f"ardy_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[ARDY] サーバーログ: {log_path}")
     return subprocess.Popen(cmd, env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
                             preexec_fn=os.setsid)
 
 
