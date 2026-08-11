@@ -23,6 +23,8 @@ botたん動画パイプライン 共通処理
   UNITY_PROJECT       : Unityプロジェクトのパス
   VRMA_MOTION_DIR     : AI生成モーション(.vrma)の出力先 (省略時は従来のMixamoモーションのみ)
   ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /mnt/data/ardy-engine)
+  ARDY_MERGED_BASE    : テキストエンコーダ(15GB)の置き場。読み込み速度が
+                        パイプライン全体を左右するのでSSDを指すこと
   ARDY_REPO           : text-to-vrma のリポジトリパス
   ARDY_PORT           : ARDYサーバーのポート (既定 2337)
   VRMA_BIG_SEC        : 山場のジェスチャー1本の目安の長さ[秒] (既定 4.5)
@@ -732,6 +734,12 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
 # systemd timer からの無人実行では未マウントになり生成が丸ごとスキップされていた。
 # ext4 化で FUSE のオーバーヘッドも外れる（ただし同じHDDなので速度改善は限定的）
 ARDY_ENGINE_ROOT   = os.getenv("ARDY_ENGINE_ROOT", "/mnt/data/ardy-engine")
+# テキストエンコーダ(15GB)の置き場。ARDY_ENGINE_ROOT とは別に指定できる。
+# 実測: HDD(sda1) 41〜111MB/s に対し SSD(sdb2) 384MB/s。
+# HDD 上だと mmap のランダム読みで ready まで530秒以上かかり
+# ARDY_READY_TIMEOUT に間に合わないため、ここだけ SSD に置く
+ARDY_MERGED_BASE   = os.getenv("ARDY_MERGED_BASE",
+                               str(Path(ARDY_ENGINE_ROOT) / "llm2vec-base-merged"))
 ARDY_REPO          = os.getenv("ARDY_REPO", "/home/suibari/work/text-to-vrma")
 ARDY_PORT          = int(os.getenv("ARDY_PORT", "2337"))
 # true にすると既にポートで動いているサーバーをそのまま使う（開発時用）。
@@ -856,15 +864,32 @@ def _mem_available_gb() -> float:
     return float("inf")   # 読めないなら判定しない
 
 
+_ardy_available_cache: bool | None = None
+
+
 def ardy_available() -> bool:
-    """エンジン一式が揃っているか。NTFS未マウント時などに False になる。"""
+    """エンジン一式が揃っているか。NTFS未マウント時などに False になる。
+
+    ardy_start と ardy_wait_ready の両方から呼ばれる。中の `import ardy` は
+    HDD 上の venv を読むので冷えていると数十秒かかる。1回で済ませる。
+    """
+    global _ardy_available_cache
+    if _ardy_available_cache is None:
+        _ardy_available_cache = _check_ardy_available()
+    return _ardy_available_cache
+
+
+def _check_ardy_available() -> bool:
     root = Path(ARDY_ENGINE_ROOT)
-    ok = ((root / "venv/bin/python").exists()
-          and (root / "llm2vec-base-merged").is_dir()
-          and (Path(ARDY_REPO) / "tools/ardy-engine/server.py").exists()
-          and (Path(ARDY_REPO) / "tools/spec2vrma.mjs").exists())
-    if not ok:
-        print(f"[ARDY] エンジンが見つかりません（{ARDY_ENGINE_ROOT}）。生成モーションはスキップします")
+    # ARDY_MERGED_BASE は別ドライブを指しうるので、どれが欠けたか名指しする
+    missing = [str(p) for p in (root / "venv/bin/python",
+                                Path(ARDY_MERGED_BASE),
+                                Path(ARDY_REPO) / "tools/ardy-engine/server.py",
+                                Path(ARDY_REPO) / "tools/spec2vrma.mjs")
+               if not p.exists()]
+    if missing:
+        print(f"[ARDY] エンジンが見つかりません（{', '.join(missing)}）。"
+              f"生成モーションはスキップします")
         return False
 
     # ファイルが揃っていても、venv の editable install が旧パスを指していると
@@ -954,7 +979,7 @@ def ardy_start():
     cmd = [str(root / "venv/bin/python"),
            str(Path(ARDY_REPO) / "tools/ardy-engine/server.py"),
            "--port", str(ARDY_PORT),
-           "--merged-base", str(root / "llm2vec-base-merged")]
+           "--merged-base", ARDY_MERGED_BASE]
     print(f"[ARDY] サーバー起動: {' '.join(cmd)}")
     # 出力を捨てると起動に失敗したとき /health の error 文字列しか手掛かりが無くなる。
     # トレースバックを残す（プロセス終了時にOSが閉じるのでfpは持ち回らない）
