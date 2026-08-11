@@ -16,6 +16,8 @@ botたん YouTube Shorts 自動投稿パイプライン
   UNITY_PROJECT       : Unityプロジェクトのパス
   BGM_PATH            : BGM音声ファイルのパス (省略可)
   YOUTUBE_PRIVACY     : YouTube動画の公開設定 (public/private/unlisted, デフォルト: public)
+  VRMA_PULLBACK       : 生成モーション開始以降カメラを引く量[m] (既定 0.7)
+  （生成モーションの調整値 VRMA_GAIN / VRMA_HIPS_Y などは core.py 側を参照）
 """
 
 import os
@@ -48,6 +50,7 @@ from core import (  # noqa: F401
     _start_xvfb, record_with_unity, VRMA_MOTION_DIR,
     ardy_start, ardy_wait_ready, ardy_stop, build_vrma_motions,
     plan_vrma_segments, merge_vrma_spans, ARDY_MAX_SEGMENTS, VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD,
+    VRMA_GAIN, VRMA_HIPS_Y,
     esc_drawtext, base_vf_parts, build_subtitle_filters, build_corner_filters,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
@@ -56,10 +59,6 @@ from core import (  # noqa: F401
 # （Assets/Animations/Blow A Kiss.fbx, firstFrame:0 lastFrame:137 @30fps）。
 # 生成モーションを被せると尻切れになるので、これが終わるまでは置かない
 HOOK_MOTION_SEC = 4.6
-# DoGreeting① で流れる Standing Greeting の長さ
-# （Assets/Animations/Standing Greeting.fbx, lastFrame:153 @30fps = 5.10秒）。
-# 生成モーションを被せるとこちらが見えなくなるので、この間は空ける
-GREETING_MOTION_SEC = 5.2
 # 引き開始以降カメラを引く量[m]
 VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.7"))
 
@@ -267,58 +266,57 @@ def generate_corner_timing(
     return corners
 
 def build_vrma_blocks(corners: list[dict], script_data: dict,
-                      greeting_time1: float, closing_start: float) -> list[dict]:
+                      vrma_end: float) -> list[dict]:
     """Mixamoが動かない区間を丸ごと埋める、連続モーションのブロックを組む。
 
-    夜版でMixamoが走るのは 冒頭の Blow A Kiss（4.57秒）/ DoGreeting①（Opening
-    終了2秒前から Standing Greeting 5.10秒）/ Closing の DoThankful・DoWave。
-    その隙間を1本ずつの長いモーションで埋める。コーナー境界をセグメントの
-    切れ目にして、各コーナーの motions を尺で分け合う。
+    夜版でMixamoが走るのは 冒頭の Blow A Kiss（4.57秒）と Closing の
+    DoThankful・DoWave だけ。その間（4.6秒〜vrma_end）を1本の長いモーションで
+    途切れさせずに埋める。コーナー境界をセグメントの切れ目にして、
+    各コーナーの motions を尺で分け合う。
+
+    vrma_end: 生成モーションを終わらせる時刻[秒]。DoThankful に食い込ませないこと。
+
+    NOTE: 以前は DoGreeting①（Standing Greeting 5.10秒）を挟んで窓を2つに割っていたが、
+          greeting_time1 = corners[0].end - 2.0 は NagiCorner が毎回未検出のせいで
+          常に closing_start - 2.0 になり、「締めの2秒前に必ず手を振る」動きが
+          コーナー境界を分断していた。挨拶ごと廃止して単一区間にしている。
     """
     motions_of = {sec.get("section"): (sec.get("motions") or [])
                   for sec in script_data.get("sections", [])}
 
-    # 埋める対象の窓。DoGreeting① を挟んで前後に分かれる
-    windows = [(HOOK_MOTION_SEC, float(greeting_time1)),
-               (float(greeting_time1) + GREETING_MOTION_SEC, float(closing_start))]
-
-    blocks = []
-    for idx, (w_start, w_end) in enumerate(windows):
-        # 末尾の余白は次のMixamoモーションに食い込ませないため
-        w_end -= VRMA_TAIL_PAD
-        if w_end - w_start < VRMA_SEG_MIN_SEC:
-            continue
-
-        # Closing は Mixamo に任せるので対象外。
-        # 区切りには corners の end ではなく次のコーナーの start を使う。
-        # end は「次に検出できたコーナーの start」なので、未検出のコーナーを
-        # 飛び越して隣と重なる（実測で NagiCorner は毎回未検出）
-        ordered = [c for c in corners if c.get("tag") not in (None, "Closing")]
-        bounds = [float(c["start"]) for c in ordered] + [float(closing_start)]
-        raw = [(c["tag"], max(bounds[i], w_start), min(bounds[i + 1], w_end),
-                motions_of.get(c["tag"], []))
-               for i, c in enumerate(ordered)]
-        spans = merge_vrma_spans([r for r in raw if r[2] > r[1]])
-        if not spans:
-            continue
-
-        # 12セグメントを超えると .vrma が分割されて継ぎ目ができるので、
-        # ブロック全体で12に収まるようコーナーの尺に比例して配分する
-        block_len = sum(e - s for _, s, e, _ in spans)
-        segments = []
-        for tag, c_start, c_end, motions in spans:
-            quota = max(1, round(ARDY_MAX_SEGMENTS * (c_end - c_start) / block_len))
-            segs = plan_vrma_segments(motions, c_end - c_start,
-                                      max_segments=quota, tail_pad=0.0)
-            print(f"[モーション] {tag}: {c_start:.1f}〜{c_end:.1f}秒 → {len(segs)}セグメント")
-            segments += segs
-        if segments:
-            blocks.append({"name": f"body{idx + 1}",
-                           "time": round(spans[0][1], 2), "segments": segments})
-
-    if not blocks:
+    # 末尾の余白は次のMixamoモーションに食い込ませないため
+    w_start, w_end = HOOK_MOTION_SEC, float(vrma_end) - VRMA_TAIL_PAD
+    if w_end - w_start < VRMA_SEG_MIN_SEC:
         print("[モーション] 埋められる区間がありません")
-    return blocks
+        return []
+
+    # 区切りには corners の end ではなく次のコーナーの start を使う。
+    # end は「次に検出できたコーナーの start」なので、未検出のコーナーを
+    # 飛び越して隣と重なる（実測で NagiCorner は毎回未検出）
+    ordered = [c for c in corners if c.get("tag") is not None]
+    bounds = [float(c["start"]) for c in ordered] + [w_end]
+    raw = [(c["tag"], max(bounds[i], w_start), min(bounds[i + 1], w_end),
+            motions_of.get(c["tag"], []))
+           for i, c in enumerate(ordered)]
+    spans = merge_vrma_spans([r for r in raw if r[2] > r[1]])
+    if not spans:
+        print("[モーション] 埋められる区間がありません")
+        return []
+
+    # 12セグメントを超えると .vrma が分割されて継ぎ目ができるので、
+    # ブロック全体で12に収まるようコーナーの尺に比例して配分する
+    block_len = sum(e - s for _, s, e, _ in spans)
+    segments = []
+    for tag, c_start, c_end, motions in spans:
+        quota = max(1, round(ARDY_MAX_SEGMENTS * (c_end - c_start) / block_len))
+        segs = plan_vrma_segments(motions, c_end - c_start,
+                                  max_segments=quota, tail_pad=0.0)
+        print(f"[モーション] {tag}: {c_start:.1f}〜{c_end:.1f}秒 → {len(segs)}セグメント")
+        segments += segs
+    if not segments:
+        print("[モーション] 埋められる区間がありません")
+        return []
+    return [{"name": "body1", "time": round(spans[0][1], 2), "segments": segments}]
 
 
 # ──────────────────────────────────────────────
@@ -455,19 +453,19 @@ def main():
         emotions, wave_time = build_emotion_timeline(main_sentences, subtitles, intro_duration)
 
         # トリガー発火時刻を字幕から算出
-        # DoGreeting①: OpeningAffirmationセクション終了2秒前（フレーズに依存しないよう cornersベースで計算）
-        opening_end = corners[0]["end"] if corners else 0.0
-        greeting_time1 = max(0.0, opening_end - 2.0)
         # DoThankful: 締めセクション内に限定（corners末尾がClosing）
         closing_start = corners[-1]["start"] if corners else 0.0
         thankful_time  = _find_subtitle_time(subtitles, "高評価",   start_from=closing_start) or 0.0
-        print(f"[トリガー] greetingTime1: {greeting_time1}s, waveTime: {wave_time}s, thankfulTime: {thankful_time}s")
+        print(f"[トリガー] waveTime: {wave_time}s, thankfulTime: {thankful_time}s")
 
         # AI生成モーション。失敗しても動画は作る
+        # 生成モーションは DoThankful の直前まで敷く。「高評価」が字幕から見つからず
+        # thankful_time が 0 のときは DoThankful/DoWave と衝突しうるので Closing の手前で止める
+        vrma_end = thankful_time if thankful_time > 0 else closing_start
         vrma_motions = []
         if VRMA_MOTION_DIR:
             try:
-                blocks = build_vrma_blocks(corners, script_data, greeting_time1, closing_start)
+                blocks = build_vrma_blocks(corners, script_data, vrma_end)
                 if blocks and ardy_wait_ready():
                     vrma_motions = _timed(
                         "Step3.8 モーション生成", build_vrma_motions,
@@ -480,11 +478,13 @@ def main():
 
         # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
+        # greetingTime1 は書き出さない。corners[0].end - 2.0 で発火するが、NagiCorner が
+        # 毎回未検出のため常に「締めの2秒前」になり、Standing Greeting の手振り(5.10秒)が
+        # コーナー境界を分断していた。省くと生成モーションが最後まで連続する
         payload = {
             "emotions":      emotions,
             "waveTime":      wave_time,
             "thankfulTime":  thankful_time,
-            "greetingTime1": greeting_time1,
         }
         if vrma_motions:
             payload["vrmaMotions"] = vrma_motions
@@ -501,7 +501,11 @@ def main():
         if vrma_motions and VRMA_PULLBACK > 0:
             pullback_at = max(corners[0]["start"], HOOK_MOTION_SEC) if corners else HOOK_MOTION_SEC
             extra = ["-cameraPullbackAt", f"{pullback_at:.2f}",
-                     "-cameraPullbackZ", f"{VRMA_PULLBACK}"]
+                     "-cameraPullbackZ", f"{VRMA_PULLBACK}",
+                     # カメラを引いた画に見合う大きさにする。
+                     # 気に入らなければこの2つを外すだけで従来の見た目に戻る
+                     "-vrmaGain", f"{VRMA_GAIN}",
+                     "-vrmaHipsY", f"{VRMA_HIPS_Y}"]
         _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
                extra_args=extra or None,
                catch=(RuntimeError, TimeoutError), delay=15)

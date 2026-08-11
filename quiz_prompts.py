@@ -141,16 +141,24 @@ def build_quiz_user_prompt(quiz: dict) -> str:
     （解説はいちばん長いので、ここは特に多めに）
 
   emphasis で緩急をつける:
-  - "big"   → 話の山場に置く明確なジェスチャー。**1キーにつき1〜2個まで**
+  - "big"   → 話の山場に置く明確なジェスチャー。**1キーにつき2〜3個まで**
   - "small" → その間をつなぐ待機動作。体重移動・うなずき・手を組み直す等
 
   書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
-  - 必ず "A person stands in place facing forward" で始め、その場から動かない動作にする
+  - 必ず "A person stands in place facing forward" で始める。
+    **前後左右への移動だけは書かない**（水平方向の移動は再生側で捨てられるため、
+    歩いてもその場で足踏みしているようにしか見えない）。
+    ただし**その場での上下方向・大振りの動作は歓迎する**:
+    ジャンプ・膝を深く曲げる・上体を大きく前に倒す・腕を大きく振り回す等
   - **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない
   - **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
     big の良い例: raises one hand to their chin / waves one hand above their head /
             claps their hands in front of their chest / crosses their arms over their chest /
-            raises both arms straight up
+            raises both arms straight up /
+            jumps up once with both arms raised above their head /
+            bends their knees deeply and springs straight up /
+            swings both arms out wide to their sides at shoulder height /
+            raises both fists above their head and shakes them
     small の良い例: shifts their weight onto their left foot /
             nods their head down to their chest / tilts their head toward their right shoulder /
             clasps both hands together at their waist
@@ -159,6 +167,7 @@ def build_quiz_user_prompt(quiz: dict) -> str:
     禁止例: gestures / expresses / shows / indicates / smiles / looks / feels
   - **big は手が必ず胸より上に来る動作にする**。腰の高さの動きは画面外に出て見えない
     （small は待機動作なので胸より上でなくてよい）
+  - カメラは引いた全身の画になる。big は小さくまとまらず、思い切って大きく動かすこと
   - 1つあたり15語程度まで
   - big は題材に具体的に結びつける。どのクイズでも使い回せる動きにしない
     （例: 猫がテーマ → raises both hands beside their face like cat paws）

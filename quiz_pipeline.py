@@ -20,6 +20,7 @@ JST 6:00 に起動し、約55秒のクイズ動画を生成して YouTube に投
   VRMA_BIG_SEC        : 山場のジェスチャー1本の目安の長さ[秒] (既定 4.5)
   VRMA_SMALL_SEC      : つなぎの待機動作1本の目安の長さ[秒] (既定 3.0)
   VRMA_PULLBACK       : シンキングタイム以降カメラを引く量[m] (既定 0.7)
+  （生成モーションの調整値 VRMA_GAIN / VRMA_HIPS_Y などは core.py 側を参照）
   MORNING_CAMERA_OFFSET_Y : Unityカメラの上方向オフセット (デフォルト: 0.16)
   MORNING_MOUTH_CLOSE     : 無音時に表情の口成分を打ち消す強さ 0〜1 (デフォルト: 1.0)
   SKIP_YOUTUBE        : true で投稿をスキップ
@@ -540,7 +541,11 @@ def main(argv=None):
             if vrma_motions and VRMA_PULLBACK > 0:
                 think_start = next(s["start"] for s in segments if s["id"] == "THINK")
                 extra += ["-cameraPullbackAt", f"{think_start:.2f}",
-                          "-cameraPullbackZ", f"{VRMA_PULLBACK}"]
+                          "-cameraPullbackZ", f"{VRMA_PULLBACK}",
+                          # カメラを引いた画に見合う大きさにする（夜版と共通の値）。
+                          # 気に入らなければこの2つを外すだけで従来の見た目に戻る
+                          "-vrmaGain", f"{core.VRMA_GAIN}",
+                          "-vrmaHipsY", f"{core.VRMA_HIPS_Y}"]
             core._retry("Step5 Unity録画", core.record_with_unity,
                         wav_path, webm_path, emotion_path,
                         extra_args=extra,

@@ -27,9 +27,12 @@ botたん動画パイプライン 共通処理
                         パイプライン全体を左右するのでSSDを指すこと
   ARDY_REPO           : text-to-vrma のリポジトリパス
   ARDY_PORT           : ARDYサーバーのポート (既定 2337)
+  ARDY_BLEND_SEC      : 生成モーションのセグメント境界のクロスフェード長[秒] (既定 0.7)
   VRMA_BIG_SEC        : 山場のジェスチャー1本の目安の長さ[秒] (既定 4.5)
   VRMA_SMALL_SEC      : つなぎの待機動作1本の目安の長さ[秒] (既定 3.0)
   VRMA_SEG_MIN_SEC    : 1セグメントの下限[秒]。これ未満は動きとして成立しない (既定 2.5)
+  VRMA_GAIN           : 生成モーションの腕の振幅ゲイン (既定 1.0=無効。実測で有害だった)
+  VRMA_HIPS_Y         : 生成モーションの腰の上下移動の反映倍率 (既定 1.0、0で無効)
   BGM_PATH            : BGM音声ファイルのパス (省略可)
   DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD : PostgreSQL接続情報
 """
@@ -773,6 +776,11 @@ ARDY_CFG = float(os.getenv("ARDY_CFG", "3.0"))
 # 実測で 6→12→18 が腕の角度 70→64→58度（体側から離れる方向）に対応した。
 # 腕が体に張り付いて見えるのを緩和するため既定より少し開く
 ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "12"))
+# セグメントのつなぎ目のクロスフェード長[秒]。server.py の既定は6フレーム(20fps=0.3秒)で、
+# 独立生成された別ポーズ同士を繋ぐには短く、「スッと切り替わった」ように見えていた。
+# server.py 側は smoothstep で混ぜるので窓の両端で速度が0になる。
+# 未パッチのサーバーはこのフィールドを無視するだけなので送っても壊れない
+ARDY_BLEND_SEC = float(os.getenv("ARDY_BLEND_SEC", "0.7"))
 
 # 1リクエストで渡せるセグメント数の上限。server.py の _resolve_segments が
 # segments_req[:12] で黙って切り捨てるので、こちら側で必ず守る
@@ -792,6 +800,18 @@ VRMA_SMALL_SEC = float(os.getenv("VRMA_SMALL_SEC", "3.0"))
 VRMA_SEG_MIN_SEC = float(os.getenv("VRMA_SEG_MIN_SEC", "2.5"))
 # ブロック末尾に残す余白[秒]。次のMixamoモーションに食い込ませない
 VRMA_TAIL_PAD = 0.4
+
+# ここから下は Unity(VrmaMotionPlayer) に渡す再生時の調整値。朝版・夜版で共通。
+# 生成モーションの振幅ゲイン。Unity側で Idleポーズからの偏差を増幅する倍率（腕のみ）。
+# 既定は 1.0 = 無効。実測で 1.2 も 1.35 も、ARDYが出す「手を頭の近くに上げる」動きを
+# 引き伸ばして腕(袖)が顔を覆ってしまい、倍率を下げても改善しなかった。
+# 動きを大きくするのはプロンプト側（ジャンプ・大振りの許可）の役目で、
+# 生成済みポーズを事後に引き伸ばすこの経路は割に合わない。
+# 仕組みは残してあるので、試すときは VRMA_GAIN=1.2 のように環境変数で上書きする
+VRMA_GAIN     = float(os.getenv("VRMA_GAIN", "1.0"))
+# 生成モーションの腰の上下移動を反映する倍率。0で無効（従来動作）。
+# ジャンプを画に出すために必要。下方向は Unity 側で切っているので足は沈まない
+VRMA_HIPS_Y   = float(os.getenv("VRMA_HIPS_Y", "1.0"))
 
 # 台本の motions が尺に足りないときに挟む待機動作。
 # プロンプトのルール（その場から動かない・動作は1つ・到達点を書く）に従うこと。
@@ -1049,7 +1069,7 @@ def ardy_generate_segments(segments: list[dict], seed: int, out_json: str) -> fl
     戻り値: 生成された長さ[秒]。失敗時は None。
 
     ARDY側は各セグメントを履歴なしで独立生成し、終端の位置・向きに次を整列して
-    0.3秒でクロスフェードする（server.py の _generate_stitched）。履歴を引き継ぐ方式と
+    ARDY_BLEND_SEC 秒でクロスフェードする（server.py の _generate_stitched）。履歴を引き継ぐ方式と
     違って前の動きの慣性に負けないので、単発生成と同じテキスト追従度のまま
     つなぎ目の無い長いモーションが得られる。
     """
@@ -1065,7 +1085,8 @@ def ardy_generate_segments(segments: list[dict], seed: int, out_json: str) -> fl
                           json={"segments": [{"text": s["text"], "duration": float(s["duration"])}
                                              for s in segments],
                                 "seed": int(seed),
-                                "cfg": ARDY_CFG, "armSpread": ARDY_ARM_SPREAD},
+                                "cfg": ARDY_CFG, "armSpread": ARDY_ARM_SPREAD,
+                                "blendSec": ARDY_BLEND_SEC},
                           timeout=timeout)
         spec = r.json()
     except Exception as e:
@@ -1078,7 +1099,8 @@ def ardy_generate_segments(segments: list[dict], seed: int, out_json: str) -> fl
 
     Path(out_json).write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     print(f"[ARDY] 生成: {spec.get('duration')}秒 / {len(segments)}セグメント / "
-          f"{len(spec['tracks'])}ボーン / seed={seed} cfg={ARDY_CFG} armSpread={ARDY_ARM_SPREAD}")
+          f"{len(spec['tracks'])}ボーン / seed={seed} cfg={ARDY_CFG} "
+          f"armSpread={ARDY_ARM_SPREAD} blendSec={ARDY_BLEND_SEC}")
     return float(spec.get("duration") or total)
 
 

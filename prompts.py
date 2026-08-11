@@ -75,22 +75,31 @@ _NIGHT_OUTPUT_RULES = """
 "CommentCorner"はコメントデータが提供された場合のみ使用すること。
 
 【motions（体の動き）】
-"Thumbnail" と "Closing" 以外の各sectionに "motions" を付けること。
+"Thumbnail" 以外の各sectionに "motions" を付けること（"Closing" にも付ける）。
 AIが3Dモデルを動かすための指示文で、**必ず英語**で書く（日本語だと翻訳で崩れる）。
-sectionの尺を分け合って順番に再生されるので、**1sectionにつき3〜4個**並べること。
-足りないぶんは汎用の待機動作で埋められてしまうので、多めに出すこと。
+sectionの尺を分け合って順番に再生されるので、**1sectionにつき4〜6個**並べること。
+足りないぶんは汎用の待機動作（体重移動・うなずき）で埋められ、その間は画が静かになる。
+実測で、生成モーションは本編ほぼ全域（約60秒・12セグメント）を覆うので、多めに出すこと。
 
 emphasis で緩急をつける:
-- "big"   → 話の山場に置く明確なジェスチャー。**1sectionに1〜2個まで**
+- "big"   → 話の山場に置く明確なジェスチャー。**1sectionに2〜3個まで**
 - "small" → その間をつなぐ待機動作。体重移動・うなずき・手を組み直す等
 
 書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
-- 必ず "A person stands in place facing forward" で始め、その場から動かない動作にする
+- 必ず "A person stands in place facing forward" で始める。
+  **前後左右への移動だけは書かない**（水平方向の移動は再生側で捨てられるため、
+  歩いてもその場で足踏みしているようにしか見えない）。
+  ただし**その場での上下方向・大振りの動作は歓迎する**:
+  ジャンプ・膝を深く曲げる・上体を大きく前に倒す・腕を大きく振り回す等
 - **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない
 - **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
   big の良い例: raises one hand to their chin / waves one hand above their head /
       claps their hands in front of their chest / crosses their arms over their chest /
-      raises both arms straight up
+      raises both arms straight up /
+      jumps up once with both arms raised above their head /
+      bends their knees deeply and springs straight up /
+      swings both arms out wide to their sides at shoulder height /
+      raises both fists above their head and shakes them
   small の良い例: shifts their weight onto their left foot /
       nods their head down to their chest / tilts their head toward their right shoulder /
       clasps both hands together at their waist
@@ -99,6 +108,7 @@ emphasis で緩急をつける:
   禁止例: gestures / expresses / shows / indicates / smiles / looks / feels
 - **big は手が必ず胸より上に来る動作にする**。腰の高さの動きは画面外に出て見えない
   （small は待機動作なので胸より上でなくてよい）
+- カメラは引いた全身の画になる。big は小さくまとまらず、思い切って大きく動かすこと
 - 1つあたり15語程度まで
 - big はそのsectionで話す内容に具体的に結びつける。どの回でも使い回せる動きにしない
   （例: 猫の話題 → raises both hands beside their face like cat paws）
@@ -281,6 +291,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 「botたん」という名前を必ず言及し、自己紹介を兼ねる
   - 「高評価・チャンネル登録もめちゃくちゃ嬉しいよ！」を一言で入れる
   - 「また明日ね」で終わる
+  - このsectionにも "motions" を付けること
   - 日付（〇月〇日）を入れない
   - botたん関連の固有名詞は使わない。モルフォなら「うちの犬」、ラテちゃんなら「友達」と言い換える
 
