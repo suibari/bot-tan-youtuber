@@ -17,8 +17,6 @@ JST 6:00 に起動し、約55秒のクイズ動画を生成して YouTube に投
   QUIZ_USED_CSV       : 消費台帳のパス  (デフォルト: ./data/quiz_used.csv)
   QUIZ_COOLDOWN_DAYS  : 再利用までの日数 (デフォルト: 30)
   QUIZ_NO_CONSUME     : true で消費台帳に記録しない（テスト用）
-  VRMA_BIG_SEC        : 山場のジェスチャー1本の目安の長さ[秒] (既定 4.5)
-  VRMA_SMALL_SEC      : つなぎの待機動作1本の目安の長さ[秒] (既定 3.0)
   VRMA_PULLBACK       : シンキングタイム以降カメラを引く量[m] (既定 0.7)
   （生成モーションの調整値 VRMA_GAIN / VRMA_HIPS_Y などは core.py 側を参照）
   MORNING_CAMERA_OFFSET_Y : Unityカメラの上方向オフセット (デフォルト: 0.16)
@@ -60,9 +58,12 @@ PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "EN
 # AI生成モーションを敷くパート。Mixamoのトリガーが無いところだけを対象にする。
 #   Q   → 既定ステートの Blow A Kiss が流れる（4.57秒）。残りもサムネを撮る
 #         アップの画なので触らない（下の thumbnail.capture_frame を参照）
-#   AFF → DoThankful,  END → DoGreeting + DoWave
-# THINK 開始から AFF 開始までを、1本の連続モーションで途切れさせずに埋める。
-VRMA_PARTS = ("THINK", "A", "EXPL")
+#   END → DoGreeting + DoWave
+# THINK 開始から END 開始までを、1本の連続モーションで途切れさせずに埋める。
+#
+# 2026-08-12: AFF を対象に加えた。以前は AFF の頭で DoThankful（Mixamoの一礼）を
+# 撃っていたが、生成モーションを止めてまで出すものではないので撃つのをやめた。
+VRMA_PARTS = ("THINK", "A", "EXPL", "AFF")
 # 生成モーションが始まる THINK からカメラを引く。引く量[m]
 VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.7"))
 
@@ -204,12 +205,22 @@ def build_audio(script: dict, ending_sentences: list[dict],
             wavs = core.synthesize_sentences(sentences, tmp_dir, f"{prefix}_{pid}")
 
         start = t
-        for path, dur in wavs:
+        # 文ごとの区間も残す。生成モーションを「その文が読まれている時刻」に
+        # 置くために要る（文字数比だと漢字とかなで読み上げ速度が違うぶんズレる）
+        spans = []
+        for sent, (path, dur) in zip(sentences, wavs):
+            spans.append({"start": round(t, 3), "end": round(t + dur, 3),
+                          "motion": sent.get("motion")})
             all_wavs.append(path)
             t += dur
+        if not sentences:                       # THINK（カウントダウン）
+            for path, dur in wavs:
+                all_wavs.append(path)
+                t += dur
         segments.append({
             "id":        pid,
             "sentences": sentences,
+            "spans":     spans,
             "start":     round(start, 3),
             "end":       round(t, 3),
             "duration":  round(t - start, 3),
@@ -326,49 +337,62 @@ def build_emotions(segments: list[dict], rng) -> list[dict]:
 
 
 def build_vrma_blocks(segments: list[dict], script: dict) -> list[dict]:
-    """THINK〜AFF直前を丸ごと埋める、連続モーションのブロックを組む。
+    """THINK〜END直前を丸ごと埋める、連続モーションのブロックを組む。
 
-    パートごとに孤立した短いクリップを置くと、EXPL の後半のように長いパートで
-    棒立ちが残る（実測で17秒のうち動くのは5秒だけだった）。パート境界を
-    セグメントの切れ目にして1本につなぎ、尺は台本の motions で分け合う。
+    夜版と同じく**文ごとのモーションを、その文が読まれる時刻に置く**
+    （core.plan_vrma_from_sentences）。パートの尺で按分していた旧実装は
+    どの文に対応するかを一切見ていなかったので、ペルソナが最後の文のために
+    書いた動きがパートの中盤で再生されることがあった。
+
+    THINK だけは発話が無い（カウントダウン音のみ）ので、台本の motions.think を
+    区間に等分して疑似的な文として扱う。
     """
-    motions = (script.get("motions") or {})
-    key_of = {"THINK": "think", "A": "answer", "EXPL": "explanation"}
     seg = {x["id"]: x for x in segments}
-    if "THINK" not in seg or "AFF" not in seg:
+    if "THINK" not in seg or "END" not in seg:
         return []
 
     start = float(seg["THINK"]["start"])
-    # 末尾の余白は DoThankful（AFF.start+0.2）に食い込ませないため
-    end = float(seg["AFF"]["start"]) - core.VRMA_TAIL_PAD
+    # 末尾の余白は DoGreeting（END.start+0.2）に食い込ませないため
+    end = float(seg["END"]["start"]) - core.VRMA_TAIL_PAD
     if end - start < core.VRMA_SEG_MIN_SEC:
         print(f"[モーション] ブロックの尺が足りない({end - start:.1f}秒)のでスキップ")
         return []
 
-    # パート間のパディング（PAD_AFTER）も前のパートの区間に含めて、隙間を作らない。
-    # A（正解発表）は実測1.8秒で単独では成立しないので、merge_vrma_spans が隣に吸収する
-    parts = [pid for pid in VRMA_PARTS if pid in seg]
-    bounds = [float(seg[pid]["start"]) for pid in parts] + [end]
-    spans = core.merge_vrma_spans([
-        (pid, bounds[i], bounds[i + 1], motions.get(key_of[pid]) or [])
-        for i, pid in enumerate(parts) if bounds[i + 1] > bounds[i]
-    ])
+    spans = []
+    think_motions = [t.strip() for t in ((script.get("motions") or {}).get("think") or [])
+                     if (t or "").strip()]
+    th = seg["THINK"]
+    if think_motions:
+        step = (th["end"] - th["start"]) / len(think_motions)
+        for i, text in enumerate(think_motions):
+            spans.append({"start": th["start"] + step * i,
+                          "end":   th["start"] + step * (i + 1),
+                          "motion": text})
+    for pid in VRMA_PARTS:
+        if pid == "THINK":
+            continue
+        if pid in seg:
+            spans += seg[pid].get("spans") or []
+
+    spans.sort(key=lambda sp: sp["start"])
     if not spans:
+        print("[モーション] 埋められる区間がありません")
         return []
 
-    # 12セグメントを超えると .vrma が分割されて継ぎ目ができるので、
-    # ブロック全体で12に収まるようパートの尺に比例して配分する
-    block_len = sum(e - s for _, s, e, _ in spans)
-    seg_list = []
-    for pid, p_start, p_end, part_motions in spans:
-        quota = max(1, round(core.ARDY_MAX_SEGMENTS * (p_end - p_start) / block_len))
-        segs = core.plan_vrma_segments(part_motions, p_end - p_start,
-                                       max_segments=quota, tail_pad=0.0)
-        print(f"[モーション] {pid}: {p_start:.1f}〜{p_end:.1f}秒 → {len(segs)}セグメント")
-        seg_list += segs
+    # パート間のパディング（PAD_AFTER）を前の文の区間に含めて隙間を無くす。
+    # 埋めないと生成モーションが窓より短くなり、そのぶん棒立ちに戻る
+    for i, sp in enumerate(spans):
+        sp["end"] = spans[i + 1]["start"] if i + 1 < len(spans) else max(sp["end"], end)
+
+    seg_list = core.plan_vrma_from_sentences(spans, start, end)
     if not seg_list:
+        print("[モーション] 埋められる区間がありません")
         return []
 
+    n_auth = sum(1 for sp in spans if (sp.get("motion") or "").strip()
+                 and sp["end"] > start and sp["start"] < end)
+    print(f"[モーション] {start:.1f}〜{end:.1f}秒 → {len(seg_list)}セグメント "
+          f"（モーション指定のある文 {n_auth}/{len(spans)}）")
     return [{"name": "body", "time": round(start, 2), "segments": seg_list}]
 
 
@@ -383,6 +407,10 @@ def build_emotion_file(segments: list[dict], emotions: list[dict], path: str,
     greetingTime1 は書き出さない。greetingTime2 と同じ DoGreeting を撃つ重複であり、
     Q.start+0.3 という早さで発火するため Animator の既定ステート
     Blow A Kiss（4.57秒）を0.3秒で断ち切っていた。省くと投げキッスが最後まで流れる。
+
+    thankfulTime も書き出さない。AFF の頭で Mixamo の一礼を撃っていたが、
+    そのぶん生成モーションを AFF で止める必要があり、話に合った動きより優先する
+    ものではなかった。キーが無ければ VRM1LipSync は DoThankful を撃たない no-op。
     """
     seg = {s["id"]: s for s in segments}
 
@@ -396,7 +424,6 @@ def build_emotion_file(segments: list[dict], emotions: list[dict], path: str,
     data = {
         "emotions":      emotions,
         # 0だと VRM1LipSync が発火しないので必ず正の値にする
-        "thankfulTime":  round(seg["AFF"]["start"] + 0.2, 2),
         "greetingTime2": round(seg["END"]["start"] + 0.2, 2),
         "waveTime":      round(wave_time, 2),
     }
@@ -406,8 +433,7 @@ def build_emotion_file(segments: list[dict], emotions: list[dict], path: str,
         data["vrmaMotions"] = vrma_motions
     Path(path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     print(f"[感情] 保存: {path} "
-          f"(thankful={data['thankfulTime']}s "
-          f"greeting2={data['greetingTime2']}s wave={data['waveTime']}s)")
+          f"(greeting2={data['greetingTime2']}s wave={data['waveTime']}s)")
     for m in data.get("vrmaMotions", []):
         print(f"[モーション] 生成: {m['file']} @{m['time']}s")
 
@@ -545,7 +571,12 @@ def main(argv=None):
                           # カメラを引いた画に見合う大きさにする（夜版と共通の値）。
                           # 気に入らなければこの2つを外すだけで従来の見た目に戻る
                           "-vrmaGain", f"{core.VRMA_GAIN}",
-                          "-vrmaHipsY", f"{core.VRMA_HIPS_Y}"]
+                          "-vrmaHipsY", f"{core.VRMA_HIPS_Y}",
+                          # 体の向き・傾き。0 にすれば従来どおり正面固定に戻る
+                          "-vrmaBodyTilt", f"{core.VRMA_BODY_TILT}",
+                          "-vrmaYawLimit", f"{core.VRMA_YAW_LIMIT}",
+                          "-vrmaHeadYaw", f"{core.VRMA_HEAD_YAW}",
+                          "-vrmaHeadCounter", f"{core.VRMA_HEAD_COUNTER}"]
             core._retry("Step5 Unity録画", core.record_with_unity,
                         wav_path, webm_path, emotion_path,
                         extra_args=extra,

@@ -28,11 +28,15 @@ botたん動画パイプライン 共通処理
   ARDY_REPO           : text-to-vrma のリポジトリパス
   ARDY_PORT           : ARDYサーバーのポート (既定 2337)
   ARDY_BLEND_SEC      : 生成モーションのセグメント境界のクロスフェード長[秒] (既定 0.7)
-  VRMA_BIG_SEC        : 山場のジェスチャー1本の目安の長さ[秒] (既定 4.5)
-  VRMA_SMALL_SEC      : つなぎの待機動作1本の目安の長さ[秒] (既定 3.0)
-  VRMA_SEG_MIN_SEC    : 1セグメントの下限[秒]。これ未満は動きとして成立しない (既定 2.5)
+  VRMA_BIG_SEC        : 山場のジェスチャー1本の目安の長さ[秒] (既定 3.0)
+  VRMA_SMALL_SEC      : つなぎの待機動作1本の目安の長さ[秒] (既定 2.2)
+  VRMA_SEG_MIN_SEC    : 1セグメントの下限[秒]。これ未満は動きとして成立しない (既定 2.0)
   VRMA_GAIN           : 生成モーションの腕の振幅ゲイン (既定 1.0=無効。実測で有害だった)
-  VRMA_HIPS_Y         : 生成モーションの腰の上下移動の反映倍率 (既定 1.0、0で無効)
+  VRMA_HIPS_Y         : 生成モーションの腰の上下移動の反映倍率 (既定 0=無効)
+  VRMA_BODY_TILT      : 生成モーションの腰の傾きの反映倍率 (既定 1.0)
+  VRMA_YAW_LIMIT      : 上体の向き(ヨー)の上限[度] (既定 35。0で正面固定)
+  VRMA_HEAD_YAW       : クリップ由来の首の横振りの上限[度] (既定 15。0で無効)
+  VRMA_HEAD_COUNTER   : 上体が向いたぶんを首で打ち消す割合 (既定 0.8)
   BGM_PATH            : BGM音声ファイルのパス (省略可)
   DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD : PostgreSQL接続情報
 """
@@ -339,9 +343,13 @@ def concat_wavs(paths: list[str], output_path: str) -> None:
             Path(list_file).unlink()
 
 
-def generate_voice(sentences: list[dict], output_path: str, intro_text: str = "") -> None:
+def generate_voice(sentences: list[dict], output_path: str, intro_text: str = "") -> list[float]:
     """VOICEVOXで文ごとに音声合成し結合する。intro_textがある場合は冒頭一言を先頭に付ける。
     sentences: [{"text": str, "valence": float, "arousal": float}, ...]
+    戻り値: 各文の実測尺[秒]（intro は含まない）。
+
+    生成モーションを文に紐づけるのに使う。文字数比で割り当てると、漢字とかなで
+    読み上げ速度が違うぶんズレて、話している内容と動きが合わなくなる
     """
     print(f"[VOICEVOX] 文ごと音声生成中... (speaker: {VOICEVOX_SPEAKER})")
     tmp_dir = Path(tempfile.gettempdir())
@@ -358,13 +366,16 @@ def generate_voice(sentences: list[dict], output_path: str, intro_text: str = ""
             })
             part_paths.append(intro_wav)
 
+        durations = []
         for i, sentence in enumerate(sentences):
             part_path = str(tmp_dir / f"{Path(output_path).stem}_part{i:03d}.wav")
             _synthesize(sentence["text"], part_path)
             part_paths.append(part_path)
+            durations.append(get_wav_duration(part_path))
 
         concat_wavs(part_paths, output_path)
         print(f"[VOICEVOX] 音声生成完了: {output_path} ({len(sentences)}文)")
+        return durations
 
     finally:
         for p in part_paths:
@@ -792,12 +803,30 @@ ARDY_MAX_SEGMENTS = 12
 ARDY_GEN_SEC_PER_SEC = float(os.getenv("ARDY_GEN_SEC_PER_SEC", "10"))
 
 # 1セグメントの目安の長さ[秒]。big は明確なジェスチャー、small は待機動作。
-# この比で実尺を按分するだけなので、合計が尺に合わなくても構わない
-VRMA_BIG_SEC   = float(os.getenv("VRMA_BIG_SEC", "4.5"))
-VRMA_SMALL_SEC = float(os.getenv("VRMA_SMALL_SEC", "3.0"))
+# この比で実尺を按分するだけなので、合計が尺に合わなくても構わない。
+#
+# 短くしてあるのは、ARDYの生成モーションが尺の後半で必ず止まるため。
+# 実測（5秒生成・全ボーンの角速度[度/フレーム]、前半→後半）:
+#   raises one hand to their chin        28.3 → 8.0
+#   repeatedly sways their upper body    20.3 → 10.4
+#   rocks from one foot to the other     19.7 → 11.4
+# 「反復する動作」と書いても後半は持続しなかったので、
+# 1本を短くして高エネルギーな前半だけを使うほうが効く
+VRMA_BIG_SEC   = float(os.getenv("VRMA_BIG_SEC", "3.0"))
+VRMA_SMALL_SEC = float(os.getenv("VRMA_SMALL_SEC", "2.2"))
 # ARDYは20fpsなので、これより短いと数十フレームしか無く動きとして成立しない。
 # 実測: 1.15秒のモーションはIdleとほぼ見分けがつかなかった
-VRMA_SEG_MIN_SEC = float(os.getenv("VRMA_SEG_MIN_SEC", "2.5"))
+VRMA_SEG_MIN_SEC = float(os.getenv("VRMA_SEG_MIN_SEC", "2.0"))
+# 1セグメントの目標尺[秒]。ブロック全体のセグメント本数はこれで決める
+VRMA_SEG_TARGET_SEC = float(os.getenv("VRMA_SEG_TARGET_SEC", "2.6"))
+# 1ブロックのセグメント総数の上限。ARDY_MAX_SEGMENTS(12) を超えるぶんは
+# build_vrma_motions が .vrma を分割し、Unity 側がクリップ同士をクロスフェードする。
+# 24 = 2チャンク。増やすほど生成時間が伸びるので、ここで頭を打たせる
+VRMA_MAX_SEGMENTS_TOTAL = int(os.getenv("VRMA_MAX_SEGMENTS_TOTAL", "24"))
+# 分割された .vrma を重ねて配置する量[秒]。
+# VrmaMotionPlayer.FadeDuration と必ず一致させること。ずれると継ぎ目で
+# 生成モーションが Idle に引き戻され、棒立ちが一瞬挟まる
+VRMA_CHUNK_OVERLAP = 0.5
 # ブロック末尾に残す余白[秒]。次のMixamoモーションに食い込ませない
 VRMA_TAIL_PAD = 0.4
 
@@ -809,21 +838,112 @@ VRMA_TAIL_PAD = 0.4
 # 生成済みポーズを事後に引き伸ばすこの経路は割に合わない。
 # 仕組みは残してあるので、試すときは VRMA_GAIN=1.2 のように環境変数で上書きする
 VRMA_GAIN     = float(os.getenv("VRMA_GAIN", "1.0"))
-# 生成モーションの腰の上下移動を反映する倍率。0で無効（従来動作）。
-# ジャンプを画に出すために必要。下方向は Unity 側で切っているので足は沈まない
-VRMA_HIPS_Y   = float(os.getenv("VRMA_HIPS_Y", "1.0"))
+# 生成モーションの腰の上下移動を反映する倍率。既定0＝無効。
+# ジャンプを画に出すための仕組みだが、そのジャンプ自体を VRMA_BANNED_RE で禁止した
+# （スカートなので、ARDYが作る予備動作の深いしゃがみで下着が映る）。
+# 跳ぶ動作が無い以上ここを有効にする意味がないので0にしてある。
+# 衣装が変わって跳べるようになったら VRMA_HIPS_Y=1.0 で復活できる
+VRMA_HIPS_Y   = float(os.getenv("VRMA_HIPS_Y", "0"))
 
-# 台本の motions が尺に足りないときに挟む待機動作。
-# プロンプトのルール（その場から動かない・動作は1つ・到達点を書く）に従うこと。
-# big と違って手が胸より上に来る必要はない。これが「棒立ち」を埋める部分
+# 生成モーションの「体の向き・傾き」をどこまで画に出すか。すべて Unity 側の引数。
+#
+# ARDY は体のワールド回転（向きも傾きも）を出していて .vrma にもそのまま入っているが、
+# VrmaMotionPlayer が既定で全部捨てていた（顔のアップで横を向くと困るため）。
+# 捨てるのをやめて、代わりに上限をかけて通す。
+#
+# VRMA_YAW_LIMIT: 上体をどこまで横に向けてよいか[度]。Idle からの絶対角で切る。
+#   ARDY のセグメント連結は前セグメントの終端ヨーに合わせて回転を積み上げるので、
+#   相対量で制限すると一度横を向いたまま戻らなくなる。絶対角なら構造的に起きない。
+# VRMA_HEAD_COUNTER: 上体が向いたぶんを首で逆に回して顔をカメラに残す割合。
+#   1.0 で顔が完全に正面。体は斜め・顔はこちら＝「肩越しに振り返る」画になる。
+# VRMA_HEAD_YAW: クリップ由来の首の横振りを通す上限[度]。
+#   従来は首のヨーも殺していた。ただし実測では ARDY に「首を横に振れ」と書いても
+#   対照より小さい振幅しか出ない（下の VRMA_IDLE_MOTIONS のコメント参照）ので、
+#   ここは意図した首振りのためではなく自然さのぶんだけ通す。小さめにしてある。
+# VRMA_BODY_TILT: 腰の傾き(前後左右)の反映倍率。VRMA_GAIN は腕にしか効かないので、
+#   上体の傾きの大きさを戻せるのはここだけ。
+VRMA_BODY_TILT    = float(os.getenv("VRMA_BODY_TILT", "1.0"))
+VRMA_YAW_LIMIT    = float(os.getenv("VRMA_YAW_LIMIT", "35"))
+VRMA_HEAD_YAW     = float(os.getenv("VRMA_HEAD_YAW", "15"))
+VRMA_HEAD_COUNTER = float(os.getenv("VRMA_HEAD_COUNTER", "0.8"))
+
+# 実際の動画で破綻が確認できた動作。ここに入れる基準は「録画して目で見て駄目だったもの」。
+# ARDYはシードで出力が大きく変わるので、単発生成の数値では判断しないこと。
+#
+# 拍手: シードを変えた独立2サンプルとも拍手にならず、手が胸の前で中途半端に浮くだけ
+#       だった（夜版72秒で発生）。armSpread を 0 にしても変わらなかった。
+#
+# スカート姿なので使えない動作。しゃがむ・膝を深く曲げる・跳ぶ系は、
+# ARDY が予備動作として「膝を深く曲げて脚を大きく開くしゃがみ」を必ず作り、
+# カメラが正面・腰の高さにあるため下着が映る（実測: 2026-08-11 の夜版 19.3秒地点）。
+# 腰の上下移動(VRMA_HIPS_Y)を切っても脚のポーズは変わらないので、動作ごと落とす。
+# プロンプトでも禁止しているが、LLMが破ったときに事故るのでここでも遮断する
+VRMA_BANNED_RE = re.compile(
+    r"\b(jump|jumps|jumping|leap|leaps|hop|hops|hopping|squat|squats|squatting|"
+    r"crouch|crouches|crouching|kneel|kneels|kneeling|sit|sits|sitting|"
+    r"lunge|lunges|spring|springs|knees?|clap|claps|clapping|applaud|applauds)\b", re.I)
+
+
+def reject_unsafe_motions(motions: list[dict], label: str = "") -> list[dict]:
+    """スカートで破綻する動作を台本の motions から取り除く。
+
+    落とした結果セグメントが足りなくなっても、VRMA_IDLE_MOTIONS が埋めるので穴は空かない。
+    """
+    out = []
+    for m in (motions or []):
+        text = (m.get("text") or "")
+        if VRMA_BANNED_RE.search(text):
+            print(f"[モーション] 除外{f'({label})' if label else ''}: {text[:70]}")
+            continue
+        out.append(m)
+    return out
+
+
+# 文に motion が無い／禁止動作だったときに代わりに使う待機動作。
+# plan_vrma_from_sentences から使う。
+#
+# 選定の根拠は弱い。ARDYは拡散モデルでシードによって出力が大きく変わるのに、
+# 候補ごとにシード1つでしか測っていない。角度変化の二階差分（＝カクつき）が
+# 大きいものを避けたつもりだったが、実際に録画して見比べたところ画面上の差は
+# 確認できなかった。数値はあてにせず、実際の動画で問題が出たものだけを外している。
+#
+# 実際の動画で問題が出て外したもの:
+#   claps their hands ...                拍手にならず、手が胸の前で中途半端に往復して
+#                                        震えて見える（夜版72秒。独立2サンプルで再現）
+#   keeps bouncing lightly on their toes 跳ねる動作。スカートなので下半身は使わない
+#
+# 2026-08-12: 全文にあった "facing forward"（正面固定の明示）を外した。
+# Unity が体の向きを捨てていたので書いても無意味だったが、上限つきで通すようにした
+# 以上、正面を明示すると ARDY が体を向けなくなる。
+#
+# 同じ日に、ARDY の /generate を直接叩いて spec の hips ヨーと上体ロールを実測した
+# （3秒生成・独立2シード・振幅[度]。対照は "raises one hand to their chin"）:
+#
+#   指示                                         hipsヨー幅      上体ロール幅
+#   （対照）                                       4.5 /  8.2     6.4 /  5.1
+#   turns their upper body to their right,
+#     then back to the front                      81.1 / 76.3    25.3 /  7.9
+#   leans their upper body to their left,
+#     then straightens up                         10.0 /  9.3    25.6 / 27.6
+#   slowly sways their upper body from side to
+#     side                                         6.4 /  2.7     6.2 /  2.5  ← 効かない
+#   shakes their head slowly from side to side     1.2 /  1.5   （首ヨー 4.9 / 1.1）← 効かない
+#
+# 「…して、正面に戻る」という往復の形だけが効いた。sways / shakes は対照と差が無い
+# ので、待機動作からもプロンプトの例からも外した。
 VRMA_IDLE_MOTIONS = [
-    "A person stands in place facing forward and shifts their weight onto their left foot.",
-    "A person stands in place facing forward and slowly nods their head down to their chest.",
-    "A person stands in place facing forward and clasps both hands together at their waist.",
-    "A person stands in place facing forward and tilts their head toward their right shoulder.",
-    "A person stands in place facing forward and brings their right hand up to their chin.",
-    "A person stands in place facing forward and shifts their weight onto their right foot.",
+    "A person stands in place and opens both arms out to the sides at chest height.",
+    "A person stands in place and leans their upper body to their left, then straightens up.",
+    "A person stands in place and repeatedly nods their head down and up.",
+    "A person stands in place and keeps tilting their head from one shoulder to the other.",
+    "A person stands in place and clasps both hands together in front of their chest.",
+    "A person stands in place and brings one hand up to their chin.",
+    "A person stands in place and turns their upper body to their right, then back to the front.",
+    "A person stands in place and leans their upper body to their left, then straightens up.",
 ]
+
+
+
 
 
 # 空きメモリが足りないとき、ここまで待つ[秒]。
@@ -1135,36 +1255,53 @@ def ardy_stop(proc) -> None:
     print("[ARDY] サーバーを停止しました")
 
 
+# 【呼び出し元なし】2026-08-12 に朝版を文ベース（plan_vrma_from_sentences）へ移したため、
+# この関数と dedupe_vrma_segments / merge_vrma_spans / VRMA_BIG_SEC / VRMA_SMALL_SEC は
+# 使われていない。文ベースが安定するまで戻せるように残してある。
 def plan_vrma_segments(motions: list[dict], available_sec: float,
                        max_segments: int = ARDY_MAX_SEGMENTS,
-                       tail_pad: float = VRMA_TAIL_PAD) -> list[dict]:
+                       tail_pad: float = VRMA_TAIL_PAD,
+                       used_idles: set | None = None) -> list[dict]:
     """台本の motions と区間の尺から、ardy_generate_segments 用の segments を組む。
 
     motions: [{"text": 英文, "emphasis": "big"|"small"}, ...]（空でもよい）
     available_sec: この区間に使える秒数
     max_segments: 分割数の上限。1ブロックを複数区間で分け合うときに配分する
     tail_pad: 末尾に残す余白[秒]。区間が連続していて余白が要らないなら0
+    used_idles: 既に使った待機動作。コーナーをまたいで共有すると同じ動作が並ばない。
+        渡さないとコーナーごとにリストの先頭から舐め直すので、実測で
+        clasps both hands が23セグメント中5回出た
     戻り値: [{"text": str, "duration": float}, ...]  尺が足りなければ空リスト。
 
     台本のモーションだけでは尺が埋まらないので、足りない分は VRMA_IDLE_MOTIONS の
     待機動作で埋める。これが「棒立ちを作らない」ための本体。
+
+    スカートで破綻する動作（しゃがむ・跳ぶ）は reject_unsafe_motions がここで落とす。
     """
     avail = float(available_sec) - tail_pad
     max_segments = max(1, min(int(max_segments), ARDY_MAX_SEGMENTS))
     if avail < VRMA_SEG_MIN_SEC:
         return []
 
+    # 呼び出し側の漏れを防ぐため、危険な動作の除外はここで必ず通す
     items = [{"text": text, "emphasis": (m.get("emphasis") or "small")}
-             for m in (motions or [])
+             for m in reject_unsafe_motions(motions)
              if (text := (m.get("text") or "").strip())]
 
     def target(it):
         return VRMA_BIG_SEC if it["emphasis"] == "big" else VRMA_SMALL_SEC
 
-    # 目安の尺に届くまで待機動作を足す
+    # 目安の尺に届くまで待機動作を足す。使い回しを避けて一巡させる
+    if used_idles is None:
+        used_idles = set()
     while sum(target(it) for it in items) < avail and len(items) < max_segments:
-        items.append({"text": VRMA_IDLE_MOTIONS[len(items) % len(VRMA_IDLE_MOTIONS)],
-                      "emphasis": "small"})
+        fresh = [m for m in VRMA_IDLE_MOTIONS if m not in used_idles]
+        if not fresh:                      # 一巡したら使用済みを空にしてもう一周
+            used_idles.clear()
+            fresh = list(VRMA_IDLE_MOTIONS)
+        pick = fresh[0]
+        used_idles.add(pick)
+        items.append({"text": pick, "emphasis": "small"})
     if not items:
         return []
     items = items[:max_segments]
@@ -1182,6 +1319,102 @@ def plan_vrma_segments(motions: list[dict], available_sec: float,
             for it, w in zip(items, weights)]
 
 
+# 【呼び出し元なし】ペルソナが選んだ動きを待機動作で上書きしてしまうので、
+# 文ベースへの移行にあわせて外した（plan_vrma_segments の項を参照）
+def dedupe_vrma_segments(segments: list[dict], window: int = 4) -> list[dict]:
+    """近い位置に同じ動作が並ばないよう、後から出たほうを待機動作に差し替える。
+
+    LLMは同じプロンプトでも同じポーズを何度も選ぶ（実測: 23セグメント中
+    clasps both hands が5回・nods their head が4回）。プロンプトの指示では
+    下限を保証できないので、組み上がったあとにここで必ず均す。
+
+    window: 直近この本数のなかに同じ動作があれば差し替える。
+    """
+    out: list[dict] = []
+    for seg in segments:
+        recent = {x["text"] for x in out[-window:]}
+        if seg["text"] in recent:
+            allused = {x["text"] for x in out}
+            alt = (next((m for m in VRMA_IDLE_MOTIONS if m not in allused), None)
+                   or next((m for m in VRMA_IDLE_MOTIONS if m not in recent), None))
+            if alt:
+                print(f"[モーション] 重複を差し替え: ...{seg['text'][45:75]}"
+                      f" → ...{alt[45:75]}")
+                seg = {**seg, "text": alt}
+        out.append(seg)
+    return out
+
+
+def plan_vrma_from_sentences(spans: list[dict], window_start: float, window_end: float,
+                             max_total: int = VRMA_MAX_SEGMENTS_TOTAL) -> list[dict]:
+    """文ごとのモーションを、その文が読まれる時刻に置くセグメント列にする。
+
+    spans: [{"start": 秒, "end": 秒, "motion": 英文 or None}, ...]（文の順）
+    戻り値: [{"text": str, "duration": float}, ...]
+
+    尺で按分する plan_vrma_segments と違い、**どの文のときにどう動くか**が保たれる。
+    台詞と動きが合っていないと、ただ動いているだけで見ていて不安になる。
+
+    1文が長い（実測で平均8秒）ときは同じ指示文を2〜3本に分けて連続生成する。
+    ARDYはセグメントごとに独立生成するので、同じ指示でも毎回新しい動きが出て、
+    意図を保ったまま尺の後半で動きが止まるのを防げる。
+    短すぎる文は直前のセグメントに吸収させる（1本が短いとIdleと見分けがつかない）。
+    """
+    def build(max_split: int, quiet: bool) -> list[dict]:
+        out: list[dict] = []
+        idle_i = 0
+
+        def add(text: str, dur: float):
+            if out and dur < VRMA_SEG_MIN_SEC:
+                out[-1]["duration"] = round(out[-1]["duration"] + dur, 2)
+            else:
+                out.append({"text": text, "duration": round(dur, 2)})
+
+        for sp in spans:
+            start = max(float(sp["start"]), window_start)
+            end = min(float(sp["end"]), window_end)
+            if end - start <= 0.05:
+                continue
+            text = (sp.get("motion") or "").strip()
+            if not text or VRMA_BANNED_RE.search(text):
+                if text and not quiet:
+                    print(f"[モーション] 除外: {text[:70]}")
+                text = VRMA_IDLE_MOTIONS[idle_i % len(VRMA_IDLE_MOTIONS)]
+                idle_i += 1
+            span = end - start
+            n = max(1, min(max_split, round(span / VRMA_SEG_TARGET_SEC)))
+            for _ in range(n):
+                add(text, span / n)
+
+        # 先頭の余りをIdleで埋める（フックの直後など、文が始まるまでの隙間）
+        first = min((float(sp["start"]) for sp in spans if float(sp["end"]) > window_start),
+                    default=window_end)
+        lead = max(0.0, min(first, window_end) - window_start)
+        if lead >= VRMA_SEG_MIN_SEC:
+            out.insert(0, {"text": VRMA_IDLE_MOTIONS[0], "duration": round(lead, 2)})
+        elif out and lead > 0:
+            out[0]["duration"] = round(out[0]["duration"] + lead, 2)
+        return out
+
+    # 本数が上限を超えたら、まず「1文を何本に割るか」を減らして収める。
+    # ここを削らずに末尾を切ると、台本が長い日に終盤が丸ごとIdle（棒立ち）に戻る。
+    # 1文1本にしても超えるときだけ、短いセグメントを隣に吸収させて減らす
+    for split in (3, 2, 1):
+        out = build(split, quiet=(split != 3))
+        if len(out) <= max_total:
+            break
+    if len(out) > max_total:
+        print(f"[モーション] セグメントが{len(out)}本になったので"
+              f"短いものを隣に吸収して{max_total}本にします")
+        while len(out) > max_total:
+            i = min(range(len(out)), key=lambda k: out[k]["duration"])
+            j = i - 1 if i > 0 else 1
+            out[j]["duration"] = round(out[j]["duration"] + out[i]["duration"], 2)
+            out.pop(i)
+    return out
+
+
+# 【呼び出し元なし】plan_vrma_segments の項を参照
 def merge_vrma_spans(spans: list[tuple]) -> list[tuple]:
     """連続した (label, start, end, motions) から、短すぎる区間を隣に吸収して穴を無くす。
 
@@ -1216,8 +1449,9 @@ def build_vrma_motions(blocks: list[dict], out_dir: str, seed_base: str) -> list
             （日本語だと FuguMT の英訳が崩れて品質が落ちる）。
     戻り値: [{"time": float, "file": str}, ...]  生成に失敗したブロックは黙って除く。
 
-    ARDY_MAX_SEGMENTS を超えるブロックは複数の .vrma に分け、2本目以降は実際の
-    生成長を足した時刻に置いて隣接させる（Unity側は隣接なら1フレームIdleが挟まるだけ）。
+    ARDY_MAX_SEGMENTS を超えるブロックは複数の .vrma に分け、2本目以降は
+    VRMA_CHUNK_OVERLAP だけ手前に重ねて置く。Unity(VrmaMotionPlayer) はこの重なりで
+    2クリップを混ぜてから Idle に乗せるので、継ぎ目で棒立ちに引き戻されない。
     生成モーションはビルド成果物なので out_dir を毎回作り直す。
     """
     if not blocks:
@@ -1257,7 +1491,8 @@ def build_vrma_motions(blocks: list[dict], out_dir: str, seed_base: str) -> list
                   f"({length:.1f}秒 / {len(segs)}セグメント / 生成{time.time() - t0:.1f}秒)")
             for seg in segs:
                 print(f"[ARDY]   {seg['duration']:.1f}s ← {seg['text'][:70]}")
-            cursor += length
+            # 次のチャンクは重ねて置く。Unity 側がこの重なりで2本をクロスフェードする
+            cursor += length - VRMA_CHUNK_OVERLAP
 
     return result
 

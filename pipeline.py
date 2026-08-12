@@ -49,8 +49,10 @@ from core import (  # noqa: F401
     _query_mora_times, split_sentences, generate_subtitle_timing, _find_subtitle_time,
     _start_xvfb, record_with_unity, VRMA_MOTION_DIR,
     ardy_start, ardy_wait_ready, ardy_stop, build_vrma_motions,
-    plan_vrma_segments, merge_vrma_spans, ARDY_MAX_SEGMENTS, VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD,
-    VRMA_GAIN, VRMA_HIPS_Y,
+    VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD,
+    VRMA_GAIN, VRMA_HIPS_Y, VRMA_SEG_TARGET_SEC, VRMA_MAX_SEGMENTS_TOTAL,
+    VRMA_BODY_TILT, VRMA_YAW_LIMIT, VRMA_HEAD_YAW, VRMA_HEAD_COUNTER,
+    plan_vrma_from_sentences,
     esc_drawtext, base_vf_parts, build_subtitle_filters, build_corner_filters,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
@@ -72,20 +74,6 @@ SCRIPT_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "section": {"type": "string"},
-                    # AI(ARDY)で生成する体の動き。英語で書かせる:
-                    # 日本語だと FuguMT の英訳が崩れ、その英文がモーションの条件になってしまう。
-                    # セクションの尺を分け合うので、1つではなく並べて出させる
-                    "motions": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "text":     {"type": "string"},
-                                "emphasis": {"type": "string", "enum": ["big", "small"]},
-                            },
-                            "required": ["text", "emphasis"],
-                        },
-                    },
                     "sentences": {
                         "type": "array",
                         "items": {
@@ -94,6 +82,9 @@ SCRIPT_SCHEMA = {
                                 "text":    {"type": "string"},
                                 "valence": {"type": "number"},
                                 "arousal": {"type": "number"},
+                                # その文を話している間の体の動き（英語）。
+                                # 文に紐づけることで、台詞と動きが必ず対応する
+                                "motion":  {"type": "string"},
                             },
                             "required": ["text", "valence", "arousal"],
                         },
@@ -265,58 +256,42 @@ def generate_corner_timing(
 
     return corners
 
-def build_vrma_blocks(corners: list[dict], script_data: dict,
-                      vrma_end: float) -> list[dict]:
-    """Mixamoが動かない区間を丸ごと埋める、連続モーションのブロックを組む。
+def build_vrma_blocks(sentences: list[dict], durations: list[float],
+                      intro_duration: float, vrma_end: float) -> list[dict]:
+    """文ごとのモーションを、その文が読まれる時刻に置く連続モーションを組む。
 
-    夜版でMixamoが走るのは 冒頭の Blow A Kiss（4.57秒）と Closing の
-    DoThankful・DoWave だけ。その間（4.6秒〜vrma_end）を1本の長いモーションで
-    途切れさせずに埋める。コーナー境界をセグメントの切れ目にして、
-    各コーナーの motions を尺で分け合う。
-
+    sentences: 本編の文（"motion" を持ちうる）。generate_voice に渡したものと同じ順。
+    durations: generate_voice が返した各文の実測尺[秒]。
+    intro_duration: 冒頭一言の尺[秒]。本編はここから始まる。
     vrma_end: 生成モーションを終わらせる時刻[秒]。DoThankful に食い込ませないこと。
 
-    NOTE: 以前は DoGreeting①（Standing Greeting 5.10秒）を挟んで窓を2つに割っていたが、
-          greeting_time1 = corners[0].end - 2.0 は NagiCorner が毎回未検出のせいで
-          常に closing_start - 2.0 になり、「締めの2秒前に必ず手を振る」動きが
-          コーナー境界を分断していた。挨拶ごと廃止して単一区間にしている。
-    """
-    motions_of = {sec.get("section"): (sec.get("motions") or [])
-                  for sec in script_data.get("sections", [])}
+    夜版でMixamoが走るのは 冒頭の Blow A Kiss（4.57秒）と Closing の
+    DoThankful・DoWave だけ。その間を1本の連続モーションで埋める。
 
-    # 末尾の余白は次のMixamoモーションに食い込ませないため
+    NOTE: 以前はコーナー単位の motions を尺で按分していたが、どの文に対応するかを
+          見ていなかったため、最後の文のために書いた動きがコーナーの中盤で再生されていた。
+          「ただ動いている」だけで話している内容と合わない状態だったので、文に紐づけた。
+    """
     w_start, w_end = HOOK_MOTION_SEC, float(vrma_end) - VRMA_TAIL_PAD
     if w_end - w_start < VRMA_SEG_MIN_SEC:
         print("[モーション] 埋められる区間がありません")
         return []
 
-    # 区切りには corners の end ではなく次のコーナーの start を使う。
-    # end は「次に検出できたコーナーの start」なので、未検出のコーナーを
-    # 飛び越して隣と重なる（実測で NagiCorner は毎回未検出）
-    ordered = [c for c in corners if c.get("tag") is not None]
-    bounds = [float(c["start"]) for c in ordered] + [w_end]
-    raw = [(c["tag"], max(bounds[i], w_start), min(bounds[i + 1], w_end),
-            motions_of.get(c["tag"], []))
-           for i, c in enumerate(ordered)]
-    spans = merge_vrma_spans([r for r in raw if r[2] > r[1]])
-    if not spans:
-        print("[モーション] 埋められる区間がありません")
-        return []
+    spans, t = [], float(intro_duration)
+    for sent, dur in zip(sentences, durations):
+        spans.append({"start": t, "end": t + dur, "motion": sent.get("motion")})
+        t += dur
 
-    # 12セグメントを超えると .vrma が分割されて継ぎ目ができるので、
-    # ブロック全体で12に収まるようコーナーの尺に比例して配分する
-    block_len = sum(e - s for _, s, e, _ in spans)
-    segments = []
-    for tag, c_start, c_end, motions in spans:
-        quota = max(1, round(ARDY_MAX_SEGMENTS * (c_end - c_start) / block_len))
-        segs = plan_vrma_segments(motions, c_end - c_start,
-                                  max_segments=quota, tail_pad=0.0)
-        print(f"[モーション] {tag}: {c_start:.1f}〜{c_end:.1f}秒 → {len(segs)}セグメント")
-        segments += segs
+    segments = plan_vrma_from_sentences(spans, w_start, w_end)
     if not segments:
         print("[モーション] 埋められる区間がありません")
         return []
-    return [{"name": "body1", "time": round(spans[0][1], 2), "segments": segments}]
+
+    n_auth = sum(1 for sp in spans
+                 if (sp.get("motion") or "").strip() and sp["end"] > w_start and sp["start"] < w_end)
+    print(f"[モーション] {w_start:.1f}〜{w_end:.1f}秒 → {len(segments)}セグメント "
+          f"（モーション指定のある文 {n_auth}/{len(spans)}）")
+    return [{"name": "body1", "time": round(w_start, 2), "segments": segments}]
 
 
 # ──────────────────────────────────────────────
@@ -431,8 +406,9 @@ def main():
         section_starts = {k: v[0]["text"][:8] if v else "" for k, v in sections.items()}
         print(f"[セクション] 検出: {list(sections.keys())}")
 
-        # Step 3: 音声生成
-        _timed("Step3 音声生成", generate_voice, main_sentences, wav_path, thumbnail_text)
+        # Step 3: 音声生成。各文の実測尺を受け取り、モーションを文に紐づけるのに使う
+        sentence_durations = _timed("Step3 音声生成", generate_voice,
+                                    main_sentences, wav_path, thumbnail_text)
 
         # 冒頭一言の音声時間を取得
         intro_duration = get_wav_duration(intro_wav_path) if thumbnail_text and Path(intro_wav_path).exists() else 0.0
@@ -465,7 +441,8 @@ def main():
         vrma_motions = []
         if VRMA_MOTION_DIR:
             try:
-                blocks = build_vrma_blocks(corners, script_data, vrma_end)
+                blocks = build_vrma_blocks(main_sentences, sentence_durations,
+                                           intro_duration, vrma_end)
                 if blocks and ardy_wait_ready():
                     vrma_motions = _timed(
                         "Step3.8 モーション生成", build_vrma_motions,
@@ -505,7 +482,12 @@ def main():
                      # カメラを引いた画に見合う大きさにする。
                      # 気に入らなければこの2つを外すだけで従来の見た目に戻る
                      "-vrmaGain", f"{VRMA_GAIN}",
-                     "-vrmaHipsY", f"{VRMA_HIPS_Y}"]
+                     "-vrmaHipsY", f"{VRMA_HIPS_Y}",
+                     # 体の向き・傾き。0 にすれば従来どおり正面固定に戻る
+                     "-vrmaBodyTilt", f"{VRMA_BODY_TILT}",
+                     "-vrmaYawLimit", f"{VRMA_YAW_LIMIT}",
+                     "-vrmaHeadYaw", f"{VRMA_HEAD_YAW}",
+                     "-vrmaHeadCounter", f"{VRMA_HEAD_COUNTER}"]
         _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
                extra_args=extra or None,
                catch=(RuntimeError, TimeoutError), delay=15)

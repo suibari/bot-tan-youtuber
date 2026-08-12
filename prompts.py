@@ -49,12 +49,9 @@ _NIGHT_OUTPUT_RULES = """
     },
     {
       "section": "OpeningAffirmation",
-      "motions": [
-        {"text": "A person stands in place facing forward and ...", "emphasis": "big"},
-        {"text": "A person stands in place facing forward and ...", "emphasis": "small"}
-      ],
       "sentences": [
-        {"text": "文章1", "valence": 0.8, "arousal": 0.4},
+        {"text": "文章1", "valence": 0.8, "arousal": 0.4,
+         "motion": "A person stands in place and ..."},
         ...
       ]
     },
@@ -74,46 +71,54 @@ _NIGHT_OUTPUT_RULES = """
 - "Closing"            → ④or⑤締め（自己紹介を含む）
 "CommentCorner"はコメントデータが提供された場合のみ使用すること。
 
-【motions（体の動き）】
-"Thumbnail" 以外の各sectionに "motions" を付けること（"Closing" にも付ける）。
-AIが3Dモデルを動かすための指示文で、**必ず英語**で書く（日本語だと翻訳で崩れる）。
-sectionの尺を分け合って順番に再生されるので、**1sectionにつき4〜6個**並べること。
-足りないぶんは汎用の待機動作（体重移動・うなずき）で埋められ、その間は画が静かになる。
-実測で、生成モーションは本編ほぼ全域（約60秒・12セグメント）を覆うので、多めに出すこと。
+【motion（体の動き）】
+"Thumbnail" 以外の各sectionの**すべてのsentenceに "motion" を付ける**こと。
+その文を話している間の体の動きで、AIが3Dモデルを動かすための指示文。
+**必ず英語**で書く（日本語だと翻訳で崩れる）。
 
-emphasis で緩急をつける:
-- "big"   → 話の山場に置く明確なジェスチャー。**1sectionに2〜3個まで**
-- "small" → その間をつなぐ待機動作。体重移動・うなずき・手を組み直す等
+**最重要: その文の内容と動きが一致していること**。ただ動いていればよいのではない。
+文で言っていることを体で表す。合っていないと、見ていて不安になる画になる。
+  例: 「たっぷり休むべきだよ」→ 両手を胸の前で合わせて落ち着かせる動き
+  例: 「本当にすごいね！」   → 両手を頭上に上げて称える動き
+  例: 「どっちが勝つかドキドキしてた」→ 両手を口元に近づけて見守る動き
 
 書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
-- 必ず "A person stands in place facing forward" で始める。
-  **前後左右への移動だけは書かない**（水平方向の移動は再生側で捨てられるため、
+- 必ず "A person stands in place" で始める。
+  **前後左右への移動は書かない**（水平方向の移動は再生側で捨てられるため、
   歩いてもその場で足踏みしているようにしか見えない）。
-  ただし**その場での上下方向・大振りの動作は歓迎する**:
-  ジャンプ・膝を深く曲げる・上体を大きく前に倒す・腕を大きく振り回す等
-- **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない
+  ただし**その場での体の向き・傾きは使ってよい**（下記）
+- **腕だけでなく上体も使うこと**。腕しか動かないと立ち絵に見える。
+  体をひねる・傾ける動きは再生側で角度を制限してあるので、書いても顔は正面に残る。
+  **「…して、正面に戻る」という往復の形で書くこと**（実測でこの形だけが効いた）:
+    turns their upper body to their right, then back to the front /
+    leans their upper body to their left, then straightens up /
+    twists their torso to one side, then returns to center
+- **下半身を使う動作は禁止**。キャラはスカートを履いていて、カメラが正面・腰の高さに
+  あるため、しゃがむ・膝を曲げる・跳ぶ・座る動作は下着が映って公開できない。
+  禁止例: jump / hop / leap / squat / crouch / kneel / sit / bend their knees /
+  spring up。**大きく動かすのは腕・上体・首だけにすること**
+- **拍手は書かない**。モーション生成AIが拍手を描けず、手が胸の前で中途半端に
+  往復するだけになり、手を震わせている画に見える（実測）
+- **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない。
+  ただし「ひねって戻す」「傾けて戻す」のような1往復は1つと数えてよい
 - **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
-  big の良い例: raises one hand to their chin / waves one hand above their head /
-      claps their hands in front of their chest / crosses their arms over their chest /
-      raises both arms straight up /
-      jumps up once with both arms raised above their head /
-      bends their knees deeply and springs straight up /
-      swings both arms out wide to their sides at shoulder height /
-      raises both fists above their head and shakes them
-  small の良い例: shifts their weight onto their left foot /
-      nods their head down to their chest / tilts their head toward their right shoulder /
-      clasps both hands together at their waist
 - **抽象的な動詞と表情の描写は禁止**。モーション生成AIは体しか動かせないので、
   書いても棒立ちになる（実測で腕の動きがほぼゼロだった）
   禁止例: gestures / expresses / shows / indicates / smiles / looks / feels
-- **big は手が必ず胸より上に来る動作にする**。腰の高さの動きは画面外に出て見えない
-  （small は待機動作なので胸より上でなくてよい）
-- カメラは引いた全身の画になる。big は小さくまとまらず、思い切って大きく動かすこと
+- 話の山場では手が胸より上に来る動作にする。腰の高さの動きは画面外に出て見えない
 - 1つあたり15語程度まで
-- big はそのsectionで話す内容に具体的に結びつける。どの回でも使い回せる動きにしない
-  （例: 猫の話題 → raises both hands beside their face like cat paws）
+- 同じ動作を何度も使わない。文ごとに内容に合わせて変えること
 
-【valence/arousalの指定ルール】
+よく使う形（この通りでなくてよい。内容に合わせてアレンジすること）:
+  raises both arms straight up above their head / opens both arms out to the sides
+  at chest height / raises one hand straight above their head / waves one hand
+  gently beside their face / raises one index finger beside their face /
+  clasps both hands together in front of their chest / tilts their head slowly
+  toward their right shoulder / brings one hand up to their chin /
+  nods their head down to their chest /
+  turns their upper body to their right, then back to the front /
+  leans their upper body to their left, then straightens up
+
 【valence/arousalの指定ルール】
 各sentenceのvalenceとarousalは -1.0〜1.0 の実数で指定する。
 必ず複数の値を使い分けること。全文を同じ値にしてはいけない。
@@ -291,7 +296,6 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 「botたん」という名前を必ず言及し、自己紹介を兼ねる
   - 「高評価・チャンネル登録もめちゃくちゃ嬉しいよ！」を一言で入れる
   - 「また明日ね」で終わる
-  - このsectionにも "motions" を付けること
   - 日付（〇月〇日）を入れない
   - botたん関連の固有名詞は使わない。モルフォなら「うちの犬」、ラテちゃんなら「友達」と言い換える
 

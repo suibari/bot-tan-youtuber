@@ -48,36 +48,37 @@ _SENTENCE = {
 
 # AI(ARDY)で毎回生成する体の動き。英語で書かせる:
 # 日本語を投げると FuguMT の英訳が崩れ、その崩れた英文がモーションの条件になってしまう
-# 各パートの尺を分け合って順番に再生されるので、1つではなく並べて出させる
-_MOTION_LIST = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "properties": {
-            "text":     {"type": "string"},
-            "emphasis": {"type": "string", "enum": ["big", "small"]},
-        },
-        "required": ["text", "emphasis"],
+#
+# 夜版と同じく**文ごとに1つ**持たせる。パートの尺で按分する旧方式は、
+# どの文に対応するかを見ていないので「話している内容と動きが合わない」原因だった。
+_SENTENCE_M = {
+    "type": "object",
+    "properties": {
+        "text":    {"type": "string"},
+        "valence": {"type": "number"},
+        "arousal": {"type": "number"},
+        "motion":  {"type": "string"},
     },
+    "required": ["text", "valence", "arousal", "motion"],
 }
 
+# シンキングタイムだけは発話が無く（カウントダウン音のみ）紐づける文が無いので、
+# ここだけパート単位で受け取る
 _MOTIONS = {
     "type": "object",
     "properties": {
-        "think":       _MOTION_LIST,
-        "answer":      _MOTION_LIST,
-        "explanation": _MOTION_LIST,
+        "think": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["think", "answer", "explanation"],
+    "required": ["think"],
 }
 
 QUIZ_SCRIPT_SCHEMA = {
     "type": "object",
     "properties": {
         "question_intro": {"type": "array", "items": _SENTENCE},
-        "answer_reveal":  {"type": "array", "items": _SENTENCE},
-        "explanation":    {"type": "array", "items": _SENTENCE},
-        "affirmation":    {"type": "array", "items": _SENTENCE},
+        "answer_reveal":  {"type": "array", "items": _SENTENCE_M},
+        "explanation":    {"type": "array", "items": _SENTENCE_M},
+        "affirmation":    {"type": "array", "items": _SENTENCE_M},
         "thumbnail_text": {"type": "string"},
         "title_hook":     {"type": "string"},
         "motions":        _MOTIONS,
@@ -130,47 +131,66 @@ def build_quiz_user_prompt(quiz: dict) -> str:
 ⑥ title_hook（25文字以内）
   - YouTubeタイトル用の引きのある一言
 
-⑦ motions — botたんの体の動き。**英語で**書くこと（日本語だと翻訳で崩れる）
-  AIが3Dモデルを動かすための指示文です。次の3つのキーそれぞれに、
-  {{"text": 英文, "emphasis": "big" または "small"}} を**3〜4個ずつ**並べてください。
-  パートの尺を分け合って順番に再生されます。足りないぶんは汎用の待機動作で
-  埋められてしまうので、多めに出してください。
-  - think       : シンキングタイム中の動き。答えを考えている様子
-  - answer      : 正解発表の瞬間の動き。驚きや納得が伝わるもの
-  - explanation : 解説中の動き。**このクイズの題材そのものを体で表現する**
-    （解説はいちばん長いので、ここは特に多めに）
+⑦ motion — botたんの体の動き。**英語で**書くこと（日本語だと翻訳で崩れる）
+  AIが3Dモデルを動かすための指示文です。
 
-  emphasis で緩急をつける:
-  - "big"   → 話の山場に置く明確なジェスチャー。**1キーにつき2〜3個まで**
-  - "small" → その間をつなぐ待機動作。体重移動・うなずき・手を組み直す等
+  **answer_reveal / explanation / affirmation の各sentenceに "motion" を付ける**こと
+  （question_intro は動きを付ける区間の外なので不要）。
+  さらに motions.think に、シンキングタイム中の動きを**英文2つの配列**で入れること
+  （ここだけ発話が無いので文に紐づけられない）。
+
+  **最重要: その文の内容と動きが一致していること**。ただ動いていればよいのではない。
+  文で言っていることを体で表す。合っていないと、見ていて不安になる画になる。
+    例: 「正解はAだよ！」       → 片手を高く上げて発表する動き
+    例: 「実はこうなんだって」  → 人差し指を立てて説明する動き
+    例: 「知らなくて大丈夫だよ」→ 両手を胸の前で合わせて落ち着かせる動き
 
   書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
-  - 必ず "A person stands in place facing forward" で始める。
-    **前後左右への移動だけは書かない**（水平方向の移動は再生側で捨てられるため、
+  - 必ず "A person stands in place" で始める。
+    **前後左右への移動は書かない**（水平方向の移動は再生側で捨てられるため、
     歩いてもその場で足踏みしているようにしか見えない）。
-    ただし**その場での上下方向・大振りの動作は歓迎する**:
-    ジャンプ・膝を深く曲げる・上体を大きく前に倒す・腕を大きく振り回す等
-  - **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない
+    ただし**その場での体の向き・傾きは使ってよい**（下記）
+  - **腕だけでなく上体も使うこと**。腕しか動かないと立ち絵に見える。
+    体をひねる・傾ける動きは再生側で角度を制限してあるので、書いても顔は正面に残る。
+    **「…して、正面に戻る」という往復の形で書くこと**（実測でこの形だけが効いた）:
+      turns their upper body to their right, then back to the front /
+      leans their upper body to their left, then straightens up /
+      twists their torso to one side, then returns to center
+  - **下半身を使う動作は禁止**。キャラはスカートを履いていて、カメラが正面・腰の高さに
+    あるため、しゃがむ・膝を曲げる・跳ぶ・座る動作は下着が映って公開できない。
+    禁止例: jump / hop / leap / squat / crouch / kneel / sit / bend their knees /
+    spring up。**大きく動かすのは腕・上体・首だけにすること**
+  - **拍手は書かない**。モーション生成AIが拍手を描けず、手が胸の前で中途半端に
+    往復するだけになり、手を震わせている画に見える（実測）
+  - **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない。
+    ただし「ひねって戻す」「傾けて戻す」のような1往復は1つと数えてよい
   - **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
-    big の良い例: raises one hand to their chin / waves one hand above their head /
-            claps their hands in front of their chest / crosses their arms over their chest /
-            raises both arms straight up /
-            jumps up once with both arms raised above their head /
-            bends their knees deeply and springs straight up /
-            swings both arms out wide to their sides at shoulder height /
-            raises both fists above their head and shakes them
-    small の良い例: shifts their weight onto their left foot /
-            nods their head down to their chest / tilts their head toward their right shoulder /
-            clasps both hands together at their waist
+  - **手や腕を同じ場所で往復させ続ける動作は書かない**。3秒間ずっと手を震わせている
+    画になり、見ていて不安になる（例: 胸の前で両手を上下に繰り返す）。
+    首や上体をゆっくり繰り返し動かすのは可
   - **抽象的な動詞と表情の描写は禁止**。モーション生成AIは体しか動かせないので、
     書いても棒立ちになる（実測で腕の動きがほぼゼロだった）
     禁止例: gestures / expresses / shows / indicates / smiles / looks / feels
-  - **big は手が必ず胸より上に来る動作にする**。腰の高さの動きは画面外に出て見えない
-    （small は待機動作なので胸より上でなくてよい）
-  - カメラは引いた全身の画になる。big は小さくまとまらず、思い切って大きく動かすこと
+  - 話の山場では手が胸より上に来る動作にする。腰の高さの動きは画面外に出て見えない
+  - カメラは引いた全身の画になる。小さくまとまらず、思い切って大きく動かすこと
   - 1つあたり15語程度まで
-  - big は題材に具体的に結びつける。どのクイズでも使い回せる動きにしない
+  - **同じ動作を何度も使わない**。文ごとに内容に合わせて変えること
+  - explanation の動きは**このクイズの題材そのものを体で表現する**。
+    どのクイズでも使い回せる動きにしない
     （例: 猫がテーマ → raises both hands beside their face like cat paws）
+
+  **使ってはいけない動作**（実測で不自然な震えが出た）:
+    頬に手を添える / 胸に手を当てる / 腕を組む / 拍手
+
+  よく使う形（この通りでなくてよい。内容に合わせてアレンジすること）:
+    raises both arms straight up above their head / opens both arms out to the sides
+    at chest height / raises one hand straight above their head / raises both fists
+    up to their chest / waves one hand gently beside their face / raises one index
+    finger beside their face / clasps both hands together in front of their chest /
+    tilts their head slowly toward their right shoulder / brings one hand up to
+    their chin / nods their head down to their chest /
+    turns their upper body to their right, then back to the front /
+    leans their upper body to their left, then straightens up
 
 重要：合計の尺は55秒以内。各パートの文字数の目安を大きく超えないこと。
 """
@@ -190,38 +210,26 @@ def build_fallback_script(quiz: dict) -> dict:
             {"text": "AとB、どっちだと思う？",      "valence": 0.6, "arousal": 0.7},
         ],
         "answer_reveal": [
-            {"text": f"正解は、{ans}の{answer_text(quiz)}！", "valence": 0.9, "arousal": 0.9},
+            {"text": f"正解は、{ans}の{answer_text(quiz)}！", "valence": 0.9, "arousal": 0.9,
+             "motion": "A person stands in place and raises one hand straight above their head."},
         ],
         "explanation": [
-            {"text": quiz["解説"], "valence": 0.7, "arousal": 0.0},
+            {"text": quiz["解説"], "valence": 0.7, "arousal": 0.0,
+             "motion": "A person stands in place and raises one index finger beside their face."},
         ],
         "affirmation": [
-            {"text": "知らなかったってことは、今日ひとつ知れたってことだよ。", "valence": 1.0, "arousal": 0.2},
-            {"text": "それってすごく素敵なことだと思うんだ。",                 "valence": 1.0, "arousal": 0.3},
+            {"text": "知らなかったってことは、今日ひとつ知れたってことだよ。", "valence": 1.0, "arousal": 0.2,
+             "motion": "A person stands in place and clasps both hands together in front of their chest."},
+            {"text": "それってすごく素敵なことだと思うんだ。",                 "valence": 1.0, "arousal": 0.3,
+             "motion": "A person stands in place and opens both arms out to the sides at chest height."},
         ],
         "thumbnail_text": quiz["問題"][:20],
         "title_hook":     quiz["問題"][:25],
         # LLMが落ちたときは題材に紐づけられないので、どのクイズでも成立する汎用動作にする
         "motions": {
             "think": [
-                {"text": "A person stands in place facing forward and raises one hand to their chin.",
-                 "emphasis": "big"},
-                {"text": "A person stands in place facing forward and tilts their head toward their right shoulder.",
-                 "emphasis": "small"},
-            ],
-            "answer": [
-                {"text": "A person stands in place facing forward and opens both hands beside their face.",
-                 "emphasis": "big"},
-                {"text": "A person stands in place facing forward and nods their head down to their chest.",
-                 "emphasis": "small"},
-            ],
-            "explanation": [
-                {"text": "A person stands in place facing forward and raises both hands in front of their chest.",
-                 "emphasis": "big"},
-                {"text": "A person stands in place facing forward and shifts their weight onto their left foot.",
-                 "emphasis": "small"},
-                {"text": "A person stands in place facing forward and clasps both hands together at their waist.",
-                 "emphasis": "small"},
+                "A person stands in place and brings one hand up to their chin.",
+                "A person stands in place and turns their upper body to their right, then back to the front.",
             ],
         },
     }
@@ -243,19 +251,26 @@ def validate_script(script: dict, quiz: dict) -> list[str]:
             if not (s.get("text") or "").strip():
                 warnings.append(f"{key} に空のtextがあります")
 
-    motions = script.get("motions") or {}
-    for key in ("think", "answer", "explanation"):
-        items = motions.get(key)
-        if not isinstance(items, list) or not items:
-            warnings.append(f"motions.{key} が空です")
-            continue
-        for i, m in enumerate(items):
-            text = ((m or {}).get("text") or "").strip()
+    # 文ごとの motion。ARDY に渡す英文なので、日本語のまま返ってくると
+    # FuguMT の英訳が崩れて、その崩れた英文がモーションの条件になってしまう
+    for key in ("answer_reveal", "explanation", "affirmation"):
+        for i, sent in enumerate(script.get(key) or []):
+            text = ((sent or {}).get("motion") or "").strip()
             if not text:
-                warnings.append(f"motions.{key}[{i}] が空です")
+                warnings.append(f"{key}[{i}] に motion がありません")
             elif not text.isascii():
-                # 日本語のまま返ってくると FuguMT の英訳が崩れて品質が落ちる
-                warnings.append(f"motions.{key}[{i}] が英語ではありません: {text[:40]!r}")
+                warnings.append(f"{key}[{i}].motion が英語ではありません: {text[:40]!r}")
+
+    think = (script.get("motions") or {}).get("think")
+    if not isinstance(think, list) or not think:
+        warnings.append("motions.think が空です")
+    else:
+        for i, text in enumerate(think):
+            text = (text or "").strip()
+            if not text:
+                warnings.append(f"motions.think[{i}] が空です")
+            elif not text.isascii():
+                warnings.append(f"motions.think[{i}] が英語ではありません: {text[:40]!r}")
 
     # 正解発表に正解のラベルが含まれているか
     reveal = "".join(s.get("text", "") for s in script.get("answer_reveal", []))
