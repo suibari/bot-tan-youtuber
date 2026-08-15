@@ -175,6 +175,15 @@ def build_countdown_wav(tmp_dir: Path, prefix: str) -> str:
     return out
 
 
+# フック（掴みの一言）の声色を変えるパート・文数。
+# 夜版は Thumbnail の一言まるごとだが、朝版の question_intro は
+# 「掛け声／問題文／どっちだと思う？」の2〜3文なので、掛け声の1文目だけに当てる。
+# 問題文まで speedScale 0.85 にすると間延びするうえ尺が伸びる。
+# build_audio（合成）と build_subtitles（字幕の区切り）の両方がこれを見る
+HOOK_PART      = "Q"
+HOOK_SENTENCES = 1
+
+
 def build_audio(script: dict, ending_sentences: list[dict],
                 wav_path: str, tmp_dir: Path, prefix: str) -> list[dict]:
     """5パート分の音声を合成・結合し、各パートの開始/終了時刻を確定して返す。
@@ -201,6 +210,13 @@ def build_audio(script: dict, ending_sentences: list[dict],
             actual = core.get_wav_duration(cd)
             wavs = [(cd, actual)]
             sentences = []
+        elif pid == HOOK_PART and len(sentences) > HOOK_SENTENCES:
+            # フックだけ声色を変える。prefix を分けないと連番 _000.wav が
+            # 衝突して1文目が2文目に上書きされる
+            wavs = (core.synthesize_sentences(sentences[:HOOK_SENTENCES], tmp_dir,
+                                              f"{prefix}_{pid}hook", core.HOOK_VOICE_PARAMS)
+                    + core.synthesize_sentences(sentences[HOOK_SENTENCES:], tmp_dir,
+                                                f"{prefix}_{pid}"))
         else:
             wavs = core.synthesize_sentences(sentences, tmp_dir, f"{prefix}_{pid}")
 
@@ -263,14 +279,27 @@ def build_subtitles(segments: list[dict], max_chars: int = 20) -> list[dict]:
     for seg in segments:
         if not seg["sentences"]:
             continue
-        text = "".join(s["text"] for s in seg["sentences"])
-        subs = core.generate_subtitle_timing(
-            text,
-            time_offset=seg["start"],
-            actual_duration=seg["duration"],
-            max_chars=max_chars,
-            merge_short=True,   # 「萩、」「桔梗、」のような細切れを防ぐ
-        )
+        # 声色を変えた文は境界で切って別々に計算する。
+        # generate_subtitle_timing は「既定の速さで測ったモーラ時刻」を
+        # actual_duration に線形スケールするので、パート内に速さの違う文が
+        # 混ざっていると配分がズレる（フックだけ speedScale 0.85）。
+        # 切らない場合は spans が seg["start"]/["duration"] と一致するので、
+        # 従来とまったく同じ結果になる
+        bounds = [0, len(seg["sentences"])]
+        if seg["id"] == HOOK_PART and len(seg["sentences"]) > HOOK_SENTENCES:
+            bounds.insert(1, HOOK_SENTENCES)
+
+        subs = []
+        for lo, hi in zip(bounds, bounds[1:]):
+            spans = seg["spans"][lo:hi]
+            text = "".join(s["text"] for s in seg["sentences"][lo:hi])
+            subs += core.generate_subtitle_timing(
+                text,
+                time_offset=spans[0]["start"],
+                actual_duration=round(spans[-1]["end"] - spans[0]["start"], 3),
+                max_chars=max_chars,
+                merge_short=True,   # 「萩、」「桔梗、」のような細切れを防ぐ
+            )
         for s in subs:
             s["part"] = seg["id"]
         seg["subs"] = subs
@@ -460,7 +489,7 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    keep_temp = args.keep_temp or os.getenv("KEEP_TEMP", "").lower() == "true"
+    keep_temp = args.keep_temp or core.env_flag("KEEP_TEMP")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmp_dir = Path(tempfile.gettempdir())
@@ -567,16 +596,7 @@ def main(argv=None):
             if vrma_motions and VRMA_PULLBACK > 0:
                 think_start = next(s["start"] for s in segments if s["id"] == "THINK")
                 extra += ["-cameraPullbackAt", f"{think_start:.2f}",
-                          "-cameraPullbackZ", f"{VRMA_PULLBACK}",
-                          # カメラを引いた画に見合う大きさにする（夜版と共通の値）。
-                          # 気に入らなければこの2つを外すだけで従来の見た目に戻る
-                          "-vrmaGain", f"{core.VRMA_GAIN}",
-                          "-vrmaHipsY", f"{core.VRMA_HIPS_Y}",
-                          # 体の向き・傾き。0 にすれば従来どおり正面固定に戻る
-                          "-vrmaBodyTilt", f"{core.VRMA_BODY_TILT}",
-                          "-vrmaYawLimit", f"{core.VRMA_YAW_LIMIT}",
-                          "-vrmaHeadYaw", f"{core.VRMA_HEAD_YAW}",
-                          "-vrmaHeadCounter", f"{core.VRMA_HEAD_COUNTER}"]
+                          "-cameraPullbackZ", f"{VRMA_PULLBACK}"] + core.vrma_unity_args()
             core._retry("Step5 Unity録画", core.record_with_unity,
                         wav_path, webm_path, emotion_path,
                         extra_args=extra,
@@ -605,7 +625,7 @@ def main(argv=None):
                 print(f"[サムネイル] 生成に失敗しました（投稿は続行）: {e}")
 
         # ── Step 8: 投稿
-        if os.getenv("SKIP_YOUTUBE") == "true" or args.preview:
+        if core.env_flag("SKIP_YOUTUBE") or args.preview:
             print("[YouTube] スキップ")
         else:
             _upload(quiz, script, mp4_path, thumbnail_path if thumb_ok else "")
@@ -655,7 +675,7 @@ def _upload(quiz, script, mp4_path, thumbnail_path):
                  "theme": quiz.get("カテゴリ", "")},
             ])
             notify_discord(yt_url, title)
-        if os.getenv("QUIZ_NO_CONSUME", "").lower() == "true":
+        if core.env_flag("QUIZ_NO_CONSUME"):
             print("[クイズ] QUIZ_NO_CONSUME=true のため消費を記録しません")
         else:
             quiz_data.mark_used(quiz["id"], yt_url)

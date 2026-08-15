@@ -37,7 +37,13 @@ botたん動画パイプライン 共通処理
   VRMA_YAW_LIMIT      : 上体の向き(ヨー)の上限[度] (既定 35。0で正面固定)
   VRMA_HEAD_YAW       : クリップ由来の首の横振りの上限[度] (既定 15。0で無効)
   VRMA_HEAD_COUNTER   : 上体が向いたぶんを首で打ち消す割合 (既定 0.8)
+  VRMA_KEEP_IDLE_HANDS: 指・親指・つま先を生成モーションで上書きしない (既定 1=有効)
+  VRMA_ELBOW_BEND     : 肘を常時わずかに曲げる量[度] (既定 8)
+  VRMA_WRIST_BEND     : 手首を常時わずかに曲げる量[度] (既定 6)
+  VRMA_HEAD_TILT      : 首を常時わずかに傾ける量[度] (既定 4)
+  VRMA_SMOOTH         : 生成モーションの平滑化の時定数[秒] (既定 0.10。0で無効)
   BGM_PATH            : BGM音声ファイルのパス (省略可)
+  （真偽値の環境変数は env_flag() で読むこと。TRUE / 1 / yes も真として扱う）
   DB_HOST/DB_PORT/DB_NAME/DB_USER/DB_PASSWORD : PostgreSQL接続情報
 """
 
@@ -65,15 +71,41 @@ _JST = timezone(timedelta(hours=9))
 # 設定
 # ──────────────────────────────────────────────
 
+def env_flag(name: str, default: bool = False) -> bool:
+    """真偽値の環境変数を読む。
+
+    `SKIP_YOUTUBE=TRUE` のような大文字や `1` / `yes` も受け付ける。
+    以前は `os.getenv("SKIP_YOUTUBE") == "true"` と完全一致で見ていたため、
+    **TRUE を渡したのにスキップされず動画が公開された**（2026-08-15）。
+    真偽値の環境変数は必ずこれを通すこと。
+    """
+    v = os.getenv(name)
+    if v is None or v.strip() == "":
+        return default
+    return v.strip().lower() in ("true", "1", "yes", "on")
+
+
+
 VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
 VOICEVOX_SPEAKER = int(os.getenv("VOICEVOX_SPEAKER", "8"))
+# 動画冒頭のフック（掴みの一言）だけに使う合成パラメータ。
+# ゆっくり・抑揚強め・大きめ・少し高めにして、本編の語りと声色を変える。
+# 夜版は Thumbnail の一言（generate_voice の intro_text）、
+# 朝版は question_intro の1文目（掛け声）に当てる。
+# 話者(VOICEVOX_SPEAKER)は変えない。同一キャラなので声そのものは共通。
+HOOK_VOICE_PARAMS = {
+    "speedScale":      0.85,
+    "intonationScale": 1.4,
+    "volumeScale":     1.3,
+    "pitchScale":      0.05,
+}
 UNITY_EXE        = os.getenv("UNITY_EXE", "/home/suibari/Unity/Hub/Editor/6000.0.76f1/Editor/Unity")
 UNITY_PROJECT    = os.getenv("UNITY_PROJECT", "/home/suibari/bottan-video")
 # 指定するとUnityへ -vrmaMotionDir が渡り、VrmaMotionPlayer が該当モーションを差し替える。
 # 未指定なら Unity 側は完全な no-op で、従来のMixamoモーションのまま。
 VRMA_MOTION_DIR  = os.getenv("VRMA_MOTION_DIR", "")
 BGM_PATH         = os.getenv("BGM_PATH", "")
-USE_LOCAL_LLM    = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
+USE_LOCAL_LLM    = env_flag("USE_LOCAL_LLM")
 
 # 動画の出力仕様（Unity Recorder の設定と一致させること）
 W, H = 1080, 1920
@@ -358,12 +390,7 @@ def generate_voice(sentences: list[dict], output_path: str, intro_text: str = ""
 
     try:
         if intro_text:
-            _synthesize(intro_text, intro_wav, {
-                "speedScale":      0.85,
-                "intonationScale": 1.4,
-                "volumeScale":     1.3,
-                "pitchScale":      0.05,
-            })
+            _synthesize(intro_text, intro_wav, HOOK_VOICE_PARAMS)
             part_paths.append(intro_wav)
 
         durations = []
@@ -758,7 +785,7 @@ ARDY_REPO          = os.getenv("ARDY_REPO", "/home/suibari/work/text-to-vrma")
 ARDY_PORT          = int(os.getenv("ARDY_PORT", "2337"))
 # true にすると既にポートで動いているサーバーをそのまま使う（開発時用）。
 # 既定は false で、古いサーバーは落として起動し直す
-ARDY_REUSE         = os.getenv("ARDY_REUSE", "false").lower() == "true"
+ARDY_REUSE         = env_flag("ARDY_REUSE")
 ARDY_READY_TIMEOUT = float(os.getenv("ARDY_READY_TIMEOUT", "600"))
 # 3秒のモーションで実測3〜4秒。ただしGPUが混んでいると20秒、稀に140秒まで伸びる。
 # さらに長時間アイドルだったサーバーは最初のリクエストで固まることがある
@@ -785,8 +812,12 @@ ARDY_MIN_AVAIL_GB = float(os.getenv("ARDY_MIN_AVAIL_GB", "13"))
 ARDY_CFG = float(os.getenv("ARDY_CFG", "3.0"))
 # 腕の開き具合[度]（0〜20）。モーションではなく静的なオフセットで、
 # 実測で 6→12→18 が腕の角度 70→64→58度（体側から離れる方向）に対応した。
-# 腕が体に張り付いて見えるのを緩和するため既定より少し開く
-ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "12"))
+# 腕が体に張り付いて見えるのを緩和するため既定(6)より少し開く。
+#
+# 12 だと脇が開いて男性的に見えるという指摘があったので 8 に下げた（2026-08-15）。
+# 0 にはしないこと。リアル体型のモーキャプをアニメ体型に当てる都合で、
+# 開きが足りないと腕（袖）が胴にめり込む（retarget.py の ARM_SPREAD_SIGN 参照）
+ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "8"))
 # セグメントのつなぎ目のクロスフェード長[秒]。server.py の既定は6フレーム(20fps=0.3秒)で、
 # 独立生成された別ポーズ同士を繋ぐには短く、「スッと切り替わった」ように見えていた。
 # server.py 側は smoothstep で混ぜるので窓の両端で速度が0になる。
@@ -867,6 +898,58 @@ VRMA_YAW_LIMIT    = float(os.getenv("VRMA_YAW_LIMIT", "35"))
 VRMA_HEAD_YAW     = float(os.getenv("VRMA_HEAD_YAW", "15"))
 VRMA_HEAD_COUNTER = float(os.getenv("VRMA_HEAD_COUNTER", "0.8"))
 
+# ── 女の子らしい所作にするための調整（2026-08-15）
+#
+# VRMA_KEEP_IDLE_HANDS: 指・親指・つま先をクリップで上書きせず、VRMモデルの
+#   Idle ポーズを残す。1=有効。
+#   .vrma の骨格には親指とつま先のボーンが無く（vrmaBuilder.js の SKELETON）、
+#   人差し指〜小指も ARDY が出力しないので固定カール(14/17/10度)が焼き込まれている
+#   だけ。Unity は全95 muscle を無条件に混ぜていたので、生成モーション区間
+#   （＝ほぼ全編）でモデル本来の手のポーズが汎用の固定ポーズに置き換わり、
+#   親指は Unity 既定(=0)で伸びたまま固定されていた。
+#
+# VRMA_ELBOW_BEND / VRMA_WRIST_BEND / VRMA_HEAD_TILT: 常時かける姿勢のバイアス[度]。
+#   肘がピンと伸びた腕・真っ直ぐな手首・傾かない首は男性的に見える。
+#   ARDY 側にこれを指示する手段が無い（プロンプトに書いても動かない）ので、
+#   再生側で足す。符号付きなので、向きが逆なら負値を入れる。
+#
+# VRMA_SMOOTH: クリップのポーズを時間方向に平滑化する時定数[秒]（一次ローパス）。
+#   角ばった・キビキビしすぎる動きの角を丸める。
+#   実測（0.10秒・フレーム間差分）: 動き量 1.659→1.626（-2%）に対して
+#   二階差分＝カクつきは 0.733→0.265（-64%）。**振幅はほぼ落ちない。**
+#   代償は位相の遅れで、0.10秒 のとき約0.13秒ぶんモーションが後ろにずれる
+#   （遅れは時定数に比例する）。話す内容との同期が気になるなら下げること。
+VRMA_KEEP_IDLE_HANDS = int(os.getenv("VRMA_KEEP_IDLE_HANDS", "1"))
+VRMA_ELBOW_BEND      = float(os.getenv("VRMA_ELBOW_BEND", "8"))
+VRMA_WRIST_BEND      = float(os.getenv("VRMA_WRIST_BEND", "6"))
+VRMA_HEAD_TILT       = float(os.getenv("VRMA_HEAD_TILT", "4"))
+VRMA_SMOOTH          = float(os.getenv("VRMA_SMOOTH", "0.10"))
+
+
+def vrma_unity_args() -> list[str]:
+    """生成モーションの見た目を決める Unity 引数をまとめて作る。
+
+    朝版・夜版で同じ値を使うので1か所にまとめてある（別々に書くと片方だけ
+    直して食い違う）。VrmaMotionPlayer 側の既定値はすべて「従来どおり」なので、
+    切り分けたいときはこの戻り値を渡さなければ改修前の見た目に戻る。
+    """
+    return [
+        # カメラを引いた画に見合う大きさにする
+        "-vrmaGain", f"{VRMA_GAIN}",
+        "-vrmaHipsY", f"{VRMA_HIPS_Y}",
+        # 体の向き・傾き。0 にすれば従来どおり正面固定に戻る
+        "-vrmaBodyTilt", f"{VRMA_BODY_TILT}",
+        "-vrmaYawLimit", f"{VRMA_YAW_LIMIT}",
+        "-vrmaHeadYaw", f"{VRMA_HEAD_YAW}",
+        "-vrmaHeadCounter", f"{VRMA_HEAD_COUNTER}",
+        # 女の子らしい所作にするための調整。0 にすればそれぞれ無効になる
+        "-vrmaKeepIdleHands", f"{VRMA_KEEP_IDLE_HANDS}",
+        "-vrmaElbowBend", f"{VRMA_ELBOW_BEND}",
+        "-vrmaWristBend", f"{VRMA_WRIST_BEND}",
+        "-vrmaHeadTilt", f"{VRMA_HEAD_TILT}",
+        "-vrmaSmooth", f"{VRMA_SMOOTH}",
+    ]
+
 # 実際の動画で破綻が確認できた動作。ここに入れる基準は「録画して目で見て駄目だったもの」。
 # ARDYはシードで出力が大きく変わるので、単発生成の数値では判断しないこと。
 #
@@ -931,15 +1014,20 @@ def reject_unsafe_motions(motions: list[dict], label: str = "") -> list[dict]:
 #
 # 「…して、正面に戻る」という往復の形だけが効いた。sways / shakes は対照と差が無い
 # ので、待機動作からもプロンプトの例からも外した。
+#
+# 主語は "A person / their" ではなく "A woman / her" にしてある（2026-08-15）。
+# 動きが男っぽいという指摘への対処。ARDY はテキスト条件付きの拡散モデルなので、
+# 主語の性別で分布が動くことを期待している。上の実測値は "A person / their" 版の
+# ものなので、書き換えるときは振幅が落ちていないか測り直すこと。
 VRMA_IDLE_MOTIONS = [
-    "A person stands in place and opens both arms out to the sides at chest height.",
-    "A person stands in place and leans their upper body to their left, then straightens up.",
-    "A person stands in place and repeatedly nods their head down and up.",
-    "A person stands in place and keeps tilting their head from one shoulder to the other.",
-    "A person stands in place and clasps both hands together in front of their chest.",
-    "A person stands in place and brings one hand up to their chin.",
-    "A person stands in place and turns their upper body to their right, then back to the front.",
-    "A person stands in place and leans their upper body to their left, then straightens up.",
+    "A woman stands in place and opens both arms out to the sides at chest height.",
+    "A woman stands in place and leans her upper body to her left, then straightens up.",
+    "A woman stands in place and repeatedly nods her head down and up.",
+    "A woman stands in place and keeps tilting her head from one shoulder to the other.",
+    "A woman stands in place and clasps both hands together in front of her chest.",
+    "A woman stands in place and brings one hand up to her chin.",
+    "A woman stands in place and turns her upper body to her right, then back to the front.",
+    "A woman stands in place and raises one hand straight above her head.",
 ]
 
 
@@ -952,7 +1040,7 @@ ARDY_MEM_WAIT_SEC = float(os.getenv("ARDY_MEM_WAIT_SEC", "360"))
 # true にすると生成前に ollama のモデルをアンロードさせる。
 # ollama は次のリクエストで自動的に読み直すので停止はしないが、
 # そちらのサービスの次回応答が数秒遅くなる。既定は無効（他サービスに触らない）
-ARDY_FREE_OLLAMA = os.getenv("ARDY_FREE_OLLAMA", "false").lower() == "true"
+ARDY_FREE_OLLAMA = env_flag("ARDY_FREE_OLLAMA")
 OLLAMA_URL       = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
 
@@ -1345,6 +1433,35 @@ def dedupe_vrma_segments(segments: list[dict], window: int = 4) -> list[dict]:
     return out
 
 
+# 指示文の先頭を "A woman stands in place and ..." に揃える正規表現。
+# 「A <なにか> stands in place [facing forward] [and|.]」までを丸ごと拾う
+_MOTION_PREFIX_RE = re.compile(
+    r"^\s*an?\s+\w+(\s+\w+)?\s+stands?\s+in\s+place"
+    r"(\s+facing\s+forward)?\s*(and\s+|,\s*|\.\s*)?", re.I)
+
+MOTION_SUBJECT = "A woman stands in place and "
+
+
+def normalize_motion_text(text: str) -> str:
+    """モーション指示文の主語を "A woman stands in place and ..." に揃える。
+
+    プロンプトで「必ずこの形で始める」と指示しているが、**LLM は普通に破る**。
+    実測（2026-08-12 / 08-15 の朝版）では主語ごと落として
+    `raises one hand up to her chin` のような断片を返しており、
+    ARDY には主語なしの文が渡っていた。禁止語と同じくコード側を最後の砦にする。
+
+    主語が女性であることは ARDY の条件付けに効かせたい要素なので、
+    `A person` と書かれていた場合も含めて書き換える。
+    """
+    text = (text or "").strip()
+    if not text:
+        return text
+    body = _MOTION_PREFIX_RE.sub("", text).strip()
+    if not body:                      # 主語だけで中身が無いなら捨てる
+        return ""
+    return MOTION_SUBJECT + body[0].lower() + body[1:]
+
+
 def plan_vrma_from_sentences(spans: list[dict], window_start: float, window_end: float,
                              max_total: int = VRMA_MAX_SEGMENTS_TOTAL) -> list[dict]:
     """文ごとのモーションを、その文が読まれる時刻に置くセグメント列にする。
@@ -1375,7 +1492,7 @@ def plan_vrma_from_sentences(spans: list[dict], window_start: float, window_end:
             end = min(float(sp["end"]), window_end)
             if end - start <= 0.05:
                 continue
-            text = (sp.get("motion") or "").strip()
+            text = normalize_motion_text(sp.get("motion"))
             if not text or VRMA_BANNED_RE.search(text):
                 if text and not quiet:
                     print(f"[モーション] 除外: {text[:70]}")

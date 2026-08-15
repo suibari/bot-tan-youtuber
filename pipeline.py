@@ -52,7 +52,7 @@ from core import (  # noqa: F401
     VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD,
     VRMA_GAIN, VRMA_HIPS_Y, VRMA_SEG_TARGET_SEC, VRMA_MAX_SEGMENTS_TOTAL,
     VRMA_BODY_TILT, VRMA_YAW_LIMIT, VRMA_HEAD_YAW, VRMA_HEAD_COUNTER,
-    plan_vrma_from_sentences,
+    plan_vrma_from_sentences, vrma_unity_args, env_flag,
     esc_drawtext, base_vf_parts, build_subtitle_filters, build_corner_filters,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
@@ -478,16 +478,7 @@ def main():
         if vrma_motions and VRMA_PULLBACK > 0:
             pullback_at = max(corners[0]["start"], HOOK_MOTION_SEC) if corners else HOOK_MOTION_SEC
             extra = ["-cameraPullbackAt", f"{pullback_at:.2f}",
-                     "-cameraPullbackZ", f"{VRMA_PULLBACK}",
-                     # カメラを引いた画に見合う大きさにする。
-                     # 気に入らなければこの2つを外すだけで従来の見た目に戻る
-                     "-vrmaGain", f"{VRMA_GAIN}",
-                     "-vrmaHipsY", f"{VRMA_HIPS_Y}",
-                     # 体の向き・傾き。0 にすれば従来どおり正面固定に戻る
-                     "-vrmaBodyTilt", f"{VRMA_BODY_TILT}",
-                     "-vrmaYawLimit", f"{VRMA_YAW_LIMIT}",
-                     "-vrmaHeadYaw", f"{VRMA_HEAD_YAW}",
-                     "-vrmaHeadCounter", f"{VRMA_HEAD_COUNTER}"]
+                     "-cameraPullbackZ", f"{VRMA_PULLBACK}"] + vrma_unity_args()
         _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
                extra_args=extra or None,
                catch=(RuntimeError, TimeoutError), delay=15)
@@ -506,7 +497,7 @@ def main():
         # Step 6: YouTubeアップロード
         title = build_title(thumbnail_text)
         description = build_description()
-        if os.getenv("SKIP_YOUTUBE") != "true":
+        if not env_flag("SKIP_YOUTUBE"):
             yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description, thumbnail_path)
             if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
                 corners_metadata = [

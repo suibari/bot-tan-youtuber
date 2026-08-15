@@ -146,19 +146,19 @@ def build_quiz_user_prompt(quiz: dict) -> str:
     例: 「知らなくて大丈夫だよ」→ 両手を胸の前で合わせて落ち着かせる動き
 
   書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
-  - 必ず "A person stands in place" で始める。
+  - 必ず "A woman stands in place" で始める。
     **前後左右への移動は書かない**（水平方向の移動は再生側で捨てられるため、
     歩いてもその場で足踏みしているようにしか見えない）。
     ただし**その場での体の向き・傾きは使ってよい**（下記）
   - **腕だけでなく上体も使うこと**。腕しか動かないと立ち絵に見える。
     体をひねる・傾ける動きは再生側で角度を制限してあるので、書いても顔は正面に残る。
     **「…して、正面に戻る」という往復の形で書くこと**（実測でこの形だけが効いた）:
-      turns their upper body to their right, then back to the front /
-      leans their upper body to their left, then straightens up /
-      twists their torso to one side, then returns to center
+      turns her upper body to her right, then back to the front /
+      leans her upper body to her left, then straightens up /
+      twists her torso to one side, then returns to center
   - **下半身を使う動作は禁止**。キャラはスカートを履いていて、カメラが正面・腰の高さに
     あるため、しゃがむ・膝を曲げる・跳ぶ・座る動作は下着が映って公開できない。
-    禁止例: jump / hop / leap / squat / crouch / kneel / sit / bend their knees /
+    禁止例: jump / hop / leap / squat / crouch / kneel / sit / bend her knees /
     spring up。**大きく動かすのは腕・上体・首だけにすること**
   - **拍手は書かない**。モーション生成AIが拍手を描けず、手が胸の前で中途半端に
     往復するだけになり、手を震わせている画に見える（実測）
@@ -177,20 +177,20 @@ def build_quiz_user_prompt(quiz: dict) -> str:
   - **同じ動作を何度も使わない**。文ごとに内容に合わせて変えること
   - explanation の動きは**このクイズの題材そのものを体で表現する**。
     どのクイズでも使い回せる動きにしない
-    （例: 猫がテーマ → raises both hands beside their face like cat paws）
+    （例: 猫がテーマ → raises both hands beside her face like cat paws）
 
   **使ってはいけない動作**（実測で不自然な震えが出た）:
     頬に手を添える / 胸に手を当てる / 腕を組む / 拍手
 
   よく使う形（この通りでなくてよい。内容に合わせてアレンジすること）:
-    raises both arms straight up above their head / opens both arms out to the sides
-    at chest height / raises one hand straight above their head / raises both fists
-    up to their chest / waves one hand gently beside their face / raises one index
-    finger beside their face / clasps both hands together in front of their chest /
-    tilts their head slowly toward their right shoulder / brings one hand up to
-    their chin / nods their head down to their chest /
-    turns their upper body to their right, then back to the front /
-    leans their upper body to their left, then straightens up
+    raises both arms straight up above her head / opens both arms out to the sides
+    at chest height / raises one hand straight above her head / raises both fists
+    up to her chest / waves one hand gently beside her face / raises one index
+    finger beside her face / clasps both hands together in front of her chest /
+    tilts her head slowly toward her right shoulder / brings one hand up to
+    her chin / nods her head down to her chest /
+    turns her upper body to her right, then back to the front /
+    leans her upper body to her left, then straightens up
 
 重要：合計の尺は55秒以内。各パートの文字数の目安を大きく超えないこと。
 """
@@ -211,25 +211,25 @@ def build_fallback_script(quiz: dict) -> dict:
         ],
         "answer_reveal": [
             {"text": f"正解は、{ans}の{answer_text(quiz)}！", "valence": 0.9, "arousal": 0.9,
-             "motion": "A person stands in place and raises one hand straight above their head."},
+             "motion": "A woman stands in place and raises one hand straight above her head."},
         ],
         "explanation": [
             {"text": quiz["解説"], "valence": 0.7, "arousal": 0.0,
-             "motion": "A person stands in place and raises one index finger beside their face."},
+             "motion": "A woman stands in place and raises one index finger beside her face."},
         ],
         "affirmation": [
             {"text": "知らなかったってことは、今日ひとつ知れたってことだよ。", "valence": 1.0, "arousal": 0.2,
-             "motion": "A person stands in place and clasps both hands together in front of their chest."},
+             "motion": "A woman stands in place and clasps both hands together in front of her chest."},
             {"text": "それってすごく素敵なことだと思うんだ。",                 "valence": 1.0, "arousal": 0.3,
-             "motion": "A person stands in place and opens both arms out to the sides at chest height."},
+             "motion": "A woman stands in place and opens both arms out to the sides at chest height."},
         ],
         "thumbnail_text": quiz["問題"][:20],
         "title_hook":     quiz["問題"][:25],
         # LLMが落ちたときは題材に紐づけられないので、どのクイズでも成立する汎用動作にする
         "motions": {
             "think": [
-                "A person stands in place and brings one hand up to their chin.",
-                "A person stands in place and turns their upper body to their right, then back to the front.",
+                "A woman stands in place and brings one hand up to her chin.",
+                "A woman stands in place and turns her upper body to her right, then back to the front.",
             ],
         },
     }

@@ -51,7 +51,7 @@ _NIGHT_OUTPUT_RULES = """
       "section": "OpeningAffirmation",
       "sentences": [
         {"text": "文章1", "valence": 0.8, "arousal": 0.4,
-         "motion": "A person stands in place and ..."},
+         "motion": "A woman stands in place and ..."},
         ...
       ]
     },
@@ -83,19 +83,19 @@ _NIGHT_OUTPUT_RULES = """
   例: 「どっちが勝つかドキドキしてた」→ 両手を口元に近づけて見守る動き
 
 書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
-- 必ず "A person stands in place" で始める。
+- 必ず "A woman stands in place" で始める。
   **前後左右への移動は書かない**（水平方向の移動は再生側で捨てられるため、
   歩いてもその場で足踏みしているようにしか見えない）。
   ただし**その場での体の向き・傾きは使ってよい**（下記）
 - **腕だけでなく上体も使うこと**。腕しか動かないと立ち絵に見える。
   体をひねる・傾ける動きは再生側で角度を制限してあるので、書いても顔は正面に残る。
   **「…して、正面に戻る」という往復の形で書くこと**（実測でこの形だけが効いた）:
-    turns their upper body to their right, then back to the front /
-    leans their upper body to their left, then straightens up /
-    twists their torso to one side, then returns to center
+    turns her upper body to her right, then back to the front /
+    leans her upper body to her left, then straightens up /
+    twists her torso to one side, then returns to center
 - **下半身を使う動作は禁止**。キャラはスカートを履いていて、カメラが正面・腰の高さに
   あるため、しゃがむ・膝を曲げる・跳ぶ・座る動作は下着が映って公開できない。
-  禁止例: jump / hop / leap / squat / crouch / kneel / sit / bend their knees /
+  禁止例: jump / hop / leap / squat / crouch / kneel / sit / bend her knees /
   spring up。**大きく動かすのは腕・上体・首だけにすること**
 - **拍手は書かない**。モーション生成AIが拍手を描けず、手が胸の前で中途半端に
   往復するだけになり、手を震わせている画に見える（実測）
@@ -110,14 +110,14 @@ _NIGHT_OUTPUT_RULES = """
 - 同じ動作を何度も使わない。文ごとに内容に合わせて変えること
 
 よく使う形（この通りでなくてよい。内容に合わせてアレンジすること）:
-  raises both arms straight up above their head / opens both arms out to the sides
-  at chest height / raises one hand straight above their head / waves one hand
-  gently beside their face / raises one index finger beside their face /
-  clasps both hands together in front of their chest / tilts their head slowly
-  toward their right shoulder / brings one hand up to their chin /
-  nods their head down to their chest /
-  turns their upper body to their right, then back to the front /
-  leans their upper body to their left, then straightens up
+  raises both arms straight up above her head / opens both arms out to the sides
+  at chest height / raises one hand straight above her head / waves one hand
+  gently beside her face / raises one index finger beside her face /
+  clasps both hands together in front of her chest / tilts her head slowly
+  toward her right shoulder / brings one hand up to her chin /
+  nods her head down to her chest /
+  turns her upper body to her right, then back to the front /
+  leans her upper body to her left, then straightens up
 
 【valence/arousalの指定ルール】
 各sentenceのvalenceとarousalは -1.0〜1.0 の実数で指定する。

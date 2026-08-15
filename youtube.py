@@ -10,6 +10,7 @@ YouTube API 関連処理モジュール
 
 import os
 import re
+import time
 import json
 import pickle
 import random
@@ -134,6 +135,43 @@ def fetch_youtube_comments() -> list[dict]:
         return []
 
 
+# アップロード直後は、動画がまだ処理中でサムネイルAPIから見つからない
+# （videoNotFound の404が返る）。待ち時間は毎回違うので、伸ばしながら数回試す。
+# 実測: 2026-08-15 の朝版で1回目が即座に404になり、例外が upload_to_youtube を
+# 突き抜けて URL が返らなかった。結果、動画は公開されたのに DB にも残らず、
+# クイズも消費済みにならないという最悪の不整合になった
+THUMBNAIL_RETRY_DELAYS = [5, 10, 20, 30, 60]
+
+
+def _set_thumbnail(youtube, video_id: str, thumbnail_path: str) -> bool:
+    """サムネイルを設定する。失敗しても例外は投げない。
+
+    **サムネイルの失敗でアップロードを失敗扱いにしてはいけない。**
+    動画そのものは既に公開されているので、URL を返さないと DB への記録も
+    Discord 通知も台帳の消費も飛んでしまう。サムネイルは後から手で設定できる。
+    """
+    from googleapiclient.http import MediaFileUpload
+
+    for i, delay in enumerate([0] + THUMBNAIL_RETRY_DELAYS):
+        if delay:
+            print(f"[YouTube] サムネイル設定を{delay}秒後に再試行します")
+            time.sleep(delay)
+        try:
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=MediaFileUpload(thumbnail_path, mimetype="image/png")
+            ).execute()
+            print("[YouTube] サムネイル設定完了"
+                  + (f"（{i}回再試行）" if i else ""))
+            return True
+        except Exception as e:
+            print(f"[YouTube] サムネイル設定に失敗: {e}")
+
+    print(f"[YouTube] サムネイルを設定できませんでした（動画は公開済み）。"
+          f"手動で設定してください: {thumbnail_path}")
+    return False
+
+
 def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_path: str = "") -> None:
     """YouTube Data API v3で動画をアップロードする"""
     print(f"[YouTube] アップロード中: {title}")
@@ -173,15 +211,11 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
                 print(f"[YouTube] アップロード進捗: {int(status.progress() * 100)}%")
 
         video_id = response['id']
+        url = f"https://youtube.com/watch?v={video_id}"
 
         if thumbnail_path and Path(thumbnail_path).exists():
-            youtube.thumbnails().set(
-                videoId=video_id,
-                media_body=MediaFileUpload(thumbnail_path, mimetype="image/png")
-            ).execute()
-            print(f"[YouTube] サムネイル設定完了")
+            _set_thumbnail(youtube, video_id, thumbnail_path)
 
-        url = f"https://youtube.com/watch?v={video_id}"
         print(f"[YouTube] アップロード完了 ({privacy}): {url}")
         return url
 
