@@ -615,9 +615,16 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
     sp.run(["pkill", "-9", "-f", "Unity -projectPath"], capture_output=True)
     sp.run(["pkill", "-9", "-f", "Xvfb :"], capture_output=True)
     time.sleep(3)
-    # 残留Xvfbロックファイルを削除
+    # 残留Xvfbロックファイルを削除。
+    # /tmp は sticky bit 付きなので、gdm の greeter (:1024/:1025) や bottan-live の
+    # Xorg :99 (root) が置いたロックは suibari では消せず EPERM になる。
+    # missing_ok=True は「無いとき」しか救わないため、握りつぶさないと録画前に落ちる。
+    # 他人のロックは触らなくて当然なので、消せないものは黙って飛ばす。
     for _lock_file in Path("/tmp").glob(".X*-lock"):
-        _lock_file.unlink(missing_ok=True)
+        try:
+            _lock_file.unlink(missing_ok=True)
+        except OSError:
+            pass
     # Unityプロジェクトのロックファイル・一時ファイルを削除
     for _unity_lock in [
         Path(UNITY_PROJECT) / "Temp" / "UnityLockFile",
