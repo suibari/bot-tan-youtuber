@@ -64,7 +64,10 @@ def render(energy: float) -> str:
     text-shadow: 0 2px 4px rgba(0,0,0,.75), 0 0 2px rgba(0,0,0,.9);
   }}
   .value {{
+    /* コメント1件が +0.1% なので小数第一位まで出す。整数だと変化が見えない */
     font-size: 24px; font-weight: 800; color: #fff; line-height: 1;
+    font-variant-numeric: tabular-nums;   /* 桁が動いても幅が揺れない */
+    letter-spacing: -.01em;
     text-shadow: 0 2px 4px rgba(0,0,0,.75), 0 0 2px rgba(0,0,0,.9);
   }}
   .value small {{ font-size: 13px; font-weight: 700; opacity: .85; margin-left: 1px; }}
@@ -92,7 +95,7 @@ def render(energy: float) -> str:
   <div class="wrap">
     <div class="head">
       <span class="label">ENERGY</span>
-      <span class="value">{energy:.0f}<small>%</small></span>
+      <span class="value">{energy:.1f}<small>%</small></span>
     </div>
     <div class="track">
       <div class="fill"></div>
