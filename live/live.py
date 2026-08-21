@@ -34,7 +34,7 @@ import voice
 from config import (
     DRY_RUN, ENERGY_REFRESH_SEC, FILLER_IDLE_SEC, IDLE_ENABLED, LIVE_CLOSING_HHMM,
     LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
-    SKIP_ARDY, WORK_DIR, ensure_dirs,
+    SKIP_ARDY, UNITY_PROJECT, WORK_DIR, ensure_dirs,
 )
 
 # LLM が落ちたときに使う定型。無言になるよりはよい
@@ -128,6 +128,9 @@ class LiveSession:
         import obs as obs_mod
         obs_mod.launch()
         self.obs = obs_mod.Obs().connect()
+        # Unity は prepare() で起動済み。窓の ID もタイトルも起動のたびに変わるので、
+        # シーンに保存されたキャプチャ先をここで今の窓へ合わせる
+        self.obs.bind_window_capture(UNITY_PROJECT)
         return self.obs
 
     # ── 配信枠 ────────────────────────────────────────
@@ -496,9 +499,14 @@ class LiveSession:
                 print(f"[終了] 配信記録を残せません: {e}")
 
         if self.obs is not None:
-            print(f"[終了] OBS 統計: {self.obs.stream_stats()}")
-            self.obs.stop_stream()
-            self.obs.disconnect()
+            # OBS を配信中に手で起動し直すとここの websocket は死んでいる。
+            # その後の Unity と ARDY の後始末まで巻き込まれないよう握りつぶす
+            try:
+                print(f"[終了] OBS 統計: {self.obs.stream_stats()}")
+                self.obs.stop_stream()
+                self.obs.disconnect()
+            except Exception as e:
+                print(f"[終了] OBS の後片付けに失敗（続行します）: {e}")
 
         self.unity.stop()
         self.ardy.stop()

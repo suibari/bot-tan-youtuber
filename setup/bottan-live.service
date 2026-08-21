@@ -11,6 +11,13 @@ User=__USER__
 Group=__USER__
 WorkingDirectory=__INSTALL_DIR__
 ExecStart=__INSTALL_DIR__/run_live.sh
+# flatpak の OBS は、セッションバス越しでないと PulseAudio へ橋を架けられない。
+# systemd から起動すると DBUS_SESSION_BUS_ADDRESS が無いので
+# 「pulse-input: Unable to get server info !」となり、映像だけの無音配信になる。
+# ログインセッションの値をそのまま渡す（__USER__ がデスクトップにログインしている
+# 前提。していないなら loginctl enable-linger __USER__ を入れておくこと）
+Environment=XDG_RUNTIME_DIR=/run/user/__UID__
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/__UID__/bus
 # 20:40 起動で 22:00 終了。ARDY の読み込み4〜5分と flock の待ちを含めて余裕を見る
 TimeoutStartSec=6000
 # 配信が落ちたら自動で上げ直さない。中途半端な時刻に配信枠が増えるほうが困る

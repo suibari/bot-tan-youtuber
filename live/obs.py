@@ -7,6 +7,7 @@ OBS のシーンとして事前に手で組んでおく。毎回プログラム�
 
 import configparser
 import os
+import re
 import shlex
 import signal
 from pathlib import Path
@@ -19,6 +20,40 @@ import obsws_python as obs
 from config import (OBS_HOST, OBS_PORT, OBS_PASSWORD, OBS_LAUNCH, OBS_COMMAND,
                     OBS_COLLECTION, OBS_PROFILE, LIVE_DISPLAY,
                     STREAM_VIDEO_KBPS, STREAM_AUDIO_KBPS)
+
+
+# xwininfo -root -tree の1行:
+#   0x600267 "Unity - bottan-video - SampleScene ...": ("Unity" "Unity")  2560x1440+0+0  +0+0
+_WINDOW_RE = re.compile(
+    r'^\s*(0x[0-9a-fA-F]+)\s+"(.+)":\s+\("[^"]*"\s+"([^"]*)"\)\s+(\d+)x(\d+)')
+
+
+def find_window(title_part: str, display: str = LIVE_DISPLAY,
+                min_width: int = 640) -> tuple[int, str, str] | None:
+    """display 上でタイトルに title_part を含む一番大きい窓を返す。
+
+    Unity は 10x10 のダミー窓も作るので、小さすぎるものは除く。
+    """
+    try:
+        out = subprocess.run(["xwininfo", "-root", "-tree"],
+                             env={**os.environ, "DISPLAY": display},
+                             capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[OBS] {display} の窓を数えられません: {e}")
+        return None
+
+    best = None
+    for line in out.splitlines():
+        m = _WINDOW_RE.match(line)
+        if not m:
+            continue
+        wid, title, cls, w, h = m.groups()
+        if title_part not in title or int(w) < min_width:
+            continue
+        area = int(w) * int(h)
+        if best is None or area > best[0]:
+            best = (area, int(wid, 16), title, cls)
+    return best[1:] if best else None
 
 
 class ObsError(RuntimeError):
@@ -282,6 +317,56 @@ class Obs:
                   f"配信開始に失敗します（OBS を起動し直すと x264 になります）")
         else:
             print(f"[OBS] エンコーダ: x264 / 映像 {vb}kbps")
+
+    def bind_window_capture(self, unity_project: str) -> bool:
+        """ウィンドウキャプチャの参照先を、いま動いている Unity の窓に合わせる。
+
+        OBS はシーンに保存された「ウィンドウID + タイトル + クラス」で窓を探す。
+        ID は Unity を起動し直すたびに変わり、タイトルにはプロジェクト名が入る。
+        dev で組んだシーンをそのまま本番で使うと `bottan-video-dev` を探し続けて
+        見つからず、配信が真っ暗のまま流れる（2026-08-21 の配信がこれ）。
+        毎回ここで今の窓に張り替えるので、シーンを手で直す必要はない。
+        """
+        hint = f"Unity - {Path(unity_project).name} - "
+        found = find_window(hint)
+        if found is None:
+            print(f"[OBS] {LIVE_DISPLAY} に「{hint}」の窓が見つかりません。"
+                  f"シーンの設定のまま進みます")
+            return False
+        wid, title, cls = found
+        want = f"{wid}\r\n{title}\r\n{cls}"
+
+        try:
+            scene = self.client.get_current_program_scene()
+            scene_name = getattr(scene, "current_program_scene_name", None) or scene.scene_name
+            items = self.client.get_scene_item_list(scene_name).scene_items
+        except Exception as e:
+            print(f"[OBS] シーンを読めません（続行します）: {e}")
+            return False
+
+        bound = 0
+        for item in items:
+            source = item["sourceName"]
+            try:
+                settings = self.client.get_input_settings(source)
+                if settings.input_kind != "xcomposite_input":
+                    continue
+                current = settings.input_settings.get("capture_window", "")
+                if current == want:
+                    print(f"[OBS] ウィンドウキャプチャ「{source}」はすでに今の Unity を見ています")
+                    bound += 1
+                    continue
+                new = dict(settings.input_settings)
+                new["capture_window"] = want
+                self.client.set_input_settings(source, new, overlay=True)
+                print(f"[OBS] ウィンドウキャプチャ「{source}」を今の Unity に張り替えました: "
+                      f"{title[:60]}")
+                bound += 1
+            except Exception as e:
+                print(f"[OBS] 「{source}」を張り替えられません（続行します）: {e}")
+        if not bound:
+            print("[OBS] シーンにウィンドウキャプチャがありません")
+        return bound > 0
 
     def set_stream_target(self, ingestion_address: str, stream_key: str) -> None:
         """YouTube から受け取った RTMP の宛先を設定する。"""

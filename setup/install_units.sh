@@ -17,6 +17,8 @@ fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="$(cd "$HERE/.." && pwd)"
 RUN_USER="${SUDO_USER:-$USER}"
+# ライブ配信の OBS が PulseAudio に繋ぐのに要る（bottan-live.service の Environment）
+RUN_UID="$(id -u "$RUN_USER")"
 
 for f in run.sh run_quiz.sh run_live.sh; do
     if [ ! -f "$INSTALL_DIR/$f" ]; then
@@ -25,11 +27,12 @@ for f in run.sh run_quiz.sh run_live.sh; do
     fi
 done
 
-echo "インストール先: $INSTALL_DIR (User=$RUN_USER)"
+echo "インストール先: $INSTALL_DIR (User=$RUN_USER, UID=$RUN_UID)"
 
 install_unit() {
     local name="$1"
     sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" -e "s|__USER__|$RUN_USER|g" \
+        -e "s|__UID__|$RUN_UID|g" \
         "$HERE/$name" > "/etc/systemd/system/$name"
     chmod 0644 "/etc/systemd/system/$name"
     echo "  配置: $name"
