@@ -3,8 +3,8 @@
 liveBroadcasts / liveStreams / bind / transition の一連を扱う。
 OBS へ渡す RTMP の URL とキーもここから取る。
 
-enableAutoStart / enableAutoStop は使わない。21:00 ちょうどに live へ遷移させ、
-22:00 に complete させたいので、遷移はこちらから明示的に行う。
+enableAutoStart は使わない。21:00 ちょうどに live へ遷移させたいので、開始は
+こちらから明示的に行う。終わりは enableAutoStop に任せる（下記 create() 参照）。
 """
 
 import time
@@ -92,9 +92,14 @@ class Broadcast:
                     "selfDeclaredMadeForKids": False,
                 },
                 "contentDetails": {
-                    # 遷移はこちらで制御する
+                    # 開始はこちらで制御する。OBS が送り始めた時点で live に
+                    # なってしまうと、20:41 から配信が始まってしまう
                     "enableAutoStart": False,
-                    "enableAutoStop": False,
+                    # 終わりは YouTube にも任せる。complete を投げ損ねると
+                    # （クォータ切れ、プロセスの異常終了、websocket の切断）
+                    # 枠が live のまま残り続けて、真っ暗な配信が終わらない。
+                    # OBS が送信を止めたら終わってよい
+                    "enableAutoStop": True,
                     "enableDvr": True,
                     "recordFromStart": True,
                     # ライブチャットが無いと配信の意味がない

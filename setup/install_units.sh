@@ -27,6 +27,18 @@ for f in run.sh run_quiz.sh run_live.sh; do
     fi
 done
 
+# systemd が向く先は「このスクリプトがどこに置かれているか」で決まる。
+# dev の worktree から実行すると本番のタイマーが dev を向いてしまい、
+# 配信が dev の Unity・限定公開で走る。意図してやるとき以外は止める
+if [[ "$(basename "$INSTALL_DIR")" == *-dev ]] && [ -z "${ALLOW_DEV:-}" ]; then
+    PROD_DIR="$(dirname "$INSTALL_DIR")/$(basename "$INSTALL_DIR" -dev)"
+    echo "$INSTALL_DIR は dev の worktree です。" >&2
+    echo "本番へ入れるなら本番のディレクトリで実行してください:" >&2
+    echo "    cd $PROD_DIR && sudo bash setup/install_units.sh" >&2
+    echo "dev を承知で入れるなら: sudo ALLOW_DEV=1 bash $0" >&2
+    exit 1
+fi
+
 echo "インストール先: $INSTALL_DIR (User=$RUN_USER, UID=$RUN_UID)"
 
 install_unit() {
