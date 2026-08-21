@@ -11,6 +11,7 @@ import random
 import threading
 
 import memory
+from bot_memory_client import BotMemoryClient
 
 
 class TopicRotator:
@@ -42,7 +43,7 @@ _HOBBY_TOPICS = [
     "いま書いてみたい本の話。誰かを励ます本を書きたいという夢について。",
 ]
 
-_KINDS = ["mood", "nagi", "short", "previous_live", "hobby", "hobby", "ask"]
+_KINDS = ["rag", "rag", "mood", "nagi", "short", "previous_live", "hobby", "hobby", "ask"]
 
 
 class FillerPlanner:
@@ -51,13 +52,17 @@ class FillerPlanner:
     DB アクセスは配信ループを止めないよう別スレッドで行い、結果をキャッシュする。
     """
 
-    def __init__(self):
+    def __init__(self, memory_client=None):
         self.rotator = TopicRotator(_KINDS)
         self.hobby = TopicRotator(_HOBBY_TOPICS)
         self._cache = {}
         self._lock = threading.Lock()
         self._used_nagi = set()
         self._used_prev = set()
+        self._used_rag = set()
+        self._rag_candidates = []
+        self._rag_refreshing = False
+        self._rag_client = memory_client or BotMemoryClient()
 
     def refresh_memory(self) -> dict:
         """DBから記憶を引き直す。数分に1回でよい。"""
@@ -82,8 +87,8 @@ class FillerPlanner:
         with self._lock:
             return dict(self._cache)
 
-    def next_topic(self) -> str:
-        """次のフリートークのお題を文字列で返す。"""
+    def next_topic(self) -> dict:
+        """次のお題と、そのお題が実際に参照する記憶IDを返す。"""
         mem = self.cache
         for _ in range(len(_KINDS)):
             kind = self.rotator.next()
@@ -91,23 +96,94 @@ class FillerPlanner:
             if hint:
                 return hint
         # DBが全滅していてもひとりごとは話せる
-        return self.hobby.next()
+        return {"hint": self.hobby.next(), "memory_ids": []}
 
-    def _build(self, kind: str, mem: dict) -> str:
+    def prefetch_rag(self, bot: dict, recent_comments=None,
+                     recent_replies=None) -> bool:
+        """フリートークのホットパスを止めず、次のRAG候補を先読みする。"""
+        with self._lock:
+            if self._rag_refreshing or not self._rag_client.enabled:
+                return False
+            self._rag_refreshing = True
+        comments = [
+            (item.get("text") or "").strip()
+            for item in (recent_comments or [])[-5:]
+            if isinstance(item, dict)
+        ]
+        query = "\n".join(filter(None, [
+            bot.get("mood", ""),
+            bot.get("status", ""),
+            *(recent_replies or [])[-3:],
+            *comments,
+        ]))[:1000]
+
+        def run():
+            try:
+                candidates = self._rag_client.search(
+                    query,
+                    exclude_document_ids=list(self._used_rag),
+                    limit=10,
+                )
+                with self._lock:
+                    self._rag_candidates = candidates
+            except Exception as error:
+                print(f"[filler] RAG先読みでエラー（従来話題へ戻します）: {error}")
+                with self._lock:
+                    self._rag_candidates = []
+            finally:
+                with self._lock:
+                    self._rag_refreshing = False
+
+        threading.Thread(target=run, daemon=True, name="bot-memory-prefetch").start()
+        return True
+
+    def record_usage(self, document_ids: list, output_ref: str = "") -> bool:
+        threading.Thread(
+            target=self._rag_client.record_usage,
+            args=(document_ids, output_ref),
+            daemon=True,
+            name="bot-memory-usage",
+        ).start()
+        return True
+
+    def _build(self, kind: str, mem: dict):
+        if kind == "rag":
+            with self._lock:
+                candidates = list(self._rag_candidates)
+            for candidate in candidates:
+                document_id = candidate.get("id")
+                if document_id in self._used_rag:
+                    continue
+                self._used_rag.add(document_id)
+                source = candidate.get("source") or "memory"
+                content = candidate.get("content", "").replace("\n", " ").strip()
+                if not content:
+                    continue
+                return {
+                    "hint": {
+                        "rag_source": source,
+                        "rag_content": content[:300],
+                    },
+                    "memory_ids": [document_id],
+                }
+            return None
+
         if kind == "hobby":
-            return self.hobby.next()
+            return {"hint": self.hobby.next(), "memory_ids": []}
 
         if kind == "ask":
-            return ("視聴者に話しかけて、コメントしやすい問いかけをして。"
-                    "答えやすくて、重くない話題にすること。")
+            return {"hint": ("視聴者に話しかけて、コメントしやすい問いかけをして。"
+                             "答えやすくて、重くない話題にすること。"),
+                    "memory_ids": []}
 
         if kind == "mood":
             acts = mem.get("activities") or []
             if not acts:
                 return ""
             act = acts[0]
-            return (f"さっきまで「{act.get('mood', '')}」をしていた話をして。"
-                    f"その様子を視聴者に伝えるように話すこと。")
+            return {"hint": (f"さっきまで「{act.get('mood', '')}」をしていた話をして。"
+                             f"その様子を視聴者に伝えるように話すこと。"),
+                    "memory_ids": []}
 
         if kind == "nagi":
             for post in (mem.get("nagi_posts") or []):
@@ -115,16 +191,18 @@ class FillerPlanner:
                 if not text or text in self._used_nagi:
                     continue
                 self._used_nagi.add(text)
-                return (f"Nagiで見かけた投稿に反応して。投稿の内容：「{text[:100]}」\n"
-                        f"投稿した人の名前は出さないこと。内容にだけ触れて全肯定して。")
+                return {"hint": (f"Nagiで見かけた投稿に反応して。投稿の内容：「{text[:100]}」\n"
+                                 f"投稿した人の名前は出さないこと。内容にだけ触れて全肯定して。"),
+                        "memory_ids": []}
             return ""
 
         if kind == "short":
             short = mem.get("latest_short") or {}
             if not short.get("title"):
                 return ""
-            return (f"昨日出したショート動画「{short['title']}」の話をして。"
-                    f"見てくれた人にお礼を言うこと。")
+            return {"hint": (f"昨日出したショート動画「{short['title']}」の話をして。"
+                             f"見てくれた人にお礼を言うこと。"),
+                    "memory_ids": []}
 
         if kind == "previous_live":
             for prev in (mem.get("previous_live") or []):
@@ -132,9 +210,9 @@ class FillerPlanner:
                 if not comment or comment in self._used_prev:
                     continue
                 self._used_prev.add(comment)
-                author = prev.get("author_name") or "誰か"
-                return (f"前の配信で {author} さんが「{comment[:60]}」って言ってたのを"
-                        f"思い出した、という話をして。")
+                return {"hint": (f"前の配信で「{comment[:60]}」っていう話が出たのを"
+                                 f"思い出した、という話をして。名前は出さないこと。"),
+                        "memory_ids": []}
             return ""
 
         return ""

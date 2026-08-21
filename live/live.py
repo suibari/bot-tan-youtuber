@@ -210,6 +210,7 @@ class LiveSession:
                 "lines": random.choice(FALLBACK_LINES),
                 "valence": 0.5, "arousal": 0.2,
                 "motion_category": "neutral", "motion_en": "",
+                "_fallback": True,
             }
 
     def _speak(self, reply: dict, tag: str = "", interruptible: bool = False) -> bool:
@@ -360,13 +361,18 @@ class LiveSession:
 
     def speak_filler(self) -> None:
         bot = self._bot_context()
+        topic = self.planner.next_topic()
         prompt = persona.build_filler_prompt(
-            self.planner.next_topic(), bot, self.planner.cache,
+            topic["hint"], bot, self.planner.cache,
             recent_replies=self.recent_replies,
         )
         # フリートークはコメントが来たら途中でやめる。最後まで喋りきってから
         # でないと反応できないのが、往復の遅さのいちばん大きな要因だった
-        self._speak(self._generate(prompt), tag="フリートーク", interruptible=True)
+        reply = self._generate(prompt)
+        spoken = self._speak(reply, tag="フリートーク", interruptible=True)
+        if spoken and topic["memory_ids"] and not reply.get("_fallback"):
+            output_ref = self.broadcast.broadcast_id if self.broadcast else "dry-run"
+            self.planner.record_usage(topic["memory_ids"], output_ref)
 
     def speak_scripted(self, instruction: str, tag: str) -> None:
         reply = self._generate(persona.build_scripted_prompt(instruction, self._bot_context()))
@@ -376,6 +382,7 @@ class LiveSession:
         closing_at = _today_at(LIVE_CLOSING_HHMM)
         last_housekeeping = 0.0
         last_memory_refresh = time.monotonic()
+        last_rag_refresh = 0.0
 
         self.speak_scripted(
             "配信のオープニングです。挨拶をして、今日も来てくれた人にお礼を言って、"
@@ -405,6 +412,14 @@ class LiveSession:
             if now - last_memory_refresh > 600:
                 self.planner.refresh_memory()
                 last_memory_refresh = now
+            if now - last_rag_refresh > 30:
+                recent_comments = list(self.poller.recent) if self.poller else []
+                self.planner.prefetch_rag(
+                    self._bot_context(),
+                    recent_comments=recent_comments,
+                    recent_replies=self.recent_replies,
+                )
+                last_rag_refresh = now
 
         self.speak_scripted(
             "配信のクロージングです。「botたん」という自分の名前を必ず言って、"

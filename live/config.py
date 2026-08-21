@@ -94,6 +94,9 @@ GEMINI_MODELS   = _llm.GEMINI_MODELS
 # ── DB（botたんの記憶） ───────────────────────────
 # ── biorhythm（energy） ──────────────────────────
 BIORHYTHM_URL = os.getenv("BIORHYTHM_URL", "http://localhost:3002")
+BIORHYTHM_MEMORY_API_URL = os.getenv("BIORHYTHM_MEMORY_API_URL", "").rstrip("/")
+BIORHYTHM_INTERNAL_SECRET = os.getenv("BIORHYTHM_INTERNAL_SECRET", "")
+BIORHYTHM_MEMORY_API_TIMEOUT_SEC = env_float("BIORHYTHM_MEMORY_API_TIMEOUT_SEC", 3.0)
 # フェーズ1では bsky-affirmative-bot を改修せず既存 type を流用する。
 # 将来 apps/biorhythm_server に live_comment を足したらここを差し替えるだけでよい
 ENERGY_TYPE_COMMENT = os.getenv("ENERGY_TYPE_COMMENT", "conversation")
