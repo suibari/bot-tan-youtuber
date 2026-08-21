@@ -99,14 +99,12 @@ GEMINI_MODELS   = _llm.GEMINI_MODELS
 
 # ── DB（botたんの記憶） ───────────────────────────
 # ── biorhythm（energy） ──────────────────────────
-BIORHYTHM_URL = os.getenv("BIORHYTHM_URL", "http://localhost:3002")
+# energy は共有DBの bot_state を読むだけ（live/energy.py 参照）。加算は
+# biorhythm_server が bottan_live.comments を見て自分でやるので、
+# 配信側から biorhythm_server の HTTP を叩くことはない
 BIORHYTHM_MEMORY_API_URL = os.getenv("BIORHYTHM_MEMORY_API_URL", "").rstrip("/")
 BIORHYTHM_INTERNAL_SECRET = os.getenv("BIORHYTHM_INTERNAL_SECRET", "")
 BIORHYTHM_MEMORY_API_TIMEOUT_SEC = env_float("BIORHYTHM_MEMORY_API_TIMEOUT_SEC", 3.0)
-# フェーズ1では bsky-affirmative-bot を改修せず既存 type を流用する。
-# 将来 apps/biorhythm_server に live_comment を足したらここを差し替えるだけでよい
-ENERGY_TYPE_COMMENT = os.getenv("ENERGY_TYPE_COMMENT", "conversation")
-
 # ── ARDY（モーション生成） ────────────────────────
 ARDY_PORT          = _ardy.ARDY_PORT
 ARDY_URL           = _ardy.ARDY_URL

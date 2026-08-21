@@ -1,7 +1,7 @@
 """energy ゲージの書き出し。
 
 OBS の「energy」ブラウザソース（320x80・画面左下）に file:// で読ませる HTML を書く。
-数値の出どころは energy.get_energy()（biorhythm_server → 落ちていれば DB）。
+数値の出どころは energy.get_energy()（共有DBの bot_state）。
 
 ブラウザソースはローカルファイルの変更を自前では監視しないので、HTML の側に
 「一定時間後に自分を読み直す」スクリプトを埋めてある。energy は分単位でしか

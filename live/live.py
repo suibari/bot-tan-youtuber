@@ -370,7 +370,8 @@ class LiveSession:
             return
 
         self.replied_count += 1
-        energy.add_comment_energy()
+        # energy はここでは足さない。下の memory.save_comment() が入れた行を
+        # biorhythm_server が拾って加算する（live/energy.py の説明を参照）
         response_text = " ".join(l["ja"] for l in reply["lines"])
         self.memory_writer.update_response(comment.message_id, response_text)
         try:

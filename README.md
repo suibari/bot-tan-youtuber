@@ -83,8 +83,8 @@ OBS のシーンはファイルを絶対パスで掴むので、これらをリ�
 ### energy ゲージ
 
 画面左下の `energy` ブラウザソースは `file://.../obs/energy.html` を読む。
-`live/gauge.py` が `energy.get_energy()`（biorhythm_server → 落ちていれば DB の
-`bot_state`）の値で HTML を書き直し、HTML 側に埋めたスクリプトが
+`live/gauge.py` が `energy.get_energy()`（共有DBの `bot_state`）の値で
+HTML を書き直し、HTML 側に埋めたスクリプトが
 `ENERGY_REFRESH_SEC`（既定30秒）ごとに自分を読み直す。
 **ブラウザソースはローカルファイルの変更を自前では監視しない**ので、この
 自己リロードが無いと数値が固まったままになる。
@@ -352,7 +352,7 @@ curl localhost:2338/status
 |---|---|
 | ARDY | プールのモーションだけで継続。プールも空なら Animator の Idle |
 | LLM | `FALLBACK_LINES` の定型で返す |
-| biorhythm_server | energy を DB の `bot_state` から読む |
+| biorhythm_server | 配信側は DB の `bot_state` を読むだけなので影響なし。落ちている間はコメントぶんの加算が溜まり、復帰時にまとめて入る |
 | チャット取得 | フリートークで場をつなぐ |
 | VOICEVOX | その回の発話を諦めて次へ。Discord に通知 |
 | Unity | 配信を終了する（映像が無いので続ける意味がない） |
@@ -431,7 +431,12 @@ pgvector も埋め込みテーブルも実在しない。`bsky-affirmative-bot` 
 
 ### energy
 
-フェーズ1では `bsky-affirmative-bot` を改修せず、既存の `conversation` type を
-流用している（`POST /energy` の `amount` はサーバ側で必ず無視され、実効値は
-サーバ定数）。将来 `live_comment` type を足したら `.env` の
-`ENERGY_TYPE_COMMENT` を差し替えるだけでよい。
+配信側は energy を**読むだけ**で、加算はしない。`memory.save_comment()` が
+`bottan_live.comments` に残した行を、`bsky-affirmative-bot` の biorhythm_server
+（`apps/biorhythm_server/src/liveCommentEnergySync.ts`）が15秒ごとに拾い、
+1件につき内部energy +10 を足して `bot_state.biorhythm.liveCommentEnergyCursor`
+を進める。
+
+配信側から `POST /energy` を投げると同じコメントで二重に加算されるので投げない。
+読みは `memory.get_biorhythm()` で `bot_state` を直接引く（内部スケール
+0〜10000 を 0〜100 に直して返す）。
