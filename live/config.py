@@ -104,7 +104,12 @@ GEMINI_MODELS   = _llm.GEMINI_MODELS
 # 配信側から biorhythm_server の HTTP を叩くことはない
 BIORHYTHM_MEMORY_API_URL = os.getenv("BIORHYTHM_MEMORY_API_URL", "").rstrip("/")
 BIORHYTHM_INTERNAL_SECRET = os.getenv("BIORHYTHM_INTERNAL_SECRET", "")
-BIORHYTHM_MEMORY_API_TIMEOUT_SEC = env_float("BIORHYTHM_MEMORY_API_TIMEOUT_SEC", 3.0)
+# 検索APIはクエリが長いほど遅くなる。サーバがクエリ全文を埋め込んだうえ、
+# pg_trgm の similarity と ilike をクエリ全文で全行に当てるため。
+# 実測（LAN内）: 100文字 1.9秒 / 300文字 3.2秒 / 600文字 5.2秒 / 1000文字 9.1秒
+BIORHYTHM_MEMORY_API_TIMEOUT_SEC = env_float("BIORHYTHM_MEMORY_API_TIMEOUT_SEC", 15.0)
+# 検索クエリの上限。長くしても当たりが良くなるわけではなく、遅くなるだけ
+BOT_MEMORY_QUERY_MAX_CHARS = env_int("BOT_MEMORY_QUERY_MAX_CHARS", 500)
 # ── ARDY（モーション生成） ────────────────────────
 ARDY_PORT          = _ardy.ARDY_PORT
 ARDY_URL           = _ardy.ARDY_URL

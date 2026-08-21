@@ -12,6 +12,7 @@ import threading
 
 import memory
 from bot_memory_client import BotMemoryClient
+from config import BOT_MEMORY_QUERY_MAX_CHARS
 
 
 class TopicRotator:
@@ -105,17 +106,22 @@ class FillerPlanner:
             if self._rag_refreshing or not self._rag_client.enabled:
                 return False
             self._rag_refreshing = True
+        # 1件ずつ切り詰めてから連結する。全体を後ろから切ると、配信が進んで
+        # mood と返答が長くなったぶんだけ直近のコメントが落ちてしまう
+        def clip(text, limit):
+            return (text or "").strip()[:limit]
+
         comments = [
-            (item.get("text") or "").strip()
-            for item in (recent_comments or [])[-5:]
+            clip(item.get("text"), 80)
+            for item in (recent_comments or [])[-4:]
             if isinstance(item, dict)
         ]
         query = "\n".join(filter(None, [
-            bot.get("mood", ""),
-            bot.get("status", ""),
-            *(recent_replies or [])[-3:],
+            clip(bot.get("mood"), 100),
+            clip(bot.get("status"), 40),
+            *(clip(reply, 80) for reply in (recent_replies or [])[-2:]),
             *comments,
-        ]))[:1000]
+        ]))[:BOT_MEMORY_QUERY_MAX_CHARS]
 
         def run():
             try:
