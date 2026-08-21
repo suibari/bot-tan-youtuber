@@ -22,6 +22,7 @@ import filler
 import idle
 import llm
 import memory
+import gauge
 import motion as motion_mod
 import notify
 import persona
@@ -31,8 +32,8 @@ import unity_client
 import unity_live
 import voice
 from config import (
-    DRY_RUN, FILLER_IDLE_SEC, IDLE_ENABLED, LIVE_CLOSING_HHMM, LIVE_END_HHMM,
-    LIVE_START_HHMM, SKIP_ARDY, WORK_DIR, ensure_dirs,
+    DRY_RUN, ENERGY_REFRESH_SEC, FILLER_IDLE_SEC, IDLE_ENABLED, LIVE_CLOSING_HHMM,
+    LIVE_END_HHMM, LIVE_START_HHMM, SKIP_ARDY, WORK_DIR, ensure_dirs,
 )
 
 # LLM が落ちたときに使う定型。無言になるよりはよい
@@ -69,6 +70,8 @@ class LiveSession:
         self.last_speech_at = 0.0
         self.started_at = None
         self._stopping = False
+        # energy ゲージを最後に描いた時刻。0 なので初回の _housekeeping で必ず描く
+        self._gauge_at = 0.0
 
     # ── 準備 ──────────────────────────────────────────
 
@@ -398,6 +401,14 @@ class LiveSession:
             subtitle.write_clock()
         except Exception:
             pass
+
+        # energy ゲージ。DB を引くので時計ほど頻繁には更新しない
+        if time.monotonic() - self._gauge_at > ENERGY_REFRESH_SEC:
+            self._gauge_at = time.monotonic()
+            try:
+                gauge.write(energy.get_energy())
+            except Exception:
+                pass
 
         # ARDY が作り終えたモーションを拾う。プールに入っているので
         # 次に pick したときから使われる

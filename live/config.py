@@ -135,6 +135,10 @@ SUBTITLE_JA  = SUBTITLE_DIR / "subtitle_ja.txt"
 SUBTITLE_EN  = SUBTITLE_DIR / "subtitle_en.txt"
 COMMENTS_TXT = SUBTITLE_DIR / "comments.txt"
 CLOCK_TXT    = SUBTITLE_DIR / "clock.txt"
+# energy ゲージ。OBS の「energy」ブラウザソースに file:// で読ませる
+ENERGY_HTML  = SUBTITLE_DIR / "energy.html"
+# ゲージを描き直す間隔[秒]。energy は分単位でしか動かないので短くしても意味がない
+ENERGY_REFRESH_SEC = env_int("ENERGY_REFRESH_SEC", 30)
 
 # ── 配信の振る舞い ────────────────────────────────
 # コメントがこの秒数途切れたらフリートークを挟む
@@ -165,3 +169,8 @@ def ensure_dirs() -> None:
     for f in (SUBTITLE_JA, SUBTITLE_EN, COMMENTS_TXT, CLOCK_TXT):
         if not f.exists():
             f.write_text("", encoding="utf-8")
+    # ブラウザソースは URL が 404 でも黙って空を出すだけだが、
+    # 最初の描画までゲージが出ないので、起動時に一度書いておく
+    if not ENERGY_HTML.exists():
+        import gauge
+        gauge.write(0.0)

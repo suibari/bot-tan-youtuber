@@ -73,11 +73,24 @@ OBS のシーンはファイルを絶対パスで掴むので、これらをリ�
 
 ```
 ~/.local/share/bottan-live/
-├── obs/     subtitle_ja.txt / subtitle_en.txt / comments.txt / clock.txt（実行時に書かれる）
+├── obs/     subtitle_ja.txt / subtitle_en.txt / comments.txt / clock.txt
+│            energy.html（すべて実行時に書かれる）
 └── bgm/     ohirusugi.mp3（data/bgm/ からのコピー。差し替えたら両方直すこと）
 ```
 
 `.env` の `SUBTITLE_DIR` がここを指す。本番と dev の両方で同じ値にしておくこと。
+
+### energy ゲージ
+
+画面左下の `energy` ブラウザソースは `file://.../obs/energy.html` を読む。
+`live/gauge.py` が `energy.get_energy()`（biorhythm_server → 落ちていれば DB の
+`bot_state`）の値で HTML を書き直し、HTML 側に埋めたスクリプトが
+`ENERGY_REFRESH_SEC`（既定30秒）ごとに自分を読み直す。
+**ブラウザソースはローカルファイルの変更を自前では監視しない**ので、この
+自己リロードが無いと数値が固まったままになる。
+
+色は energy で変わる: 70以上=橙 / 35以上=緑 / それ未満=青。
+背景が明るい日でも読めるよう、半透明のパネルを敷いてある。
 
 ## セットアップ
 
