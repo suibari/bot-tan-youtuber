@@ -7,6 +7,7 @@ enableAutoStart / enableAutoStop は使わない。21:00 ちょうどに live �
 22:00 に complete させたいので、遷移はこちらから明示的に行う。
 """
 
+import time
 from datetime import datetime, timedelta, timezone
 
 from config import YOUTUBE_PRIVACY
@@ -18,6 +19,11 @@ JST = timezone(timedelta(hours=9))
 # 配信枠のタイトルの決まり文句。後片付けで自分の作った枠だけを狙うために使う
 TITLE_MARK = "【全肯定botたん】"
 
+# 片付けてよい枠の状態。live / complete は実際に配信した枠なので触らない。
+# testStarting / testing も入れてあるのは、live へ遷移できずに終わった枠が
+# ready ではなくこの状態で残るため
+STALE_STATUSES = ("created", "ready", "testStarting", "testing")
+
 
 def cleanup_stale(title_mark: str = TITLE_MARK) -> int:
     """一度も live まで行かなかった自分の配信枠を消す。
@@ -25,7 +31,7 @@ def cleanup_stale(title_mark: str = TITLE_MARK) -> int:
     配信開始に失敗すると枠だけが `ready` のまま YouTube に残る。放っておくと
     毎晩ぶん溜まっていくので、新しい枠を作る前に掃除する。
 
-    消すのは lifeCycleStatus が created / ready のものだけ。live や complete、
+    消すのは lifeCycleStatus が STALE_STATUSES のものだけ。live や complete、
     つまり実際に配信した枠には触らない。タイトルも見て、このパイプラインが
     作った枠以外は対象外にする。
     """
@@ -35,7 +41,7 @@ def cleanup_stale(title_mark: str = TITLE_MARK) -> int:
                                    broadcastStatus="upcoming",
                                    broadcastType="all", maxResults=50).execute()
     for b in res.get("items", []):
-        if b["status"]["lifeCycleStatus"] not in ("created", "ready"):
+        if b["status"]["lifeCycleStatus"] not in STALE_STATUSES:
             continue
         if title_mark not in b["snippet"].get("title", ""):
             continue
@@ -150,7 +156,6 @@ class Broadcast:
         active になる前に testing へ遷移させると YouTube に拒否されるので、
         必ずここを通してから遷移すること。
         """
-        import time
         deadline = time.time() + timeout
         last = None
         while time.time() < deadline:
@@ -162,6 +167,33 @@ class Broadcast:
                 return True
             time.sleep(3)
         print(f"[YouTube] {timeout:.0f}秒待っても映像が届きません")
+        return False
+
+    def lifecycle_status(self) -> str:
+        """配信枠そのものの状態。
+
+        created → ready → testStarting → testing → liveStarting → live → complete
+        と進む。transition() は要求を受け付けるだけで、実際に次の状態になるまでは
+        数十秒かかることがある。
+        """
+        yt = get_client()
+        res = yt.liveBroadcasts().list(part="status", id=self.broadcast_id).execute()
+        items = res.get("items", [])
+        return items[0]["status"]["lifeCycleStatus"] if items else "unknown"
+
+    def wait_for_lifecycle(self, target: str, timeout: float = 180.0) -> bool:
+        """lifeCycleStatus が target になるまで待つ。"""
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            status = self.lifecycle_status()
+            if status != last:
+                print(f"[YouTube] 配信枠の状態: {status}")
+                last = status
+            if status == target:
+                return True
+            time.sleep(3)
+        print(f"[YouTube] {timeout:.0f}秒待っても {target} になりません（今は {last}）")
         return False
 
     def transition(self, status: str) -> bool:
@@ -177,13 +209,36 @@ class Broadcast:
             print(f"[YouTube] {status} への遷移に失敗: {e}")
             return False
 
-    def go_live(self) -> bool:
-        """testing を経て live にする。"""
+    def start_testing(self, timeout: float = 180.0) -> bool:
+        """モニターストリームを立ち上げて testing まで持っていく。
+
+        testing の要求が通っても lifeCycleStatus はいったん testStarting になる。
+        そこで live を投げると YouTube は「Invalid transition」で 403 を返すので、
+        testing になりきるまでここで待つ。配信開始の前に済ませておくこと。
+        """
+        status = self.lifecycle_status()
+        if status in ("testing", "liveStarting", "live"):
+            print(f"[YouTube] すでに {status} なので testing は飛ばします")
+            return True
         if not self.transition("testing"):
             return False
-        import time
-        time.sleep(5)
-        if not self.transition("live"):
+        return self.wait_for_lifecycle("testing", timeout)
+
+    def go_live(self, retry_sec: float = 300.0) -> bool:
+        """live にする。testing は start_testing() で済ませておく前提。
+
+        まだ testStarting だったり YouTube 側の都合だったりで弾かれることがあるので、
+        retry_sec のあいだは 5 秒おきに投げ直す。
+        """
+        deadline = time.time() + retry_sec
+        while True:
+            if self.transition("live"):
+                break
+            if time.time() >= deadline:
+                print(f"[YouTube] {retry_sec:.0f}秒粘りましたが live になりません")
+                return False
+            time.sleep(5)
+        if not self.wait_for_lifecycle("live", 60.0):
             return False
         self.went_live = True
         return True

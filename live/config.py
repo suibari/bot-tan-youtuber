@@ -30,6 +30,12 @@ LIVE_START_HHMM = os.getenv("LIVE_START_HHMM", "21:00")
 LIVE_END_HHMM   = os.getenv("LIVE_END_HHMM", "22:00")
 # クロージングを話し始める時刻。ここから終了までに締めの発話を終わらせる
 LIVE_CLOSING_HHMM = os.getenv("LIVE_CLOSING_HHMM", "21:55")
+# 開始の何秒前に testing へ入るか。YouTube は testing の要求を受けてから
+# lifeCycleStatus が testing になるまで数十秒かかることがあり、その途中で
+# live を投げると 403 invalidTransition で弾かれる。先に済ませておく
+LIVE_TESTING_LEAD_SEC = env_int("LIVE_TESTING_LEAD_SEC", 120)
+# live への遷移を何秒粘るか。弾かれても 5 秒おきに投げ直す
+LIVE_GO_LIVE_RETRY_SEC = env_int("LIVE_GO_LIVE_RETRY_SEC", 300)
 
 # ── Unity 常駐（LiveController） ──────────────────
 UNITY_EXE     = os.getenv("UNITY_EXE", "/home/suibari/Unity/Hub/Editor/6000.0.76f1/Editor/Unity")

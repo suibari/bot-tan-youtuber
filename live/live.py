@@ -33,7 +33,8 @@ import unity_live
 import voice
 from config import (
     DRY_RUN, ENERGY_REFRESH_SEC, FILLER_IDLE_SEC, IDLE_ENABLED, LIVE_CLOSING_HHMM,
-    LIVE_END_HHMM, LIVE_START_HHMM, SKIP_ARDY, WORK_DIR, ensure_dirs,
+    LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
+    SKIP_ARDY, WORK_DIR, ensure_dirs,
 )
 
 # LLM が落ちたときに使う定型。無言になるよりはよい
@@ -48,6 +49,13 @@ FALLBACK_LINES = [
 def _today_at(hhmm: str) -> datetime:
     h, m = (int(x) for x in hhmm.split(":"))
     return datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+def _sleep_until(when: datetime, label: str) -> None:
+    wait = (when - datetime.now()).total_seconds()
+    if wait > 0:
+        print(f"[live] {label} {wait:.0f} 秒待ちます")
+        time.sleep(wait)
 
 
 class LiveSession:
@@ -157,9 +165,21 @@ class LiveSession:
         memory.start_broadcast(self.broadcast.broadcast_id,
                                self.broadcast.url, title)
 
+    def start_testing(self) -> None:
+        """配信開始の前にモニターストリームを立ち上げておく。
+
+        ここで testing まで入れておかないと、開始時刻に投げる live が
+        testStarting の途中に当たって 403 で弾かれる。入れなかった場合も
+        go_live() 側が投げ直すので、ここでは止めない。
+        """
+        if self.broadcast is None:
+            return
+        if not self.broadcast.start_testing():
+            print("[YouTube] testing まで入れませんでした（開始時刻に投げ直します）")
+
     def go_live(self) -> None:
         if self.broadcast is not None:
-            if not self.broadcast.go_live():
+            if not self.broadcast.go_live(LIVE_GO_LIVE_RETRY_SEC):
                 raise RuntimeError("live への遷移に失敗しました")
             notify.live_started(self.broadcast.url, self.broadcast.title)
 
@@ -505,12 +525,12 @@ def main() -> int:
         session.connect_obs()
         session.create_broadcast()
 
-        # 21:00 ちょうどに live へ入る
+        # 開始の少し前に testing まで入れておき、21:00 ちょうどに live へ入る
         start_at = _today_at(LIVE_START_HHMM)
-        wait = (start_at - datetime.now()).total_seconds()
-        if wait > 0:
-            print(f"[live] 配信開始まで {wait:.0f} 秒待ちます")
-            time.sleep(wait)
+        _sleep_until(start_at - timedelta(seconds=LIVE_TESTING_LEAD_SEC),
+                     "testing へ入るまで")
+        session.start_testing()
+        _sleep_until(start_at, "配信開始まで")
 
         session.go_live()
         session.run_loop()
