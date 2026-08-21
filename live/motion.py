@@ -14,7 +14,7 @@ ARDY が使えない環境（未起動・エンジン未マウント）でも配
 """
 
 import hashlib
-import os
+import json
 import queue
 import random
 import threading
@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from common import ardy
-from config import MOTION_POOL_DIR, WORK_DIR
+from config import MOTION_POOL_DIR, WORK_DIR, env_float, env_int
 from llm import MOTION_CATEGORIES
 import safety
 
@@ -56,9 +56,22 @@ def wait_ready(timeout: float = None) -> bool:
 def stop_server(proc) -> None:
     ardy.stop(proc)
 
-# 1本あたりの尺[秒]。ARDY は尺の後半で動きが止まる癖があるので短く切る
+# 1セグメントの尺[秒]。ARDY は尺の後半で動きが止まる癖があるので短く切る
 # （録画パイプラインは VRMA_SEG_TARGET_SEC=2.6 で細切れにしている）
-GEN_DURATION = float(os.getenv("ARDY_LIVE_DURATION", "3.0"))
+GEN_DURATION = env_float("ARDY_LIVE_DURATION", 3.0)
+
+# 1本の .vrma に何セグメント繋ぐか。録画パイプラインと同じく ARDY 側で
+# blendSec のクロスフェードを掛けて1本にしてもらうので、継ぎ目は見えない。
+#
+# 3秒の単発クリップだと、発話中を途切れさせないために 2.5秒ごとに /motion を
+# 投げ続けることになる。Unity は /motion を受けた瞬間にメインスレッドで
+# .vrma をパースする（VrmaMotionPlayer.LoadVrma）ので、投げる回数がそのまま
+# フレーム落ちの回数になる。3セグメント繋いで約9秒にすれば 8.5秒に1回で済む。
+GEN_SEGMENTS = max(1, env_int("LIVE_MOTION_SEGMENTS", 3))
+
+# サイドカー(.json)を持たない古いプール（1本3秒の単発生成）の尺。
+# 尺が分からないクリップはこの値で扱う
+LEGACY_CLIP_SEC = 3.0
 
 # カテゴリごとの種モーション。プールを作るときに使う。
 #
@@ -103,16 +116,49 @@ CATEGORY_MOTIONS = {
 
 # ── ARDY サーバ ───────────────────────────────────────
 
-def generate_vrma(text: str, out_vrma: Path, duration: float = GEN_DURATION,
-                  seed: int = None) -> bool:
-    """英文のモーション指示から .vrma を1本作る。
+def build_segments(text: str, category: str,
+                   count: int = None, duration: float = None) -> list:
+    """1本ぶんの segments を組む。
+
+    先頭は LLM が返した motion_en（＝いま喋る内容に合った所作）。残りは
+    そのカテゴリの種モーションから、先頭と重複しないものを順に足す。
+    種が足りなければ持っているぶんだけで作る（1本＝単発生成と同じ）。
+    """
+    count = GEN_SEGMENTS if count is None else count
+    duration = GEN_DURATION if duration is None else duration
+
+    texts = [text]
+    seeds = list(CATEGORY_MOTIONS.get(category) or safety.IDLE_MOTIONS)
+    random.shuffle(seeds)
+    for s in seeds:
+        if len(texts) >= count:
+            break
+        if s not in texts:
+            texts.append(s)
+    return [{"text": t, "duration": duration} for t in texts]
+
+
+def generate_vrma(text: str, out_vrma: Path, category: str = "neutral",
+                  duration: float = GEN_DURATION, seed: int = None):
+    """モーション指示から .vrma を1本作る。戻り値は尺[秒]、失敗なら None。
 
     text は safety.sanitize_motion を通したものを渡すこと。
     ここでも念のため通すが、呼び出し側で弾けるものは早く弾いたほうがよい。
+
+    GEN_SEGMENTS が2以上なら、カテゴリの種モーションを足して1本に繋ぐ。
+    タイムアウトは尺に比例して伸ばす（ARDY_GEN_TIMEOUT の既定300秒は
+    3秒クリップ向けなので、連結でも足りるが念のため下限として使う）。
     """
     seed = random.randint(1, 2 ** 31 - 1) if seed is None else seed
-    return ardy.generate_vrma(text, out_vrma, duration=duration, seed=seed,
-                              work_dir=WORK_DIR)
+    segments = build_segments(text, category, duration=duration)
+    if len(segments) == 1:
+        return ardy.generate_vrma(text=segments[0]["text"], out_vrma=out_vrma,
+                                  duration=segments[0]["duration"], seed=seed,
+                                  work_dir=WORK_DIR)
+    total = sum(s["duration"] for s in segments)
+    return ardy.generate_vrma(out_vrma=out_vrma, segments=segments, seed=seed,
+                              blend_sec=ardy.ARDY_BLEND_SEC, work_dir=WORK_DIR,
+                              timeout=max(ardy.ARDY_GEN_TIMEOUT, total * 20))
 
 
 # ── プール ────────────────────────────────────────────
@@ -132,6 +178,31 @@ class MotionPool:
         """同じ指示文からは同じファイル名を作る（作り直しを避ける）。"""
         digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
         return self.root / category / f"{digest}.vrma"
+
+    @staticmethod
+    def _meta_path(vrma_path) -> Path:
+        return Path(vrma_path).with_suffix(".json")
+
+    def write_duration(self, vrma_path, seconds: float) -> None:
+        """クリップの尺をサイドカーに残す。
+
+        次のモーションをいつ投げるかはこの尺で決めるので、生成した本人しか
+        知らない値をディスクに残しておく必要がある（.vrma を読めば分かるが、
+        そのために Python 側に glTF パーサを持ちたくない）。
+        """
+        try:
+            self._meta_path(vrma_path).write_text(
+                json.dumps({"duration": round(float(seconds), 3)}), encoding="utf-8")
+        except OSError as e:
+            print(f"[pool] 尺を保存できません（既定値で扱います）: {e}")
+
+    def duration_of(self, vrma_path) -> float:
+        """クリップの尺[秒]。サイドカーが無ければ LEGACY_CLIP_SEC。"""
+        try:
+            meta = json.loads(self._meta_path(vrma_path).read_text(encoding="utf-8"))
+            return max(0.5, float(meta["duration"]))
+        except Exception:
+            return LEGACY_CLIP_SEC
 
     def list(self, category: str) -> list:
         d = self.root / category
@@ -174,6 +245,12 @@ class ArdyWorker:
         self.enabled = False
         self._proc = None
         self._queue = queue.Queue(maxsize=max_queue)
+        # プールを厚くするだけの依頼。ARDY が空いているときにしか処理しないので
+        # 本数を絞る必要がなく、上限なしでよい。
+        # 以前は prewarm も同じキューへ入れていたため、per_category=3（＝最大18件）が
+        # maxsize=3 のキューを溢れさせ、15件ぶんの「古い依頼を捨てます」を出して
+        # 実際には最後の3本しか作られていなかった
+        self._prewarm = queue.Queue()
         self._done = queue.Queue()
         self._thread = None
         self._stop = threading.Event()
@@ -223,31 +300,56 @@ class ArdyWorker:
         except queue.Empty:
             return None
 
+    def _next_request(self):
+        """次に作るもの。発話由来の依頼を優先し、無ければプール補充を1件。"""
+        try:
+            return self._queue.get(timeout=1.0)
+        except queue.Empty:
+            pass
+        try:
+            return self._prewarm.get_nowait()
+        except queue.Empty:
+            return None
+
     def _run(self) -> None:
         while not self._stop.is_set():
-            try:
-                text, category = self._queue.get(timeout=1.0)
-            except queue.Empty:
+            item = self._next_request()
+            if item is None:
                 continue
+            text, category = item
             out = self.pool.path_for(category, text)
             started = time.time()
-            if generate_vrma(text, out):
-                print(f"[ARDY] {category} に追加 ({time.time() - started:.1f}秒): {out.name}")
+            made = generate_vrma(text, out, category=category)
+            if made:
+                self.pool.write_duration(out, made)
+                print(f"[ARDY] {category} に追加 ({time.time() - started:.1f}秒 / "
+                      f"{made:.1f}秒のクリップ): {out.name}")
                 self._done.put((str(out), category))
 
-    def prewarm(self, per_category: int = 3) -> None:
+    def prewarm(self, per_category: int = 3) -> int:
         """配信前にプールを厚くする。ARDY の遊休時間を使う。
 
         既に十分持っているカテゴリは飛ばすので、日を重ねるほど早く終わる。
         カテゴリごとの種モーションから作るので、引いたときに内容と動きが合う。
+
+        戻り値は実際に予約した本数。すでに持っているぶんは予約しないので、
+        呼び出し側はこの数だけ poll_ready を待てばよい。
         """
         if not self.enabled:
-            return
+            return 0
+        queued = 0
         for category in MOTION_CATEGORIES:
             seeds = CATEGORY_MOTIONS.get(category) or safety.IDLE_MOTIONS
             shortfall = per_category - self.pool.count(category)
             for i in range(max(0, shortfall)):
-                self.submit(seeds[i % len(seeds)], category)
+                text = safety.sanitize_motion(seeds[i % len(seeds)])
+                if not text or self.pool.path_for(category, text).exists():
+                    continue
+                self._prewarm.put((text, category))
+                queued += 1
+        if queued:
+            print(f"[ARDY] プール補充を {queued} 件予約しました（空き時間に作ります）")
+        return queued
 
     def stop(self) -> None:
         self._stop.set()

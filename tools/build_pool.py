@@ -32,14 +32,14 @@ def main() -> int:
         return 1
     print(f"[pool] ARDY 起動に {time.time() - started:.0f} 秒")
 
-    want = sum(max(0, per_category - pool.count(c)) for c in MOTION_CATEGORIES)
+    # 実際に作る本数は prewarm が返す（同じ指示文のものを既に持っていれば飛ばす）
+    want = worker.prewarm(per_category=per_category)
     if want == 0:
         print("[pool] すでに十分あります")
         worker.stop()
         return 0
 
     print(f"[pool] {want} 本を生成します（カテゴリごとに {per_category} 本まで）")
-    worker.prewarm(per_category=per_category)
 
     made = 0
     gen_started = time.time()

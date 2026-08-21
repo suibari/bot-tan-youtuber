@@ -68,6 +68,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from common import ardy as _ardy, llm as _llm, motion_safety, voice as _voice, xvfb as _xvfb
+from common import vrma_style as _vrma_style
 from common.db import DB_CONFIG                                        # noqa: F401
 from common.env import env_flag, env_float, env_int, env_float_opt     # noqa: F401
 from common.env import LOGS_DIR, DATA_DIR, ROOT as REPO_ROOT           # noqa: F401
@@ -554,11 +555,9 @@ ARDY_ARM_SPREAD    = _ardy.ARDY_ARM_SPREAD
 _ardy_url          = _ardy.url
 
 
-# セグメントのつなぎ目のクロスフェード長[秒]。server.py の既定は6フレーム(20fps=0.3秒)で、
-# 独立生成された別ポーズ同士を繋ぐには短く、「スッと切り替わった」ように見えていた。
-# server.py 側は smoothstep で混ぜるので窓の両端で速度が0になる。
-# 未パッチのサーバーはこのフィールドを無視するだけなので送っても壊れない
-ARDY_BLEND_SEC = float(os.getenv("ARDY_BLEND_SEC", "0.7"))
+# セグメントのつなぎ目のクロスフェード長[秒]。配信側も同じ値を使うので
+# common/ardy.py が原典（解説はあちらのコメントを読むこと）
+ARDY_BLEND_SEC = _ardy.ARDY_BLEND_SEC
 
 # 1リクエストで渡せるセグメント数の上限。server.py の _resolve_segments が
 # segments_req[:12] で黙って切り捨てるので、こちら側で必ず守る
@@ -590,101 +589,30 @@ VRMA_SEG_TARGET_SEC = float(os.getenv("VRMA_SEG_TARGET_SEC", "2.6"))
 # build_vrma_motions が .vrma を分割し、Unity 側がクリップ同士をクロスフェードする。
 # 24 = 2チャンク。増やすほど生成時間が伸びるので、ここで頭を打たせる
 VRMA_MAX_SEGMENTS_TOTAL = int(os.getenv("VRMA_MAX_SEGMENTS_TOTAL", "24"))
-# 分割された .vrma を重ねて配置する量[秒]。
+# 分割された .vrma を重ねて配置する量[秒]。common/vrma_style.py に移した
+# （配信側も次のモーションを投げる間隔として同じ値を使うため）。
 # VrmaMotionPlayer.FadeDuration と必ず一致させること。ずれると継ぎ目で
 # 生成モーションが Idle に引き戻され、棒立ちが一瞬挟まる
-VRMA_CHUNK_OVERLAP = 0.5
+VRMA_CHUNK_OVERLAP = _vrma_style.VRMA_CHUNK_OVERLAP
 # ブロック末尾に残す余白[秒]。次のMixamoモーションに食い込ませない
 VRMA_TAIL_PAD = 0.4
 
-# ここから下は Unity(VrmaMotionPlayer) に渡す再生時の調整値。朝版・夜版で共通。
-# 生成モーションの振幅ゲイン。Unity側で Idleポーズからの偏差を増幅する倍率（腕のみ）。
-# 既定は 1.0 = 無効。実測で 1.2 も 1.35 も、ARDYが出す「手を頭の近くに上げる」動きを
-# 引き伸ばして腕(袖)が顔を覆ってしまい、倍率を下げても改善しなかった。
-# 動きを大きくするのはプロンプト側（ジャンプ・大振りの許可）の役目で、
-# 生成済みポーズを事後に引き伸ばすこの経路は割に合わない。
-# 仕組みは残してあるので、試すときは VRMA_GAIN=1.2 のように環境変数で上書きする
-VRMA_GAIN     = float(os.getenv("VRMA_GAIN", "1.0"))
-# 生成モーションの腰の上下移動を反映する倍率。既定0＝無効。
-# ジャンプを画に出すための仕組みだが、そのジャンプ自体を VRMA_BANNED_RE で禁止した
-# （スカートなので、ARDYが作る予備動作の深いしゃがみで下着が映る）。
-# 跳ぶ動作が無い以上ここを有効にする意味がないので0にしてある。
-# 衣装が変わって跳べるようになったら VRMA_HIPS_Y=1.0 で復活できる
-VRMA_HIPS_Y   = float(os.getenv("VRMA_HIPS_Y", "0"))
+# Unity(VrmaMotionPlayer) に渡す再生時の調整値は common/vrma_style.py にある。
+# 配信（live/unity_live.py）も同じ値で Unity を起動するので、片方だけ直して
+# 食い違わないよう共有している。ここは後方互換の再輸出。
+VRMA_GAIN            = _vrma_style.VRMA_GAIN
+VRMA_HIPS_Y          = _vrma_style.VRMA_HIPS_Y
+VRMA_BODY_TILT       = _vrma_style.VRMA_BODY_TILT
+VRMA_YAW_LIMIT       = _vrma_style.VRMA_YAW_LIMIT
+VRMA_HEAD_YAW        = _vrma_style.VRMA_HEAD_YAW
+VRMA_HEAD_COUNTER    = _vrma_style.VRMA_HEAD_COUNTER
+VRMA_KEEP_IDLE_HANDS = _vrma_style.VRMA_KEEP_IDLE_HANDS
+VRMA_ELBOW_BEND      = _vrma_style.VRMA_ELBOW_BEND
+VRMA_WRIST_BEND      = _vrma_style.VRMA_WRIST_BEND
+VRMA_HEAD_TILT       = _vrma_style.VRMA_HEAD_TILT
+VRMA_SMOOTH          = _vrma_style.VRMA_SMOOTH
+vrma_unity_args      = _vrma_style.vrma_unity_args
 
-# 生成モーションの「体の向き・傾き」をどこまで画に出すか。すべて Unity 側の引数。
-#
-# ARDY は体のワールド回転（向きも傾きも）を出していて .vrma にもそのまま入っているが、
-# VrmaMotionPlayer が既定で全部捨てていた（顔のアップで横を向くと困るため）。
-# 捨てるのをやめて、代わりに上限をかけて通す。
-#
-# VRMA_YAW_LIMIT: 上体をどこまで横に向けてよいか[度]。Idle からの絶対角で切る。
-#   ARDY のセグメント連結は前セグメントの終端ヨーに合わせて回転を積み上げるので、
-#   相対量で制限すると一度横を向いたまま戻らなくなる。絶対角なら構造的に起きない。
-# VRMA_HEAD_COUNTER: 上体が向いたぶんを首で逆に回して顔をカメラに残す割合。
-#   1.0 で顔が完全に正面。体は斜め・顔はこちら＝「肩越しに振り返る」画になる。
-# VRMA_HEAD_YAW: クリップ由来の首の横振りを通す上限[度]。
-#   従来は首のヨーも殺していた。ただし実測では ARDY に「首を横に振れ」と書いても
-#   対照より小さい振幅しか出ない（下の VRMA_IDLE_MOTIONS のコメント参照）ので、
-#   ここは意図した首振りのためではなく自然さのぶんだけ通す。小さめにしてある。
-# VRMA_BODY_TILT: 腰の傾き(前後左右)の反映倍率。VRMA_GAIN は腕にしか効かないので、
-#   上体の傾きの大きさを戻せるのはここだけ。
-VRMA_BODY_TILT    = float(os.getenv("VRMA_BODY_TILT", "1.0"))
-VRMA_YAW_LIMIT    = float(os.getenv("VRMA_YAW_LIMIT", "35"))
-VRMA_HEAD_YAW     = float(os.getenv("VRMA_HEAD_YAW", "15"))
-VRMA_HEAD_COUNTER = float(os.getenv("VRMA_HEAD_COUNTER", "0.8"))
-
-# ── 女の子らしい所作にするための調整（2026-08-15）
-#
-# VRMA_KEEP_IDLE_HANDS: 指・親指・つま先をクリップで上書きせず、VRMモデルの
-#   Idle ポーズを残す。1=有効。
-#   .vrma の骨格には親指とつま先のボーンが無く（vrmaBuilder.js の SKELETON）、
-#   人差し指〜小指も ARDY が出力しないので固定カール(14/17/10度)が焼き込まれている
-#   だけ。Unity は全95 muscle を無条件に混ぜていたので、生成モーション区間
-#   （＝ほぼ全編）でモデル本来の手のポーズが汎用の固定ポーズに置き換わり、
-#   親指は Unity 既定(=0)で伸びたまま固定されていた。
-#
-# VRMA_ELBOW_BEND / VRMA_WRIST_BEND / VRMA_HEAD_TILT: 常時かける姿勢のバイアス[度]。
-#   肘がピンと伸びた腕・真っ直ぐな手首・傾かない首は男性的に見える。
-#   ARDY 側にこれを指示する手段が無い（プロンプトに書いても動かない）ので、
-#   再生側で足す。符号付きなので、向きが逆なら負値を入れる。
-#
-# VRMA_SMOOTH: クリップのポーズを時間方向に平滑化する時定数[秒]（一次ローパス）。
-#   角ばった・キビキビしすぎる動きの角を丸める。
-#   実測（0.10秒・フレーム間差分）: 動き量 1.659→1.626（-2%）に対して
-#   二階差分＝カクつきは 0.733→0.265（-64%）。**振幅はほぼ落ちない。**
-#   代償は位相の遅れで、0.10秒 のとき約0.13秒ぶんモーションが後ろにずれる
-#   （遅れは時定数に比例する）。話す内容との同期が気になるなら下げること。
-VRMA_KEEP_IDLE_HANDS = int(os.getenv("VRMA_KEEP_IDLE_HANDS", "1"))
-VRMA_ELBOW_BEND      = float(os.getenv("VRMA_ELBOW_BEND", "8"))
-VRMA_WRIST_BEND      = float(os.getenv("VRMA_WRIST_BEND", "6"))
-VRMA_HEAD_TILT       = float(os.getenv("VRMA_HEAD_TILT", "4"))
-VRMA_SMOOTH          = float(os.getenv("VRMA_SMOOTH", "0.10"))
-
-
-def vrma_unity_args() -> list[str]:
-    """生成モーションの見た目を決める Unity 引数をまとめて作る。
-
-    朝版・夜版で同じ値を使うので1か所にまとめてある（別々に書くと片方だけ
-    直して食い違う）。VrmaMotionPlayer 側の既定値はすべて「従来どおり」なので、
-    切り分けたいときはこの戻り値を渡さなければ改修前の見た目に戻る。
-    """
-    return [
-        # カメラを引いた画に見合う大きさにする
-        "-vrmaGain", f"{VRMA_GAIN}",
-        "-vrmaHipsY", f"{VRMA_HIPS_Y}",
-        # 体の向き・傾き。0 にすれば従来どおり正面固定に戻る
-        "-vrmaBodyTilt", f"{VRMA_BODY_TILT}",
-        "-vrmaYawLimit", f"{VRMA_YAW_LIMIT}",
-        "-vrmaHeadYaw", f"{VRMA_HEAD_YAW}",
-        "-vrmaHeadCounter", f"{VRMA_HEAD_COUNTER}",
-        # 女の子らしい所作にするための調整。0 にすればそれぞれ無効になる
-        "-vrmaKeepIdleHands", f"{VRMA_KEEP_IDLE_HANDS}",
-        "-vrmaElbowBend", f"{VRMA_ELBOW_BEND}",
-        "-vrmaWristBend", f"{VRMA_WRIST_BEND}",
-        "-vrmaHeadTilt", f"{VRMA_HEAD_TILT}",
-        "-vrmaSmooth", f"{VRMA_SMOOTH}",
-    ]
 
 # モーションの安全化（禁止語・主語の正規化・待機動作）は common/motion_safety.py に
 # 集約した。実測で事故った履歴に基づく値なので、緩めるときはあちらのコメントを読むこと。

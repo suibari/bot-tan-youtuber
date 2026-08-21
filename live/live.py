@@ -12,6 +12,7 @@
 
 import signal
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -34,7 +35,8 @@ import voice
 from config import (
     DRY_RUN, ENERGY_REFRESH_SEC, FILLER_IDLE_SEC, IDLE_ENABLED, LIVE_CLOSING_HHMM,
     LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
-    SKIP_ARDY, UNITY_PROJECT, WORK_DIR, ensure_dirs,
+    BOT_CONTEXT_TTL_SEC, FPS_LOG_SEC, SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT,
+    WORK_DIR, ensure_dirs,
 )
 
 # LLM が落ちたときに使う定型。無言になるよりはよい
@@ -79,8 +81,15 @@ class LiveSession:
         self.last_speech_at = 0.0
         self.started_at = None
         self._stopping = False
-        # energy ゲージを最後に描いた時刻。0 なので初回の _housekeeping で必ず描く
-        self._gauge_at = 0.0
+        # 直近の発話が実際に鳴り始めた時刻。反応までの内訳を出すのに使う
+        self._speech_started_at = 0.0
+        # fps を最後に出した時刻
+        self._fps_at = 0.0
+        # botたんの状態のキャッシュ（_bot_context 参照）
+        self._bot_cache = None
+        self._bot_cache_at = 0.0
+        # メインループを止めない雑務スレッド（_start_chores 参照）
+        self._chores = None
 
     # ── 準備 ──────────────────────────────────────────
 
@@ -131,6 +140,10 @@ class LiveSession:
         # Unity は prepare() で起動済み。窓の ID もタイトルも起動のたびに変わるので、
         # シーンに保存されたキャプチャ先をここで今の窓へ合わせる
         self.obs.bind_window_capture(UNITY_PROJECT)
+        # 字幕は websocket で直接流し込む。ファイル経由だと OBS が読みに行くのが
+        # 約1秒に1回で、そのぶん発話より字幕が遅れる
+        if self.obs.bind_text_sources():
+            subtitle.set_sink(self.obs.set_text)
         return self.obs
 
     # ── 配信枠 ────────────────────────────────────────
@@ -209,16 +222,33 @@ class LiveSession:
 
     # ── 発話 ──────────────────────────────────────────
 
-    def _bot_context(self) -> dict:
+    def _bot_context(self, max_age: float = BOT_CONTEXT_TTL_SEC) -> dict:
+        """いまの気分・行動・energy。コメント返信の直前で必ず呼ばれる。
+
+        DB は別マシン（`common/db.py` の DB_HOST）にあり、接続はプールせず
+        毎回張り直す。ここが詰まるとメインループごと止まってコメントに反応
+        できなくなるので、
+
+          - `energy.get_energy()` は呼ばない。`memory.get_biorhythm()` が
+            返す energy と同じ行なので、以前は同じ行を2回引くために接続を
+            2本張っていた
+          - 数秒ぶんはキャッシュを使い回す。energy は分単位でしか動かない
+
+        引けなかったときは直前の値を使う。無ければ当たり障りのない既定値。
+        """
+        now = time.monotonic()
+        if self._bot_cache is not None and now - self._bot_cache_at <= max_age:
+            bot = dict(self._bot_cache)
+            bot["now"] = datetime.now().strftime("%H:%M")
+            return bot
+
         try:
             bot = memory.get_biorhythm()
+            self._bot_cache = dict(bot)
+            self._bot_cache_at = now
         except Exception as e:
-            print(f"[live] biorhythm を引けません: {e}")
-            bot = {"energy": 50.0, "mood": "", "status": ""}
-        try:
-            bot["energy"] = energy.get_energy()
-        except Exception:
-            pass
+            print(f"[live] biorhythm を引けません（直前の値で続けます）: {e}")
+            bot = dict(self._bot_cache or {"energy": 50.0, "mood": "", "status": ""})
         bot["now"] = datetime.now().strftime("%H:%M")
         return bot
 
@@ -255,22 +285,18 @@ class LiveSession:
 
         valence = reply.get("valence", 0.0)
         arousal = reply.get("arousal", 0.0)
-        # 待機モーションが喋り出しに割り込まないよう先に手を引かせる
-        self.idle.hold(10.0)
-        self.idle.set_base(valence, arousal)
+        category = reply.get("motion_category", "neutral")
 
-        # 1) モーション。合成を待たずに先に動かす。プールから即座に引く
-        try:
-            path = self.pool.pick(reply.get("motion_category", "neutral"))
-            if path:
-                unity_client.motion(path)
-        except Exception as e:
-            print(f"[live] モーションを再生できません（無視します）: {e}")
+        # 1) モーション。合成を待たずに先に動かす。プールから即座に引く。
+        #    投げるのは idle スレッドの仕事（/motion の送出者を1つにしておかないと、
+        #    フェードイン途中のクリップを打ち切って Idle が一瞬混ざる）。
+        #    発話が終わるまで、クリップが切れる手前で継ぎ足し続けてくれる
+        self.idle.speak_begin(category, valence, arousal)
 
         # 2) ARDY へ非同期で投げる。次の発話以降で使えるようになる
         motion_en = safety.sanitize_motion(reply.get("motion_en", ""))
         if motion_en:
-            self.ardy.submit(motion_en, reply.get("motion_category", "neutral"))
+            self.ardy.submit(motion_en, category)
 
         prefix = f"utt_{int(time.time() * 1000)}"
         began = time.monotonic()
@@ -302,21 +328,31 @@ class LiveSession:
                     notify.warn(f"Unity へ発話を送れません: {e}")
                 break
 
+            pushed = False
             if spoken == 0:
-                # 字幕は Unity が実際に鳴らし始めてから走らせる（WAVのロード待ちを吸収）
+                # 字幕は Unity が実際に鳴らし始めてから走らせる（WAVのロード待ちを吸収）。
+                # SUBTITLE_LEAD_SEC で前後にずらせる（config.py の解説を参照）
+                if SUBTITLE_LEAD_SEC < 0:
+                    self.subs.push(line, durs[0])
+                    pushed = True
                 self._wait_speech_start()
-                print(f"[live] 喋り出しまで {time.monotonic() - began:.1f}秒")
-            self.subs.push(line, durs[0])
+                self._speech_started_at = time.monotonic()
+                print(f"[live] 喋り出しまで {self._speech_started_at - began:.1f}秒")
+                if SUBTITLE_LEAD_SEC > 0:
+                    time.sleep(SUBTITLE_LEAD_SEC)
+            if not pushed:
+                self.subs.push(line, durs[0])
             last_dur = durs[0]
             spoken += 1
-            self.idle.hold(last_dur + 6.0)
 
         self.subs.finish()
         if spoken == 0:
             self.subs.stop()
+            self.idle.speak_end()
             return False
 
         self._wait_speech_end()
+        self.idle.speak_end()
         self.last_speech_at = time.monotonic()
 
         text = " ".join(l["ja"] for l in lines[:spoken])
@@ -341,6 +377,11 @@ class LiveSession:
 
     @staticmethod
     def _wait_speech_start(timeout: float = 5.0) -> None:
+        """Unity が実際に鳴らし始めるまで待つ。字幕を出す基準時刻になる。
+
+        刻みが粗いとそのぶん字幕が音声より遅れるので細かく回す。
+        /status は Unity のメインスレッドが書いた値を返すだけなので安い。
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             try:
@@ -348,7 +389,7 @@ class LiveSession:
                     return
             except unity_client.UnityError:
                 return
-            time.sleep(0.1)
+            time.sleep(0.02)
 
     def _wait_speech_end(self, timeout: float = 120.0) -> None:
         unity_client.wait_until_idle(timeout=timeout)
@@ -358,7 +399,14 @@ class LiveSession:
     def reply_to_comment(self, comment) -> None:
         first = self.queue.is_first_time(comment.channel_id)
         self.queue.mark_seen(comment.channel_id)
+
+        # 反応までの内訳を測る。これが無いと「15秒かかる」の原因が
+        # 待ち行列なのか DB なのか LLM なのか切り分けられない。
+        # comment.received_at は ChatPoller が受け取った瞬間（＝コメント欄に
+        # 出した瞬間）なので、視聴者から見た体感とほぼ一致する
+        t_pop = time.monotonic()
         bot = self._bot_context()
+        t_ctx = time.monotonic()
 
         prompt = persona.build_comment_prompt(
             comment.author, comment.text, bot, self.planner.cache,
@@ -366,8 +414,15 @@ class LiveSession:
             recent_replies=self.recent_replies,
         )
         reply = self._generate(prompt)
+        t_llm = time.monotonic()
         if not self._speak(reply, tag=comment.author):
             return
+
+        started = self._speech_started_at
+        print(f"[live] 反応まで {started - comment.received_at:.1f}秒 "
+              f"(待ち {t_pop - comment.received_at:.1f} / "
+              f"DB {t_ctx - t_pop:.1f} / LLM {t_llm - t_ctx:.1f} / "
+              f"合成 {started - t_llm:.1f})")
 
         self.replied_count += 1
         # energy はここでは足さない。下の memory.save_comment() が入れた行を
@@ -405,9 +460,8 @@ class LiveSession:
     def run_loop(self) -> None:
         closing_at = _today_at(LIVE_CLOSING_HHMM)
         last_housekeeping = 0.0
-        last_memory_refresh = time.monotonic()
-        last_rag_refresh = 0.0
 
+        self._start_chores()
         self.speak_scripted(
             "配信のオープニングです。挨拶をして、今日も来てくれた人にお礼を言って、"
             "コメントで話しかけてねと伝えてください。",
@@ -433,17 +487,6 @@ class LiveSession:
             if now - last_housekeeping > 2:
                 self._housekeeping()
                 last_housekeeping = now
-            if now - last_memory_refresh > 600:
-                self.planner.refresh_memory()
-                last_memory_refresh = now
-            if now - last_rag_refresh > 30:
-                recent_comments = list(self.poller.recent) if self.poller else []
-                self.planner.prefetch_rag(
-                    self._bot_context(),
-                    recent_comments=recent_comments,
-                    recent_replies=self.recent_replies,
-                )
-                last_rag_refresh = now
 
         self.speak_scripted(
             "配信のクロージングです。「botたん」という自分の名前を必ず言って、"
@@ -451,8 +494,54 @@ class LiveSession:
             "日付は言わないこと。",
             "クロージング")
 
+    def _start_chores(self) -> None:
+        """DB や LAN を触る雑務を別スレッドへ追い出す。
+
+        以前は energy ゲージ（30秒ごと）・RAG 先読み（30秒ごと）・記憶の
+        引き直し（600秒ごと）を run_loop の中で直接呼んでいた。DB は別マシンで
+        接続をプールしておらず `connect_timeout` は数秒あるので、そのホストが
+        不調だと**コメントが1件も無くてもメインループが十数秒止まる**。
+        2026-08-21 の配信で実際に起きた（同じホストの 3200/3204 も全滅していた）。
+        """
+        def run():
+            gauge_at = 0.0
+            rag_at = 0.0
+            memory_at = time.monotonic()
+            while not self._stopping:
+                now = time.monotonic()
+                if now - gauge_at > ENERGY_REFRESH_SEC:
+                    gauge_at = now
+                    try:
+                        gauge.write(energy.get_energy())
+                    except Exception:
+                        pass
+                if now - memory_at > 600:
+                    memory_at = now
+                    try:
+                        self.planner.refresh_memory()
+                    except Exception as e:
+                        print(f"[live] 記憶を引き直せません（無視します）: {e}")
+                if now - rag_at > 30:
+                    rag_at = now
+                    try:
+                        self.planner.prefetch_rag(
+                            self._bot_context(),
+                            recent_comments=list(self.poller.recent) if self.poller else [],
+                            recent_replies=self.recent_replies,
+                        )
+                    except Exception as e:
+                        print(f"[live] RAG 先読みを始められません（無視します）: {e}")
+                time.sleep(1.0)
+
+        self._chores = threading.Thread(target=run, daemon=True, name="chores")
+        self._chores.start()
+
     def _housekeeping(self) -> None:
         """数秒ごとの雑務。落ちても配信に影響しない処理だけ置くこと。
+
+        **ここには DB・LAN を触る処理を置かないこと。** メインループから
+        呼ばれるので、詰まるとコメントへの反応がそのぶん遅れる。
+        重いものは _start_chores の別スレッドへ。
 
         コメント欄は ChatPoller が受信と同時に書くのでここでは触らない
         （ここで書くと、視聴者から見て画面に出るまでがこの間隔ぶん遅れる）。"""
@@ -461,19 +550,24 @@ class LiveSession:
         except Exception:
             pass
 
-        # energy ゲージ。DB を引くので時計ほど頻繁には更新しない
-        if time.monotonic() - self._gauge_at > ENERGY_REFRESH_SEC:
-            self._gauge_at = time.monotonic()
-            try:
-                gauge.write(energy.get_energy())
-            except Exception:
-                pass
-
         # ARDY が作り終えたモーションを拾う。プールに入っているので
         # 次に pick したときから使われる
         ready = self.ardy.poll_ready()
         if ready:
             print(f"[live] モーションができました: {ready[1]} / {self.pool.summary()}")
+
+        # Unity のフレームレート。/motion を受けた Unity はメインスレッドで
+        # .vrma をパースするので、モーションを投げる頻度を上げたときに
+        # フレームが落ちていないかはここでしか分からない
+        if FPS_LOG_SEC > 0 and time.monotonic() - self._fps_at > FPS_LOG_SEC:
+            self._fps_at = time.monotonic()
+            try:
+                st = unity_client.status()
+                print(f"[Unity] fps={st.get('fps', 0):.1f} "
+                      f"motion={st.get('motion_queue', 0)} "
+                      f"rss={self.unity.rss_mb():.0f}MB")
+            except unity_client.UnityError:
+                pass
 
         if not self.unity.is_alive():
             print("[live] Unity が落ちています")
@@ -503,6 +597,10 @@ class LiveSession:
             # OBS を配信中に手で起動し直すとここの websocket は死んでいる。
             # その後の Unity と ARDY の後始末まで巻き込まれないよう握りつぶす
             try:
+                # 字幕ソースをファイル読み込みに戻す。戻さないと、次に
+                # プログラムを通さず OBS を使ったとき字幕が出ないままになる
+                subtitle.set_sink(None)
+                self.obs.restore_text_files()
                 print(f"[終了] OBS 統計: {self.obs.stream_stats()}")
                 self.obs.stop_stream()
                 self.obs.disconnect()

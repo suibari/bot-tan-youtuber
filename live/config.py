@@ -22,6 +22,7 @@ from common.env import (  # noqa: E402
     env_flag, env_float, env_int, env_float_opt,
 )
 from common import ardy as _ardy, llm as _llm, voice as _voice  # noqa: E402
+from common import vrma_style as _vrma_style  # noqa: E402
 from common.db import DB_CONFIG  # noqa: E402,F401
 
 
@@ -121,6 +122,18 @@ ARDY_READY_TIMEOUT = _ardy.ARDY_READY_TIMEOUT
 ARDY_GEN_TIMEOUT   = _ardy.ARDY_GEN_TIMEOUT
 ARDY_CFG           = _ardy.ARDY_CFG
 ARDY_ARM_SPREAD    = _ardy.ARDY_ARM_SPREAD
+# 生成モーションの見た目を決める Unity 引数。Shorts の録画と同じ値を使う。
+# これを渡さないと Unity 側は「改修前の見た目」の既定値で動き、-vrmaSmooth（実測で
+# カクつき -64%）も効かない。統合前の配信はこれを1つも渡していなかった。
+# 配信だけ変えたいときは LIVE_VRMA_SMOOTH のように LIVE_ を頭に付けた環境変数を置く。
+def vrma_unity_args() -> list:
+    return _vrma_style.vrma_unity_args(prefix="LIVE_")
+
+
+# 次のモーションを投げる間隔を決めるときの重なり[秒]。
+# VrmaMotionPlayer.FadeDuration と一致させること
+VRMA_CHUNK_OVERLAP = _vrma_style.VRMA_CHUNK_OVERLAP
+
 # 生成した .vrma を貯めておく場所。過去配信ぶんを再利用するので消さない
 MOTION_POOL_DIR = Path(os.getenv("MOTION_POOL_DIR", DATA_DIR / "motions"))
 
@@ -147,10 +160,29 @@ SUBTITLE_JA  = SUBTITLE_DIR / "subtitle_ja.txt"
 SUBTITLE_EN  = SUBTITLE_DIR / "subtitle_en.txt"
 COMMENTS_TXT = SUBTITLE_DIR / "comments.txt"
 CLOCK_TXT    = SUBTITLE_DIR / "clock.txt"
+# 字幕を出すタイミングの微調整[秒]。
+#   0  : Unity が鳴らし始めたのを /status で確認してから出す（既定）
+#   正 : そのぶん字幕を遅らせる
+#   負 : 鳴り始めを待たずに先に出す（先行量は Unity の WAV ロード時間ぶんで、
+#        実測 0.2秒 前後。|値| そのものは効かない）
+#
+# OBS は映像とテキストを即時に描くが、音声は PulseAudio の null sink の
+# monitor 経由で取り込むためバッファ遅延がある。どちらへずれるかは環境で
+# 変わるので、実配信を見てここで詰めること
+SUBTITLE_LEAD_SEC = env_float("SUBTITLE_LEAD_SEC", 0.0)
 # energy ゲージ。OBS の「energy」ブラウザソースに file:// で読ませる
 ENERGY_HTML  = SUBTITLE_DIR / "energy.html"
 # ゲージを描き直す間隔[秒]。energy は分単位でしか動かないので短くしても意味がない
 ENERGY_REFRESH_SEC = env_int("ENERGY_REFRESH_SEC", 30)
+
+# Unity の fps をログへ残す間隔[秒]。0 以下で無効。
+# Editor 常駐のメモリ増加と、モーション投入によるフレーム落ちの監視を兼ねる
+FPS_LOG_SEC = env_float("FPS_LOG_SEC", 60.0)
+
+# botたんの状態（気分・行動・energy）を DB から引き直す間隔[秒]。
+# コメント返信のたびに引くと、DB が詰まったときにメインループごと止まる。
+# energy は分単位でしか動かないので、数秒のキャッシュで実害はない
+BOT_CONTEXT_TTL_SEC = env_float("BOT_CONTEXT_TTL_SEC", 20.0)
 
 # ── 配信の振る舞い ────────────────────────────────
 # コメントがこの秒数途切れたらフリートークを挟む

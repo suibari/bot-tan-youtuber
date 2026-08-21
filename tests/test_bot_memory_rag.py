@@ -30,6 +30,8 @@ config_stub = types.ModuleType("config")
 config_stub.BIORHYTHM_MEMORY_API_URL = "http://192.168.1.200:3204"
 config_stub.BIORHYTHM_INTERNAL_SECRET = "test-secret"
 config_stub.BIORHYTHM_MEMORY_API_TIMEOUT_SEC = 3.0
+# filler.py が読む。live/config.py の既定と同じ値にしておくこと
+config_stub.BOT_MEMORY_QUERY_MAX_CHARS = 500
 config_stub.AFFIRMATIVE_BOT_DIR = ROOT.parent / "bsky-affirmative-bot"
 
 client_module = load_with_stubs(
@@ -76,7 +78,10 @@ class FillerRagTest(unittest.TestCase):
         cls.module = load_with_stubs(
             "filler_rag_test_module",
             LIVE / "filler.py",
-            {"memory": memory_stub, "bot_memory_client": bot_client_stub},
+            # filler.py は config からクエリ長の上限を読む。config を差し替えないと
+            # 本物の live/config.py（.env と DB 接続を読む）を掴もうとして失敗する
+            {"config": config_stub, "memory": memory_stub,
+             "bot_memory_client": bot_client_stub},
         )
 
     def test_prefetch_uses_context_and_same_document_is_not_reused(self):

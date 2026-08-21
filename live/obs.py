@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import signal
+import threading
 from pathlib import Path
 import socket
 import subprocess
@@ -19,7 +20,12 @@ import obsws_python as obs
 
 from config import (OBS_HOST, OBS_PORT, OBS_PASSWORD, OBS_LAUNCH, OBS_COMMAND,
                     OBS_COLLECTION, OBS_PROFILE, LIVE_DISPLAY,
-                    STREAM_VIDEO_KBPS, STREAM_AUDIO_KBPS)
+                    STREAM_VIDEO_KBPS, STREAM_AUDIO_KBPS,
+                    SUBTITLE_JA, SUBTITLE_EN)
+
+# 字幕の送信を何回続けて失敗したらファイル経路へ戻すか。
+# 一時的な取りこぼしで戻すと、以後ずっと1秒遅れの字幕になってしまう
+_TEXT_FAIL_LIMIT = 3
 
 
 # xwininfo -root -tree の1行:
@@ -278,6 +284,12 @@ def launch(timeout: float = 90.0) -> bool:
 class Obs:
     def __init__(self):
         self.client = None
+        # 字幕のテキストソース名。bind_text_sources() が埋める
+        self._text_sources = {}
+        # ReqClient はスレッドセーフではない。字幕は subtitle スレッドから
+        # 呼ばれるので、配信ループ側の呼び出しと直列化する
+        self._lock = threading.Lock()
+        self._text_fails = 0
 
     def connect(self, timeout: float = 10.0) -> "Obs":
         try:
@@ -318,6 +330,103 @@ class Obs:
         else:
             print(f"[OBS] エンコーダ: x264 / 映像 {vb}kbps")
 
+    # ── 字幕 ────────────────────────────────────────
+
+    def _scene_items(self) -> list:
+        """いま映っているシーンのソース一覧。読めなければ空。"""
+        try:
+            scene = self.client.get_current_program_scene()
+            scene_name = (getattr(scene, "current_program_scene_name", None)
+                          or scene.scene_name)
+            return self.client.get_scene_item_list(scene_name).scene_items
+        except Exception as e:
+            print(f"[OBS] シーンを読めません（続行します）: {e}")
+            return []
+
+    def bind_text_sources(self) -> bool:
+        """字幕のテキストソースを見つけ、ファイル読み込みをやめさせる。
+
+        OBS の `text_ft2_source_v2` は `from_file` のとき**約1秒に1回しか**
+        ファイルを見に行かない（間隔を指定するプロパティは存在しない）。
+        発話より字幕が遅れる最大の原因がこれなので、websocket で直接
+        流し込む経路に切り替える。シーンを手で直す必要はない。
+
+        ソース名は決め打ちにせず、`text_file` が SUBTITLE_JA / SUBTITLE_EN を
+        指しているものを探す（`tools/build_scene.py` が付ける「字幕(日)」等の
+        名前に依存すると、手で組んだシーンで動かなくなる）。
+        """
+        want = {str(Path(SUBTITLE_JA).resolve()): "ja",
+                str(Path(SUBTITLE_EN).resolve()): "en"}
+        found = {}
+        for item in self._scene_items():
+            source = item["sourceName"]
+            try:
+                settings = self.client.get_input_settings(source)
+                if not str(settings.input_kind).startswith("text_"):
+                    continue
+                path = (settings.input_settings or {}).get("text_file", "")
+                if not path:
+                    continue
+                key = want.get(str(Path(path).resolve()))
+                if key is None:
+                    continue
+                new = dict(settings.input_settings)
+                new["from_file"] = False
+                new["text"] = ""
+                self.client.set_input_settings(source, new, overlay=True)
+                found[key] = source
+            except Exception as e:
+                print(f"[OBS] 「{source}」を字幕として使えません（続行します）: {e}")
+
+        self._text_sources = found
+        self._text_fails = 0
+        if found:
+            print(f"[OBS] 字幕を websocket 経由に切り替えました: "
+                  f"{', '.join(f'{k}={v}' for k, v in found.items())}")
+        else:
+            print("[OBS] 字幕のテキストソースが見つかりません。"
+                  "ファイル経由のまま進みます（最大1秒遅れます）")
+        return bool(found)
+
+    def set_text(self, ja: str = "", en: str = "") -> None:
+        """字幕を即時に差し替える。subtitle.set_sink() から呼ばれる。
+
+        失敗が続いたらファイル読み込みへ戻す。配信中に websocket が切れても
+        字幕が出続けるようにするため（subtitle.show はファイルも必ず書く）。
+        """
+        if not self._text_sources or self.client is None:
+            return
+        pairs = [(self._text_sources.get("ja"), ja),
+                 (self._text_sources.get("en"), en)]
+        try:
+            with self._lock:
+                for source, text in pairs:
+                    if source:
+                        self.client.set_input_settings(
+                            source, {"text": text or ""}, overlay=True)
+            self._text_fails = 0
+        except Exception as e:
+            self._text_fails += 1
+            print(f"[OBS] 字幕を送れません（{self._text_fails}回目）: {e}")
+            if self._text_fails >= _TEXT_FAIL_LIMIT:
+                self.restore_text_files()
+
+    def restore_text_files(self) -> None:
+        """字幕をファイル読み込みへ戻す。websocket を諦めるときに呼ぶ。"""
+        sources = list(self._text_sources.items())
+        self._text_sources = {}
+        paths = {"ja": str(SUBTITLE_JA), "en": str(SUBTITLE_EN)}
+        for key, source in sources:
+            try:
+                with self._lock:
+                    self.client.set_input_settings(
+                        source, {"from_file": True, "text_file": paths[key]},
+                        overlay=True)
+            except Exception as e:
+                print(f"[OBS] 「{source}」をファイル読み込みに戻せません: {e}")
+        if sources:
+            print("[OBS] 字幕をファイル読み込みに戻しました（最大1秒遅れます）")
+
     def bind_window_capture(self, unity_project: str) -> bool:
         """ウィンドウキャプチャの参照先を、いま動いている Unity の窓に合わせる。
 
@@ -336,14 +445,7 @@ class Obs:
         wid, title, cls = found
         want = f"{wid}\r\n{title}\r\n{cls}"
 
-        try:
-            scene = self.client.get_current_program_scene()
-            scene_name = getattr(scene, "current_program_scene_name", None) or scene.scene_name
-            items = self.client.get_scene_item_list(scene_name).scene_items
-        except Exception as e:
-            print(f"[OBS] シーンを読めません（続行します）: {e}")
-            return False
-
+        items = self._scene_items()
         bound = 0
         for item in items:
             source = item["sourceName"]

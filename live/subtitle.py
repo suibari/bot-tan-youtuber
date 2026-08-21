@@ -1,10 +1,21 @@
 """日英字幕の書き出し。
 
-Unity 側では描画せず、OBS の「テキスト(GDI+)」ソースにファイルを読ませる。
-OBS はファイルの更新を自動で反映するので、こちらは書くだけでよい。
-Unity の工事がゼロで済むのと、フォントや位置を OBS 側で調整できるのが利点。
+Unity 側では描画せず、OBS のテキストソースに出す。フォントや位置を OBS 側で
+調整できて、Unity の工事がゼロで済む。
 
-OBS のテキストソースは
+出し方は2経路ある。
+
+1. **obs-websocket で直接流し込む（速い。これが本命）**
+   `set_sink()` で送信関数を登録すると、`show()` がそちらへも流す。反映は即時。
+2. **ファイルに書いて OBS に読ませる（保険）**
+   常に併用する。websocket が繋がらない・落ちた場合はこちらだけが残る。
+
+2 だけだと発話より字幕が遅れる。OBS の `text_ft2_source_v2` は
+`video_tick` の中で**約1秒に1回しか** `stat()` せず、間隔を指定する
+プロパティも無い（0〜1.0秒の遅れ）。さらに `st_mtime` は秒解像度なので、
+同じ秒に2回差し替えると2回目が丸ごと落ちる。
+
+OBS のテキストソース（ファイル経路）は
   - エンコーディングに厳密（UTF-8 / BOMなし で書くこと）
   - 書き込み途中の中途半端な内容を読むことがある（アトミックに差し替えること）
 """
@@ -17,6 +28,20 @@ from datetime import datetime
 from pathlib import Path
 
 from config import SUBTITLE_JA, SUBTITLE_EN, COMMENTS_TXT, CLOCK_TXT
+
+# obs-websocket へ字幕を流す関数。live.py が OBS に繋がったら差し込む。
+# 差し込まれていなければファイル書き込みだけになる（従来どおり動く）
+_sink = None
+
+
+def set_sink(fn) -> None:
+    """字幕の即時反映先を登録する。None を渡すと外れる。
+
+    fn は fn(ja: str, en: str) -> None。中で例外を出しても配信は止めない
+    （呼び出し側が握りつぶす）。
+    """
+    global _sink
+    _sink = fn
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -32,9 +57,20 @@ def _write_atomic(path: Path, text: str) -> None:
 
 
 def show(ja: str = "", en: str = "") -> None:
-    """字幕を差し替える。空文字を渡せば消える。"""
-    _write_atomic(SUBTITLE_JA, ja or "")
-    _write_atomic(SUBTITLE_EN, en or "")
+    """字幕を差し替える。空文字を渡せば消える。
+
+    websocket があればそちらを先に叩く。ファイルは保険として必ず書く
+    （OBS が読むのは最大1秒後なので、websocket が生きていれば意味を持たない）。
+    """
+    ja, en = ja or "", en or ""
+    fn = _sink
+    if fn is not None:
+        try:
+            fn(ja, en)
+        except Exception as e:
+            print(f"[字幕] OBS へ送れません（ファイル経由に任せます）: {e}")
+    _write_atomic(SUBTITLE_JA, ja)
+    _write_atomic(SUBTITLE_EN, en)
 
 
 def clear() -> None:

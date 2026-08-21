@@ -138,15 +138,28 @@ class ChatPoller:
         if self._thread is not None:
             self._thread.join(timeout=5)
 
+    # 取得に失敗したときの待ち時間[秒]。失敗が続くたびに倍にして頭を打たせる。
+    #
+    # 以前は失敗しても10秒固定で叩き続けていた。クォータを使い切ると
+    # （2026-08-21 の配信は videos.insert 1600ユニット×2本ぶんが効いて枠を
+    # 使い切った）復旧まで全部 403 になり、10秒おきの空振りが112回続いて
+    # ログが埋まったうえ、翌日ぶんの枠まで削っていた。
+    FAIL_INTERVAL_MIN = 10.0
+    FAIL_INTERVAL_MAX = 120.0
+
     def _run(self) -> None:
         interval = 5.0
+        fail_interval = self.FAIL_INTERVAL_MIN
         while not self._stop.is_set():
             try:
                 interval = self._poll_once()
+                fail_interval = self.FAIL_INTERVAL_MIN
             except Exception as e:
                 # チャットが読めなくても配信は続ける。フリートークで場は持つ
-                print(f"[chat] 取得に失敗（配信は継続します）: {e}")
-                interval = 10.0
+                print(f"[chat] 取得に失敗（配信は継続します。"
+                      f"次は{fail_interval:.0f}秒後）: {e}")
+                interval = fail_interval
+                fail_interval = min(self.FAIL_INTERVAL_MAX, fail_interval * 2)
             self._stop.wait(interval)
 
     def _poll_once(self) -> float:

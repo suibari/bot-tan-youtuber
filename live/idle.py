@@ -1,4 +1,4 @@
-"""喋っていない間の演出。
+"""アバターの身振りと表情。/motion を投げるのはここだけ。
 
 Unity 側は、生成モーションが乗っていない区間は Animator の Idle クリップを
 流し続けるだけになる。表情も /emotion で最後に指定した値のまま固定される。
@@ -6,13 +6,24 @@ Unity 側は、生成モーションが乗っていない区間は Animator の 
 
 ここでは配信ループとは別スレッドで、
 
-  - 数十秒おきにプールのモーションを1本投げる（しぐさ）
-  - 数秒〜十数秒おきに表情を少しだけ振る（valence/arousal のランダムウォーク）
+  - 発話中: クリップが切れる手前で次を投げ続け、生成モーションを途切れさせない
+  - 待機中: 数十秒おきにプールのモーションを1本投げる（しぐさ）
+  - 待機中: 数秒〜十数秒おきに表情を少しだけ振る（valence/arousal のランダムウォーク）
 
-を行う。Unity の /status を見て、喋っている間は何もしない。
+を行う。
+
+**`/motion` の送出者をこのクラス1つに集約してあること。**
+以前は `live.py:_speak` も直接 `unity_client.motion()` を呼んでいて、待機スレッドが
+投げた直後に発話側が投げると、Unity 側（VrmaMotionPlayer.EnqueueMotion）が
+フェードイン途中＝重み1未満のクリップを打ち切る。すると合成後の重み
+`Min(1, wa+wb)` が1に届かず Idle が一瞬混ざり、ポーズが跳ねて見えていた。
+
+発話中に途切れさせないやり方は録画パイプラインと同じ。あちらは
+`VRMA_CHUNK_OVERLAP`（=VrmaMotionPlayer.FadeDuration）ぶん重ねた時刻表を
+事前に作って渡す。配信は先の尺が分からないので、同じ重なりを時間で刻む。
 
 モーションはプールから引くので、ARDY が配信中に足していったものも
-そのまま待機の動きとして使われる。
+そのまま使われる。
 """
 
 import random
@@ -21,7 +32,8 @@ import time
 
 import unity_client
 from config import (IDLE_EMOTION_MAX_SEC, IDLE_EMOTION_MIN_SEC,
-                    IDLE_MOTION_MAX_SEC, IDLE_MOTION_MIN_SEC)
+                    IDLE_MOTION_MAX_SEC, IDLE_MOTION_MIN_SEC,
+                    VRMA_CHUNK_OVERLAP)
 
 # 待機中に引くカテゴリの重み。大げさな動き（happy の両手上げなど）が
 # 黙っているときに出ると唐突なので、落ち着いたものを厚くする
@@ -39,6 +51,12 @@ EMOTION_JITTER = 0.22
 BASE_VALENCE = 0.55
 BASE_AROUSAL = 0.15
 
+# ループの刻み[秒]。
+# 発話の頭のモーションはこのぶん遅れて出るので短くしておく（以前は _speak が
+# 直接投げていたので遅れは無かった）。発話中の継ぎ足しが遅れると重なりも減る。
+# /status を叩かないので、短くしてもコストはほぼ増えない
+TICK_SEC = 0.1
+
 
 def _weighted_category() -> str:
     names = [c for c, _ in IDLE_CATEGORIES]
@@ -47,27 +65,46 @@ def _weighted_category() -> str:
 
 
 class IdleAnimator(threading.Thread):
-    """待機中の身振りと表情。配信ループからは start/stop するだけでよい。"""
+    """身振りと表情の唯一の送出者。配信ループからは start/stop するだけでよい。"""
 
     def __init__(self, pool, enabled: bool = True):
+        """enabled は「黙っている間も動かすか」。False でも発話中は動かす
+        （発話のモーションもこのスレッドが投げているため）。"""
         super().__init__(daemon=True, name="idle")
         self.pool = pool
         self.enabled = enabled
         self._stop = threading.Event()
-        self._hold_until = 0.0
         self._base = (BASE_VALENCE, BASE_AROUSAL)
         self._current = (BASE_VALENCE, BASE_AROUSAL)
+        # 発話中の状態。配信ループのスレッドから書き、このスレッドが読む
+        self._lock = threading.Lock()
+        self._speaking = False
+        self._speak_category = "neutral"
+        self._next_at = 0.0          # 次にモーションを投げる時刻（monotonic）
 
     # ── 配信ループから呼ぶ ──
 
-    def hold(self, seconds: float = 3.0) -> None:
-        """しばらく手を出さない。
+    def speak_begin(self, category: str, valence: float = None,
+                    arousal: float = None) -> None:
+        """発話の頭で呼ぶ。すぐに1本投げ、以後クリップが切れる手前で継ぎ足す。
 
-        発話を投げてから Unity が実際に鳴らし始めるまでの数百ミリ秒は
-        /status が speaking=false のままなので、その隙に待機モーションが
-        割り込むと、喋り出しと同時に別の動きが被る。
+        表情は発話側（_speak）が /emotion で決めるので、ここでは振らない。
         """
-        self._hold_until = max(self._hold_until, time.monotonic() + seconds)
+        if valence is not None and arousal is not None:
+            self.set_base(valence, arousal)
+        with self._lock:
+            self._speaking = True
+            self._speak_category = category or "neutral"
+            self._next_at = 0.0      # 次のループで即座に1本投げる
+
+    def speak_end(self) -> None:
+        """発話が終わったら呼ぶ。待機モードへ戻す。"""
+        with self._lock:
+            self._speaking = False
+            # 喋り終わりの余韻を持たせる。すぐ次の待機モーションを投げると
+            # 最後のクリップと二重に掛かる
+            self._next_at = time.monotonic() + random.uniform(IDLE_MOTION_MIN_SEC,
+                                                              IDLE_MOTION_MAX_SEC)
 
     def set_base(self, valence: float, arousal: float) -> None:
         """直前の発話の感情を素の顔として引き継ぐ。"""
@@ -79,47 +116,79 @@ class IdleAnimator(threading.Thread):
     # ── 本体 ──
 
     def run(self) -> None:
-        if not self.enabled:
-            return
-        next_motion = time.monotonic() + random.uniform(IDLE_MOTION_MIN_SEC,
-                                                        IDLE_MOTION_MAX_SEC)
-        next_emotion = time.monotonic() + random.uniform(IDLE_EMOTION_MIN_SEC,
-                                                         IDLE_EMOTION_MAX_SEC)
-        while not self._stop.wait(0.5):
+        now = time.monotonic()
+        with self._lock:
+            self._next_at = now + random.uniform(IDLE_MOTION_MIN_SEC,
+                                                 IDLE_MOTION_MAX_SEC)
+        next_emotion = now + random.uniform(IDLE_EMOTION_MIN_SEC,
+                                            IDLE_EMOTION_MAX_SEC)
+        while not self._stop.wait(TICK_SEC):
             now = time.monotonic()
-            if now < self._hold_until:
-                continue
-            if self._busy():
-                # 喋っている間は触らない。予定は先送りする
-                next_motion = max(next_motion, now + IDLE_MOTION_MIN_SEC)
-                next_emotion = max(next_emotion, now + IDLE_EMOTION_MIN_SEC)
+            with self._lock:
+                speaking = self._speaking
+                category = self._speak_category
+                due_at = self._next_at
+            due = now >= due_at
+
+            if speaking:
+                if due:
+                    # 次の予定は「実際に投げた時刻」ではなく「予定時刻」から数える。
+                    # 実際の時刻を基準にするとループの刻みぶん（最大 TICK_SEC）だけ
+                    # 毎回後ろへずれ、重なりがその都度削られていく
+                    self._play(category, base=due_at)
                 continue
 
-            if now >= next_motion:
-                self._play_gesture()
-                next_motion = now + random.uniform(IDLE_MOTION_MIN_SEC,
-                                                   IDLE_MOTION_MAX_SEC)
+            # 待機中。IDLE_ENABLED=false ならここから先はやらない
+            # （発話中のモーションだけを残す）
+            if not self.enabled:
+                continue
+            if due:
+                self._play(_weighted_category(),
+                           spacing=random.uniform(IDLE_MOTION_MIN_SEC,
+                                                  IDLE_MOTION_MAX_SEC))
             if now >= next_emotion:
                 self._drift_emotion()
                 next_emotion = now + random.uniform(IDLE_EMOTION_MIN_SEC,
                                                     IDLE_EMOTION_MAX_SEC)
 
-    def _busy(self) -> bool:
-        """Unity が発話中か。落ちているときは触らない方に倒す。"""
-        try:
-            st = unity_client.status()
-        except unity_client.UnityError:
-            return True
-        return bool(st.get("speaking")) or int(st.get("speak_queue", 0)) > 0
+    def _play(self, category: str, spacing: float = None,
+              base: float = None) -> None:
+        """1本投げて、次に投げる時刻を決める。
 
-    def _play_gesture(self) -> None:
-        path = self.pool.pick(_weighted_category())
+        spacing を渡さなければ「クリップの尺 - 重なり」＝途切れない間隔にする。
+        VRMA_CHUNK_OVERLAP は VrmaMotionPlayer.FadeDuration と同じ値で、
+        Unity 側はこの重なりで2本をクロスフェードする（重みの合計が常に1に
+        なるので Idle が顔を出さない）。
+        """
+        retry = spacing if spacing is not None else IDLE_MOTION_MIN_SEC
+        path = self.pool.pick(category)
         if not path:
+            # プールが空。Animator の Idle が出るだけなので配信は続く
+            self._schedule(retry)
             return
+        clip = self.pool.duration_of(path)
         try:
             unity_client.motion(path)
         except unity_client.UnityError as e:
             print(f"[idle] しぐさを送れません（無視します）: {e}")
+            self._schedule(retry)
+            return
+        if spacing is None:
+            spacing = max(0.5, clip - VRMA_CHUNK_OVERLAP)
+        self._schedule(spacing, base=base)
+
+    def _schedule(self, seconds: float, base: float = None) -> None:
+        """次にモーションを投げる時刻を決める。
+
+        base（前回の予定時刻）を渡すとそこから数えるので、ループの刻みぶんの
+        遅れが積み上がらない。大きく出遅れていたら現在時刻から数え直す
+        （スリープ復帰などで一気にまとめて投げないため）。
+        """
+        now = time.monotonic()
+        if base is None or now - base > 1.0:
+            base = now
+        with self._lock:
+            self._next_at = base + seconds
 
     def _drift_emotion(self) -> None:
         bv, ba = self._base

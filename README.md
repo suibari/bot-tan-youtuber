@@ -366,32 +366,83 @@ curl localhost:2338/status
 |---|---|---|
 | YouTube がコメントを配る | 数秒 | **どうにもならない。** liveChatMessages は `pollingIntervalMillis` を守る義務があり、無視するとクォータを焼き切って配信の途中からコメントが読めなくなる |
 | コメント欄への反映 | 最大10秒 | `ChatPoller._accept` が受信と同時に `comments.txt` を書く。以前は10秒ごとの雑務に任せていた |
-| 直前の発話が終わるのを待つ | 5〜15秒 | **ここがいちばん効いていた。** フリートークは `interruptible=True` で、文と文の切れ目でコメントの有無を見て切り上げる |
-| LLM | 約2秒 | 実測（gemini-2.5-flash、2〜3文の構造化出力） |
+| 直前の発話が終わるのを待つ | 5〜15秒 | **ここがいちばん効いている。** フリートークは `interruptible=True` で、文と文の切れ目でコメントの有無を見て切り上げる。コメントへの返信は途中で切らない方針なので、ここは残る |
+| DB（気分・energy） | 0〜数秒 | `_bot_context()` は `BOT_CONTEXT_TTL_SEC`（既定20秒）キャッシュし、DB は1往復だけ。以前は同じ行を2回引いて接続を2本張っていた |
+| LLM | 約2秒 | 実測（gemini-2.5-flash、2〜3文の構造化出力）。`LLM_TIMEOUT_SEC`（既定20秒）で頭を打たせる |
 | VOICEVOX + 送信 | 0.1〜0.7秒 | 全文まとめてではなく**1文ずつ**合成して Unity のキューへ流し込む。喋り出しまで実測 0.12秒 |
+| ARDY のモーション生成 | 4.6〜12.8秒 | **待たない。** プールから即座に1本引いて再生し、生成は別スレッドで走らせて次回以降に回す（`live/motion.py`） |
+
+実測は `[live] 反応まで X.X秒 (待ち a / DB b / LLM c / 合成 d)` としてログに出る。
+「待ち」がコメント受信から取り出しまで＝ほぼ直前の発話が終わるのを待った時間。
+
+**メインループから DB・LAN を触らないこと。** energy ゲージ・RAG 先読み・記憶の
+引き直しは `_start_chores()` の別スレッドで回している。以前は `run_loop` の中で
+直接呼んでおり、DB のホスト（`DB_HOST`）が不調だと**コメントが1件も無くても
+十数秒止まった**（2026-08-21 の配信。同じホストの 3200/3204 も全滅していた）。
+`DB_CONNECT_TIMEOUT` は既定3秒。
 
 `_speak` は1文ごとに「合成 → `/speak` → いまの文が終わる 0.7秒 前まで待つ」を
 繰り返す。0.7秒 あれば次の文の合成が間に合う（実測 0.05〜0.7秒）ので音は途切れず、
 その待ち時間が割り込みの窓になる。字幕は `SubtitleScheduler.push()` で後から
 足していく（発話を始める時点では2文目以降の尺がまだ分からないため）。
 
+### 字幕は obs-websocket で流し込む
+
+OBS の `text_ft2_source_v2` を `from_file` で使うと、**約1秒に1回しか**
+ファイルを見に行かない（`video_tick` の中の `stat()`。間隔を指定する
+プロパティは無い）。これがそのまま「発話より字幕が遅れる」になる。しかも
+`st_mtime` は秒解像度なので、同じ秒に2回差し替えると2回目が丸ごと落ちる。
+
+`Obs.bind_text_sources()` が配信開始時に字幕ソースを探して `from_file` を切り、
+`subtitle.set_sink()` で `SetInputSettings` へ流す経路に差し替える。
+**シーンを手で直す必要はない**（終了時に `restore_text_files()` で戻す）。
+ソースは名前ではなく `text_file` が `SUBTITLE_JA` / `SUBTITLE_EN` を指しているかで
+見つけるので、手で組んだシーンでも動く。
+
+ファイルへの書き込みは保険として残してあり、websocket が落ちたら
+（`set_text` が3回続けて失敗したら）自動でファイル読み込みへ戻す。
+音声は PulseAudio の null sink 経由で OBS に入るぶん遅れるので、
+ずれが気になるときは `SUBTITLE_LEAD_SEC` で前後に振る。
+
 文と文の間の 0.25秒 の無音は `voice.synthesize_lines(tail_gap=...)` が作る。
 1文ずつ別々に送るので、こちらで作らないと詰まって聞こえる。
 
-### 黙っている間も動かす
+### モーションを途切れさせない
 
-Unity は生成モーションが乗っていない区間では Animator の Idle を流すだけで、
-表情も `/emotion` で最後に指定した値のまま固定される。放っておくと
-「同じ立ち姿・同じ顔」で1時間が過ぎる。
+`/motion` を投げるのは **`idle.IdleAnimator` だけ**。送出者を1つにしておかないと、
+待機スレッドが投げた直後に発話側が投げたとき、Unity（`VrmaMotionPlayer.EnqueueMotion`）が
+フェードイン途中＝重み1未満のクリップを打ち切る。合成後の重み `Min(1, wa+wb)` が
+1に届かず Idle が一瞬混ざって、ポーズが跳ねて見えていた。
 
-`idle.IdleAnimator` が配信ループとは別スレッドで、Unity の `/status` を見ながら
+- **発話中**（`speak_begin` 〜 `speak_end`）: 「クリップの尺 − `VRMA_CHUNK_OVERLAP`(0.5秒)」
+  ごとに次を投げ、常に2本が重なった状態を保つ。録画パイプラインが
+  時刻表を事前計算して 0.5秒 重ねて置いているのと同じことを、尺が先に分からない
+  配信では時間で刻んでやっている。表情は `_speak` が決めるのでここでは振らない
+- **待機中**: 9〜20秒おきにプールのモーションを1本（落ち着いたカテゴリを厚めに抽選）、
+  6〜14秒おきに valence/arousal を少し振る（直前の発話の感情を素の顔として引き継ぐ）
 
-- 9〜20秒おきにプールのモーションを1本投げる（落ち着いたカテゴリを厚めに抽選）
-- 6〜14秒おきに valence/arousal を少し振る（直前の発話の感情を素の顔として引き継ぐ）
+`IDLE_ENABLED=false` で止まるのは待機中のぶんだけで、発話中は動く。
 
-を行う。発話中は何もしない。`/speak` を送ってから Unity が実際に鳴らし始めるまでは
-`/status` が `speaking=false` のままなので、その隙に割り込まないよう `_speak` が
-`idle.hold()` で明示的に手を引かせている。
+生成モーション1本は **ARDY のセグメント連結**で作る（`LIVE_MOTION_SEGMENTS` ×
+`ARDY_LIVE_DURATION` ＝ 既定 3×3.0秒 ≒ 9秒、つなぎ目は `ARDY_BLEND_SEC`=0.7秒 の
+クロスフェード）。3秒の単発だと発話中の継ぎ足しが 2.5秒 に1回になり、
+Unity が `/motion` を受けるたびにメインスレッドで `.vrma` をパースする
+（`VrmaMotionPlayer.LoadVrma`）ぶんフレームが落ちやすい。尺は
+`data/motions/<cat>/<hash>.json` に残す（無い古いクリップは3秒とみなす）。
+
+### 生成モーションの見た目は Shorts と共通
+
+`common/vrma_style.py` の `vrma_unity_args()` が返す `-vrmaSmooth` などを、
+録画（`shorts/pipeline.py`）と配信（`live/unity_live.py`）の**両方**が Unity へ渡す。
+渡さないと `VrmaMotionPlayer` は「改修前の見た目」の既定値で動き、
+素の ARDY 出力がそのまま出る。統合前の配信は1つも渡しておらず、Unity のログが
+
+```
+[Vrma] keepIdleHands=False elbowBend=0deg wristBend=0deg headTilt=0deg smooth=0s
+```
+
+になっていた（`-vrmaSmooth 0.10` は実測でカクつき −64%）。配信だけ変えたいときは
+`LIVE_VRMA_SMOOTH` のように `LIVE_` を頭に付けた環境変数を置く。
 
 ### モーションの安全化は緩めない
 

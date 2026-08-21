@@ -58,6 +58,13 @@ ARDY_CFG = float(os.getenv("ARDY_CFG", "3.0"))
 # 開きが足りないと腕（袖）が胴にめり込む（retarget.py の ARM_SPREAD_SIGN 参照）
 ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "8"))
 
+# セグメントのつなぎ目のクロスフェード長[秒]。server.py の既定は6フレーム(20fps=0.3秒)で、
+# 独立生成された別ポーズ同士を繋ぐには短く、「スッと切り替わった」ように見えていた。
+# server.py 側は smoothstep で混ぜるので窓の両端で速度が0になる。
+# 未パッチのサーバーはこのフィールドを無視するだけなので送っても壊れない。
+# Shorts の長尺ブロックと、配信の1本ぶん（数セグメント連結）で同じ値を使う
+ARDY_BLEND_SEC = float(os.getenv("ARDY_BLEND_SEC", "0.7"))
+
 # 空きメモリが足りないとき、ここまで待つ[秒]。
 # ollama は既定5分のkeep_aliveでモデルを自動解放するので、待てば空くことが多い
 ARDY_MEM_WAIT_SEC = float(os.getenv("ARDY_MEM_WAIT_SEC", "360"))
@@ -377,16 +384,34 @@ def to_vrma(spec_json, out_vrma) -> bool:
         return False
 
 
-def generate_vrma(text: str, out_vrma, duration: float, seed: int,
-                  work_dir=None) -> bool:
-    """英文のモーション指示から .vrma を1本作る（生成 → 変換）。
+def generate_vrma(text: str = None, out_vrma=None, duration: float = None,
+                  seed: int = 0, work_dir=None,
+                  segments: list = None, blend_sec: float = None,
+                  timeout: float = None):
+    """モーション指示から .vrma を1本作る（生成 → 変換）。
 
-    text は motion_safety.sanitize_motion を通したものを渡すこと。
-    ここでも念のため通すが、呼び出し側で弾けるものは早く弾いたほうがよい。
+    単発（text + duration）と連結（segments）の2形態がある。連結は ARDY 側が
+    各セグメントを独立生成して blend_sec 秒でクロスフェードするので、
+    1本のクリップの中に継ぎ目のない複数の所作を入れられる。
+
+    text / segments[*]["text"] は motion_safety.sanitize_motion を通したものを
+    渡すこと。ここでも念のため通すが、呼び出し側で弾けるものは早く弾くほうがよい。
+
+    戻り値: 生成された長さ[秒]。失敗時は None（真偽値としても使える）。
     """
-    text = motion_safety.sanitize_motion(text)
-    if not text:
-        return False
+    if segments:
+        clean = []
+        for s in segments:
+            t = motion_safety.sanitize_motion(s["text"])
+            if t:
+                clean.append({"text": t, "duration": float(s["duration"])})
+        segments = clean
+        if not segments:
+            return None
+    else:
+        text = motion_safety.sanitize_motion(text)
+        if not text:
+            return None
 
     out_vrma = Path(out_vrma)
     out_vrma.parent.mkdir(parents=True, exist_ok=True)
@@ -394,12 +419,15 @@ def generate_vrma(text: str, out_vrma, duration: float, seed: int,
     spec_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        if generate_spec(spec_path, text=text, duration=duration, seed=seed) is None:
-            return False
+        made = generate_spec(spec_path, text=text, duration=duration,
+                             segments=segments, seed=seed,
+                             blend_sec=blend_sec, timeout=timeout)
+        if made is None:
+            return None
         if not to_vrma(spec_path, out_vrma):
-            return False
+            return None
     finally:
         spec_path.unlink(missing_ok=True)
 
-    print(f"[ARDY] 生成: {out_vrma.name} ({duration}秒, seed={seed})")
-    return True
+    print(f"[ARDY] 生成: {out_vrma.name} ({made:.1f}秒, seed={seed})")
+    return made

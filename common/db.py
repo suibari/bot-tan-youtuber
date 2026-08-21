@@ -26,8 +26,12 @@ DB_CONFIG = {
 # affirmative_bot に置くと DROP 候補になってしまう。別スキーマなら触られない。
 LIVE_SCHEMA = "bottan_live"
 
-# 接続待ちの上限[秒]。DB は LAN 内なので、返ってこないなら待つ意味がない
-CONNECT_TIMEOUT = 10
+# 接続待ちの上限[秒]。DB は LAN 内なので、返ってこないなら待つ意味がない。
+# 配信中はこの値がそのままコメントへの反応の遅れになる（DB を引くのは
+# メインループの中）。2026-08-21 の配信では DB と同じホストの biorhythm_server /
+# Bot Memory API が両方 timeout しており、10秒だと十数秒の無反応になった。
+# Shorts の録画パイプラインは待てるので、そちらだけ伸ばしたければ環境変数で。
+CONNECT_TIMEOUT = env_int("DB_CONNECT_TIMEOUT", 3)
 
 
 @contextmanager

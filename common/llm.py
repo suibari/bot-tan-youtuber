@@ -13,7 +13,7 @@ import time
 
 from openai import OpenAI, BadRequestError
 
-from common.env import env_flag
+from common.env import env_flag, env_float
 
 USE_LOCAL_LLM   = env_flag("USE_LOCAL_LLM")
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
@@ -25,20 +25,35 @@ GEMINI_MODELS = [
     m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").split(",") if m.strip()
 ]
 
+# 1リクエストの上限[秒]。指定しないと OpenAI SDK の既定 600秒 が効き、
+# さらに SDK 内部で2回リトライするので、下の create() の 3回 × モデル数 と
+# 掛け合わさって理論上数十分ぶん待つことになる。配信ではメインループが
+# そのまま止まってコメントに反応できなくなるので必ず縛る。
+# 実測は gemini-2.5-flash の構造化出力（2〜3文）で約2秒。
+# 録画パイプラインは待てるので、必要なら LLM_TIMEOUT_SEC で伸ばす
+LLM_TIMEOUT_SEC = env_float("LLM_TIMEOUT_SEC", 20.0)
+
 if USE_LOCAL_LLM:
-    client = OpenAI(api_key="ollama", base_url=LOCAL_LLM_URL)
+    client = OpenAI(api_key="ollama", base_url=LOCAL_LLM_URL,
+                    timeout=LLM_TIMEOUT_SEC, max_retries=0)
     LLM_MODELS = [LOCAL_LLM_MODEL]
     LLM_MODEL = LOCAL_LLM_MODEL
     print(f"[LLM] Ollama ({LLM_MODEL}) を使用します")
 else:
-    client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
+    client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL,
+                    timeout=LLM_TIMEOUT_SEC, max_retries=0)
     LLM_MODELS = GEMINI_MODELS
     LLM_MODEL = LLM_MODELS[0]
     print(f"[LLM] Gemini ({', '.join(LLM_MODELS)}) を使用します")
 
 
 def create(attempts_per_model: int = 3, **kwargs):
-    """LLM_MODELS を左から順に attempts_per_model 回ずつ試す。"""
+    """LLM_MODELS を左から順に attempts_per_model 回ずつ試す。
+
+    SDK 側のリトライは切ってある（max_retries=0）。ここで数える回数が
+    そのまま実際の試行回数なので、最悪の待ち時間は
+    LLM_TIMEOUT_SEC × attempts_per_model × len(LLM_MODELS) で見積もれる。
+    """
     last_exc = None
     for model in LLM_MODELS:
         for attempt in range(1, attempts_per_model + 1):

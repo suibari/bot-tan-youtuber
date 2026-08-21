@@ -18,7 +18,7 @@ from pathlib import Path
 from config import (UNITY_EXE, UNITY_PROJECT, LIVE_PORT, LIVE_DISPLAY,
                     LIVE_CAMERA_X, LIVE_CAMERA_Z, LIVE_LIGHT_INTENSITY,
                     LIVE_LIGHT_COLOR, LIVE_AMBIENT_COLOR, LIVE_MOUTH_CLOSE,
-                    LIVE_CHARACTER_YAW)
+                    LIVE_CHARACTER_YAW, vrma_unity_args)
 from common import xvfb
 import audio
 import unity_client
@@ -107,6 +107,10 @@ class UnityLive:
             cmd += ["-mouthCloseOnSilence", str(LIVE_MOUTH_CLOSE)]
         if LIVE_CHARACTER_YAW is not None:
             cmd += ["-liveCharacterYaw", str(LIVE_CHARACTER_YAW)]
+        # 生成モーションの見た目。録画パイプラインと同じ値を渡す。
+        # 渡さないと VrmaMotionPlayer は既定値（平滑化なし・手のポーズを上書き・
+        # 正面固定）で動き、素の ARDY 出力がそのまま出てカクついて見える
+        cmd += vrma_unity_args()
         print(f"[Unity] 起動: {' '.join(cmd)}")
         # プロセスグループを分けておく。停止時にまとめて畳める
         self.proc = subprocess.Popen(
