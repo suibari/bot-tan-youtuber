@@ -31,7 +31,8 @@ live/             ライブ配信
   live.py           配信のメインループ
 tools/            手動で使う道具（プール構築・OBS シーン構築・Unity 単体確認）
 setup/            systemd ユニットと Xorg/openbox の設定＋インストーラ
-data/             quiz.csv / bgm/ / motions/（生成物）/ obs/（配信中に書かれる）
+data/             quiz.csv / bgm/ / motions/（生成物）
+                  ※ OBS が読む字幕などは SUBTITLE_DIR（リポジトリの外）に書く
 logs/             pipeline_* quiz_* live_* ardy_*
 .env              **リポジトリのルートに1本だけ**。shorts と live が同じものを読む
 ```
@@ -50,7 +51,7 @@ logs/             pipeline_* quiz_* live_* ardy_*
                               ├→ ARDY          127.0.0.1:2337（非同期）
                               ├→ PostgreSQL    192.168.1.200:5432
                               ├→ biorhythm     localhost:3002
-                              └→ data/obs/*.txt（OBS が読む字幕・コメント欄）
+                              └→ $SUBTITLE_DIR/*.txt（OBS が読む字幕・コメント欄）
 ```
 
 ## 関連リポジトリ
@@ -290,6 +291,14 @@ sudo bash setup/install_units.sh
 `Persistent=false` にしてあるので、起動に失敗した日を後から取り返さない
 （変な時刻に配信枠が増えるのを防ぐ）。
 
+> **`systemctl start bottan-quiz.service` / `bottan-pipeline.service` は本番そのもの。**
+> 通し切ると YouTube に投稿され、クイズは `data/quiz_used.csv` を1問消費する。
+> 投稿せずに service 経由で動かしたいなら drop-in で環境変数を渡す:
+> ```sh
+> sudo systemctl edit bottan-quiz.service   # [Service] Environment=SKIP_YOUTUBE=true
+> ```
+> 手元で試すだけなら `./run_quiz.sh SKIP_YOUTUBE=true QUIZ_NO_CONSUME=true --preview`。
+
 ## 動作確認
 
 ```sh
@@ -298,6 +307,12 @@ sudo bash setup/install_units.sh
 
 # 一気通貫（YouTube・OBS・ARDY 抜き、偽コメントを流し込む）
 ./run_live.sh DRY_RUN=true SKIP_ARDY=true FAKE_COMMENTS=data/fake_comments.json
+
+# 同上を「いま」から数分で一周させる。LIVE_START_HHMM の既定は 21:00 で、
+# 未来だとその時刻まで sleep するので、3つとも近い時刻に上書きすること
+S=$(date -d '+5 min' +%H:%M); C=$(date -d '+11 min' +%H:%M); E=$(date -d '+13 min' +%H:%M)
+./run_live.sh DRY_RUN=true FAKE_COMMENTS=data/fake_comments.json \
+              LIVE_START_HHMM=$S LIVE_CLOSING_HHMM=$C LIVE_END_HHMM=$E
 
 # 本番と同じ経路で限定公開の配信を1本
 ./run_live.sh LIVE_YOUTUBE_PRIVACY=private

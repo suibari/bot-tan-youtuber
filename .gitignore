@@ -229,8 +229,11 @@ test*.py
 data/quiz_used.csv
 
 # ── botたん固有 ────────────────────────────────
-# 秘密情報。DB・Gemini・YouTube の資格情報が入る
+# 秘密情報。DB・Gemini・YouTube の資格情報が入る。
+# .env.before-merge のような派生も同じ中身なので、まとめて弾く
 .env
+.env.*
+!.env.example
 
 logs/
 
