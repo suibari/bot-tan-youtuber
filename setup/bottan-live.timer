@@ -1,0 +1,14 @@
+[Unit]
+Description=botたん YouTube ライブ配信を毎日 20:40 に起動する
+
+[Timer]
+# 21:00 開始に対して 20:40 起動。内訳:
+#   ARDY のモデル読み込み 4〜5分 / Unity の起動 1〜2分 /
+#   配信枠の作成と OBS の送出開始 1分 / YouTube の取り込み確認 数十秒
+OnCalendar=*-*-* 20:40:00
+# 起動に失敗した日を後から取り返さない。変な時刻に配信が始まるほうが困る
+Persistent=false
+Unit=bottan-live.service
+
+[Install]
+WantedBy=timers.target

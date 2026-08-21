@@ -1,0 +1,352 @@
+"""OBS の制御（obs-websocket v5）。
+
+やることは RTMP の設定と配信の開始・停止だけ。画面レイアウト（Unity の
+ウィンドウキャプチャ・字幕・コメント欄・energy メーター・BGM）は
+OBS のシーンとして事前に手で組んでおく。毎回プログラムから組み立てる必要はない。
+"""
+
+import configparser
+import os
+import shlex
+import signal
+from pathlib import Path
+import socket
+import subprocess
+import time
+
+import obsws_python as obs
+
+from config import (OBS_HOST, OBS_PORT, OBS_PASSWORD, OBS_LAUNCH, OBS_COMMAND,
+                    OBS_COLLECTION, OBS_PROFILE, LIVE_DISPLAY,
+                    STREAM_VIDEO_KBPS, STREAM_AUDIO_KBPS)
+
+
+class ObsError(RuntimeError):
+    pass
+
+
+# 配信プロファイルに入っていてほしい値。OBS は「シンプル」出力の
+# エンコーダをプロファイル読み込み時に一度だけ決めるので、起動前に
+# ini へ書いておかないと効かない（websocket で書いても次回起動から）
+def _wanted_profile_settings() -> dict:
+    return {
+        "Output": {"Mode": "Simple"},
+        "SimpleOutput": {
+            "StreamEncoder": "x264",
+            "VBitrate": str(STREAM_VIDEO_KBPS),
+            "ABitrate": str(STREAM_AUDIO_KBPS),
+            "Preset": "veryfast",
+            "UseAdvanced": "false",
+        },
+    }
+
+
+def _profile_dir() -> Path | None:
+    """OBS_PROFILE という名前のプロファイルのディレクトリを探す。
+
+    ディレクトリ名は OBS が名前から記号を落として作るので（bottan-live →
+    bottanlive）、名前で決め打ちできない。中の basic.ini を読んで判別する。
+    """
+    for base in (Path.home() / ".var/app/com.obsproject.Studio/config/obs-studio",
+                 Path.home() / ".config/obs-studio"):
+        root = base / "basic" / "profiles"
+        if not root.is_dir():
+            continue
+        for d in root.iterdir():
+            ini = d / "basic.ini"
+            if not ini.is_file():
+                continue
+            cfg = configparser.ConfigParser()
+            cfg.optionxform = str
+            try:
+                cfg.read(ini, encoding="utf-8")
+            except Exception:
+                continue
+            if cfg.get("General", "Name", fallback=None) == OBS_PROFILE:
+                return d
+    return None
+
+
+def ensure_profile_settings() -> bool:
+    """プロファイルの ini を望む値に揃える。書き換えたら True。
+
+    既定の NVENC は GPU の VRAM に CUDA コンテキストを作る。この機械の GPU は
+    8GB しかなく ARDY・Unity・VOICEVOX で埋まるため、実際に
+
+      cuda_ctx_init: ... CUDA_ERROR_OUT_OF_MEMORY (2): out of memory
+      Already in non_texture encoder, can't fall back further!
+      Stream output type 'rtmp_output' failed to start!
+
+    で配信開始に失敗し、YouTube 側が「配信を待っています」のまま止まった。
+    OBS はここからソフトウェアエンコーダへ落ちてくれないので x264 を明示する。
+    """
+    d = _profile_dir()
+    if d is None:
+        print(f"[OBS] プロファイル「{OBS_PROFILE}」が見つかりません"
+              f"（初回はシーン構築時に作られます）")
+        return False
+
+    ini = d / "basic.ini"
+    cfg = configparser.ConfigParser()
+    cfg.optionxform = str          # OBS のキーは大文字小文字を保つ
+    cfg.read(ini, encoding="utf-8")
+
+    changed = []
+    for section, values in _wanted_profile_settings().items():
+        if not cfg.has_section(section):
+            cfg.add_section(section)
+        for key, value in values.items():
+            if cfg.get(section, key, fallback=None) != value:
+                cfg.set(section, key, value)
+                changed.append(f"{section}/{key}={value}")
+    if not changed:
+        return False
+
+    with ini.open("w", encoding="utf-8") as f:
+        cfg.write(f, space_around_delimiters=False)
+    print(f"[OBS] プロファイルを更新しました: {', '.join(changed)}")
+    return True
+
+
+def _last_output_error() -> str:
+    """OBS のログから出力開始まわりのエラーを拾う。原因を即座に出すため。"""
+    logs = sorted(
+        (Path.home() / ".var/app/com.obsproject.Studio/config/obs-studio/logs").glob("*.txt"),
+        key=lambda p: p.stat().st_mtime, reverse=True)
+    if not logs:
+        logs = sorted((Path.home() / ".config/obs-studio/logs").glob("*.txt"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    if not logs:
+        return "  （OBS のログが見つかりません）"
+    lines = logs[0].read_text(errors="replace").splitlines()[-60:]
+    keys = ("failed to start", "out of memory", "fall back", "cuda_ctx_init",
+            "Connection to", "is offline", "Failed to connect")
+    hits = [l for l in lines if any(k in l for k in keys)]
+    return "\n".join("  " + h for h in hits) if hits else f"  （{logs[0]} を確認してください）"
+
+
+def _clear_crash_sentinel() -> None:
+    """前回の異常終了の痕跡を消す。
+
+    OBS は起動時に設定ディレクトリの `.sentinel/run_<uuid>` を作り、正常終了で
+    消す。残っていると「OBS Studioのクラッシュが検出されました。セーフモードで
+    起動しますか？」のモーダルが出て起動が止まる。:99 には押す人が居ないので
+    無人配信がそこで詰む（`--safe-mode` はあるが WebSocket まで無効になるので
+    使えない）。OBS が動いていないときだけ消す。
+    """
+    if _port_open(OBS_HOST, OBS_PORT):
+        return
+    for base in (Path.home() / ".var/app/com.obsproject.Studio/config/obs-studio",
+                 Path.home() / ".config/obs-studio"):
+        sentinel = base / ".sentinel"
+        if not sentinel.is_dir():
+            continue
+        stale = list(sentinel.glob("run_*"))
+        for f in stale:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        if stale:
+            print(f"[OBS] 前回の異常終了の痕跡を {len(stale)} 件消しました（{sentinel}）")
+
+
+def _stop_running(timeout: float = 30.0) -> None:
+    """動いている OBS を行儀よく止める（シーンを保存させるため）。"""
+    r = subprocess.run(["pgrep", "-x", "obs"], capture_output=True, text=True)
+    pids = [int(p) for p in r.stdout.split()]
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _port_open(OBS_HOST, OBS_PORT):
+            return
+        time.sleep(0.5)
+    print("[OBS] 終了を待てませんでした")
+
+
+def _port_open(host: str, port: int, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def launch(timeout: float = 90.0) -> bool:
+    """OBS を LIVE_DISPLAY 上で起動する。すでに動いていれば何もしない。
+
+    X11 のウィンドウキャプチャは「OBS 自身が接続している X ディスプレイ」の
+    窓しか列挙できない。デスクトップ(:0)で起動した OBS からは :99 の Unity は
+    ソース一覧に絶対に出てこないので、OBS も :99 側で起動する必要がある。
+
+    さらに :99 には EWMH 準拠のウィンドウマネージャ（openbox、
+    bottan-live-wm.service）が居ること。居ないと OBS が起動時に
+    「XComposite capture disabled.」と言ってプラグインごと読み込みを諦め、
+    「ウィンドウキャプチャ」という選択肢自体が消える。
+    """
+    if _port_open(OBS_HOST, OBS_PORT):
+        if ensure_profile_settings():
+            # エンコーダの選択はプロファイル読み込み時に一度だけ決まるので、
+            # 書き換えたなら起動し直さないと反映されない
+            print("[OBS] 設定を反映するため起動し直します")
+            _stop_running()
+        else:
+            print(f"[OBS] すでに起動しています（{OBS_HOST}:{OBS_PORT}）")
+            return False
+    else:
+        ensure_profile_settings()
+    if not OBS_LAUNCH:
+        raise ObsError(
+            f"OBS が起動していません（{OBS_HOST}:{OBS_PORT}）。"
+            f"OBS_LAUNCH=true にするか、DISPLAY={LIVE_DISPLAY} で手動起動してください"
+        )
+
+    env = dict(os.environ)
+    env["DISPLAY"] = LIVE_DISPLAY
+    # Wayland が見えていると OBS がそちらのプラットフォームを選び、
+    # X11 用のキャプチャプラグインが読まれない
+    env.pop("WAYLAND_DISPLAY", None)
+    cmd = shlex.split(OBS_COMMAND)
+    if cmd[0] == "flatpak":
+        # flatpak のサンドボックスには外の DISPLAY が引き継がれないので明示する
+        cmd.insert(2, f"--env=DISPLAY={LIVE_DISPLAY}")
+    # 起動時に出うるダイアログを抑止する。:99 には誰も居ないので、
+    # ダイアログが出た時点で無人配信は詰む
+    cmd.append("--disable-missing-files-check")
+    # 配信用のシーンコレクションとプロファイルを名指しで開く。デスクトップ側で
+    # OBS を触って別のコレクションを開いたままにしていても、配信は必ず
+    # こちらで始まる
+    cmd += ["--collection", OBS_COLLECTION, "--profile", OBS_PROFILE]
+    _clear_crash_sentinel()
+
+    print(f"[OBS] {LIVE_DISPLAY} で起動します: {' '.join(cmd)}")
+    subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _port_open(OBS_HOST, OBS_PORT):
+            print(f"[OBS] 起動しました（{time.time() - (deadline - timeout):.0f}秒）")
+            return True
+        time.sleep(1.0)
+    raise ObsError(
+        f"OBS が {timeout:.0f} 秒で起動しませんでした。"
+        f"[ツール]→[WebSocket サーバー設定]が有効か確認してください"
+    )
+
+
+class Obs:
+    def __init__(self):
+        self.client = None
+
+    def connect(self, timeout: float = 10.0) -> "Obs":
+        try:
+            self.client = obs.ReqClient(
+                host=OBS_HOST, port=OBS_PORT, password=OBS_PASSWORD, timeout=timeout
+            )
+        except Exception as e:
+            raise ObsError(
+                f"OBS に接続できません（{OBS_HOST}:{OBS_PORT}）: {e}。"
+                f"OBS の[ツール]→[WebSocket サーバー設定]で有効化してください"
+            ) from e
+        version = self.client.get_version()
+        print(f"[OBS] 接続しました: OBS {version.obs_version} / "
+              f"websocket {version.obs_web_socket_version}")
+        self.check_encoder()
+        return self
+
+    def check_encoder(self) -> None:
+        """いま走っている OBS のエンコーダ設定を確かめる。
+
+        値そのものは `ensure_profile_settings()` が起動前に ini へ書く。
+        ここで websocket 越しに書いても**次回起動まで効かない**（OBS は
+        「シンプル」出力のエンコーダをプロファイル読み込み時に一度だけ
+        決めるため）ので、ずれていたら知らせるだけにする。
+        """
+        try:
+            enc = self.client.get_profile_parameter(
+                "SimpleOutput", "StreamEncoder").parameter_value
+            vb = self.client.get_profile_parameter(
+                "SimpleOutput", "VBitrate").parameter_value
+        except Exception as e:
+            print(f"[OBS] エンコーダ設定を読めませんでした: {e}")
+            return
+
+        if enc != "x264":
+            print(f"[OBS] 警告: エンコーダが {enc} です。GPU の VRAM が足りないと"
+                  f"配信開始に失敗します（OBS を起動し直すと x264 になります）")
+        else:
+            print(f"[OBS] エンコーダ: x264 / 映像 {vb}kbps")
+
+    def set_stream_target(self, ingestion_address: str, stream_key: str) -> None:
+        """YouTube から受け取った RTMP の宛先を設定する。"""
+        self.client.set_stream_service_settings(
+            ss_type="rtmp_custom",
+            ss_settings={
+                "server": ingestion_address,
+                "key": stream_key,
+                "use_auth": False,
+            },
+        )
+        print(f"[OBS] 配信先を設定しました: {ingestion_address}")
+
+    def start_stream(self, timeout: float = 15.0) -> None:
+        status = self.client.get_stream_status()
+        if status.output_active:
+            print("[OBS] すでに配信中です")
+            return
+        self.client.start_stream()
+
+        # StartStream はリクエストが通っただけで成功を返す。エンコーダの
+        # 初期化に失敗しても例外にならないので、実際に走り出したか確かめる。
+        # ここを見ていなかったせいで、YouTube 側の 180秒 タイムアウトまで
+        # 原因が分からなかった
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.client.get_stream_status().output_active:
+                print("[OBS] 配信を開始しました")
+                return
+            time.sleep(0.5)
+
+        raise ObsError(
+            f"OBS が配信を開始できませんでした（{timeout:.0f}秒）。"
+            f"多くはエンコーダの初期化失敗です:\n"
+            + _last_output_error()
+        )
+
+    def stop_stream(self) -> None:
+        try:
+            status = self.client.get_stream_status()
+            if not status.output_active:
+                return
+            self.client.stop_stream()
+            print("[OBS] 配信を停止しました")
+        except Exception as e:
+            print(f"[OBS] 停止に失敗: {e}")
+
+    def stream_stats(self) -> dict:
+        """配信の健全性。フレームドロップが増えていたら回線か描画が苦しい。"""
+        try:
+            s = self.client.get_stream_status()
+            return {
+                "active": s.output_active,
+                "duration_sec": s.output_duration / 1000.0,
+                "skipped_frames": s.output_skipped_frames,
+                "total_frames": s.output_total_frames,
+                "congestion": s.output_congestion,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def disconnect(self) -> None:
+        if self.client is not None:
+            try:
+                self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None

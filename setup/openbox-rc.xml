@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  配信用ディスプレイ (:99) の openbox 設定。
+
+  openbox が居るのは見た目のためではない。OBS の XComposite ウィンドウ
+  キャプチャは EWMH 準拠のウィンドウマネージャが居ないとプラグインごと
+  無効化される（起動ログに "XComposite capture disabled."）。
+
+  そのうえで、Unity のウィンドウには装飾を付けず全画面に貼り付ける。
+  タイトルバーが付くとクライアント領域が数十px縮み、OBS 側の切り抜き位置が
+  ずれるため。
+-->
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <theme>
+    <!-- 誰も見ないので最小限。アニメーションもしない -->
+    <animateIconify>no</animateIconify>
+  </theme>
+  <focus>
+    <focusNew>yes</focusNew>
+    <followMouse>no</followMouse>
+  </focus>
+  <placement>
+    <policy>Smart</policy>
+  </placement>
+  <desktops>
+    <number>1</number>
+  </desktops>
+  <applications>
+    <application class="Unity">
+      <decor>no</decor>
+      <maximized>true</maximized>
+      <position force="yes"><x>0</x><y>0</y></position>
+      <layer>below</layer>
+    </application>
+  </applications>
+</openbox_config>

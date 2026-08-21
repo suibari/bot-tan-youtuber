@@ -1,0 +1,9 @@
+[Unit]
+Description=botたん YouTube自動投稿 毎日JST18時
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

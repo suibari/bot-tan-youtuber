@@ -14,12 +14,15 @@
 import os
 import csv
 import random
+import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 _JST = timezone(timedelta(hours=9))
 
-DATA_DIR  = Path(__file__).parent / "data"
+# data/ はリポジトリのルートにある（shorts/ の隣ではない）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common.env import DATA_DIR  # noqa: E402
 QUIZ_CSV  = Path(os.getenv("QUIZ_CSV",  DATA_DIR / "quiz.csv"))
 USED_CSV  = Path(os.getenv("QUIZ_USED_CSV", DATA_DIR / "quiz_used.csv"))
 

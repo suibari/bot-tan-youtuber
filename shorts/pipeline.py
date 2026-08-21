@@ -109,15 +109,16 @@ SCRIPT_SCHEMA = {
 # Step 1: ラズパイDBからデータ取得
 # ──────────────────────────────────────────────
 
-import psycopg2
 from psycopg2.extras import RealDictCursor
+
+from common.db import connect_raw
 
 
 def fetch_from_bot_db() -> dict:
     """ラズパイDBからNagiのポストとMood履歴を取得する"""
     print("[DB] ラズパイDBに接続中...")
 
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = connect_raw()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
 

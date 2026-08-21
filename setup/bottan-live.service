@@ -1,0 +1,22 @@
+[Unit]
+Description=botたん YouTube ライブ配信 (21:00-22:00)
+# 映像は GPU 仮想ディスプレイの上に出すので、先に上がっている必要がある
+Requires=bottan-live-xorg.service
+After=bottan-live-xorg.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+Group=__USER__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/run_live.sh
+# 20:40 起動で 22:00 終了。ARDY の読み込み4〜5分と flock の待ちを含めて余裕を見る
+TimeoutStartSec=6000
+# 配信が落ちたら自動で上げ直さない。中途半端な時刻に配信枠が増えるほうが困る
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

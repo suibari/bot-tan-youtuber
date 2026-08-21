@@ -10,69 +10,32 @@ YouTube API 関連処理モジュール
 
 import os
 import re
+import sys
 import time
 import json
-import pickle
 import random
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
-import requests
-import psycopg2
 from psycopg2.extras import RealDictCursor
-from dotenv import load_dotenv
-load_dotenv()
 
-DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "192.168.1.200"),
-    "port":     int(os.getenv("DB_PORT", "5432")),
-    "dbname":   os.getenv("DB_NAME", ""),
-    "user":     os.getenv("DB_USER", ""),
-    "password": os.getenv("DB_PASSWORD", ""),
-}
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from common import notify as _notify                  # noqa: E402
+from common import youtube_auth as _youtube_auth      # noqa: E402
+from common.db import DB_CONFIG, connect_raw          # noqa: E402,F401
 
 # SNSコーナーのcorner_name。"BlueskyCorner"はNagi移行前に保存された過去データとの互換用
 SNS_CORNER_NAMES = ("NagiCorner", "BlueskyCorner")
 
 
 def _get_youtube_client():
-    """YouTube API クライアントを返す（OAuth2認証）。失敗時は None。"""
+    """YouTube API クライアントを返す（OAuth2認証）。失敗時は None。
+
+    人が居る前提の対話フローに入りうる（トークンが失効していたとき）。
+    従来どおり失敗しても例外にせず None を返し、呼び出し側が投稿をスキップする。
+    """
     try:
-        from google.oauth2.credentials import Credentials
-        from google_auth_oauthlib.flow import InstalledAppFlow
-        from googleapiclient.discovery import build
-
-        SCOPES = [
-            "https://www.googleapis.com/auth/youtube.upload",
-            "https://www.googleapis.com/auth/youtube",
-            "https://www.googleapis.com/auth/youtube.force-ssl"
-        ]
-        TOKEN_PATH = Path.home() / ".bottan_youtube_token.pickle"
-        CLIENT_SECRETS = Path(os.getenv("YOUTUBE_CLIENT_SECRETS", str(Path.home() / ".bottan_youtube_client_secrets.json")))
-
-        creds = None
-        if TOKEN_PATH.exists():
-            with open(TOKEN_PATH, "rb") as f:
-                creds = pickle.load(f)
-
-        if creds and creds.expired and creds.refresh_token:
-            from google.auth.transport.requests import Request
-            creds.refresh(Request())
-            with open(TOKEN_PATH, "wb") as f:
-                pickle.dump(creds, f)
-        if not creds or not creds.valid:
-            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRETS), SCOPES)
-            flow.redirect_uri = "urn:ietf:wg:oauth:2.0:oob"
-            auth_url, _ = flow.authorization_url(prompt="consent")
-            print(f"\n以下のURLをブラウザで開いてください:\n{auth_url}\n")
-            code = input("認証後に表示されたコードを入力してください: ")
-            flow.fetch_token(code=code)
-            creds = flow.credentials
-            with open(TOKEN_PATH, "wb") as f:
-                pickle.dump(creds, f)
-
-        return build("youtube", "v3", credentials=creds)
-
+        return _youtube_auth.get_client(interactive=True)
     except ImportError:
         print("[YouTube] google-api-python-client未インストール。")
         return None
@@ -84,7 +47,7 @@ def _get_youtube_client():
 def fetch_youtube_comments() -> list[dict]:
     """前日のYouTube動画へのコメントをランダム3件取得する。取得失敗時は []。"""
     try:
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = connect_raw()
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 "SELECT url FROM affirmative_bot.youtube_shorts ORDER BY id DESC LIMIT 1"
@@ -226,7 +189,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
 
 def fetch_recent_corners(limit: int = 2) -> dict:
     """直近N件のcornersからClosingの除外statusを取得する"""
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = connect_raw()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -258,7 +221,7 @@ def fetch_recent_corners(limit: int = 2) -> dict:
 
 def get_recent_video_stats(n: int = 3) -> list[dict]:
     """DBの直近n本の動画について YouTube API で viewCount/commentCount を取得する"""
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = connect_raw()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -307,7 +270,7 @@ def should_enable_comment_corner(recent_videos: list[dict]) -> bool:
 
 def fetch_nagi_corner_context() -> dict:
     """NagiCornerの参考リスト（いいね上位3件）と除外リスト（直近3日間）を取得する"""
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = connect_raw()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -373,7 +336,7 @@ def fetch_nagi_corner_context() -> dict:
 def save_youtube_upload_to_db(url: str, title: str, corners_metadata: list[dict] = None) -> None:
     """YouTube投稿情報をDBのyoutube_shortsテーブルに記録する"""
     print(f"[DB] YouTube投稿情報を記録中: {url}")
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = connect_raw()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -391,13 +354,4 @@ def save_youtube_upload_to_db(url: str, title: str, corners_metadata: list[dict]
 
 
 def notify_discord(yt_url: str, title: str) -> None:
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-    if not webhook_url:
-        return
-    payload = {"content": f"✅ YouTube投稿完了！\n**{title}**\n{yt_url}"}
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=10)
-        resp.raise_for_status()
-        print("[Discord] 通知送信完了")
-    except Exception as e:
-        print(f"[Discord] 通知失敗（続行）: {e}")
+    _notify.youtube_uploaded(yt_url, title)

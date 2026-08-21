@@ -1,0 +1,18 @@
+[Unit]
+Description=botたんライブ配信用 GPU 仮想ディスプレイ (Xorg :99)
+Documentation=https://github.com/suibari
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+# Xorg は -config にフルパスを渡す場合 root 権限が要る（非rootでは
+# 標準の場所しか読めない制限がある）
+User=root
+ExecStart=/usr/bin/Xorg :99 -config /etc/X11/xorg-bottan-live.conf -noreset -nolisten tcp -logfile /var/log/Xorg.99.log
+# 配信中に落ちたら映像が止まる。必ず上げ直す
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

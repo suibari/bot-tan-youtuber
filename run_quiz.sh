@@ -14,6 +14,9 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
+# common/ を import できるようにリポジトリのルートを通す
+export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
 mkdir -p "$SCRIPT_DIR/logs"
 
 # KEY=VALUE 形式の引数は環境変数にし、それ以外は quiz_pipeline.py へ渡す
@@ -33,7 +36,7 @@ LOG_FILE="$SCRIPT_DIR/logs/quiz_$(date +%Y%m%d_%H%M%S).log"
 # /tmp/.X*-lock も全削除するため、夜版と同時に走ると互いを壊す。
 # systemd timer の Persistent=true により、停止後の再起動で両方が同時発火しうる。
 flock -w 3600 /tmp/bottan-render.lock \
-  "$SCRIPT_DIR/venv/bin/python" -u "$SCRIPT_DIR/quiz_pipeline.py" "${PY_ARGS[@]}" \
+  "$SCRIPT_DIR/venv/bin/python" -u "$SCRIPT_DIR/shorts/quiz_pipeline.py" "${PY_ARGS[@]}" \
   2>&1 | tee "$LOG_FILE"
 # tee ではなく python の終了コードを systemd に返す。
 # 保存しないと下の if 文の値がスクリプトの終了コードになり、

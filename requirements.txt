@@ -42,3 +42,6 @@ typing_extensions==4.15.0
 uritemplate==4.2.0
 urllib3==2.7.0
 websockets==15.0.1
+
+# ── ライブ配信（live/）で追加になる依存 ──
+obsws-python==1.7.0

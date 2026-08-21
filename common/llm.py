@@ -1,0 +1,115 @@
+"""LLM 呼び出し。Gemini の OpenAI 互換エンドポイント、または Ollama。
+
+モデルは LLM_MODELS の左から順に attempts_per_model 回ずつ試し、
+400系（リクエスト不正）は即時再送しても意味がないので1回で失敗させる。
+
+以前は shorts/core.py と live/llm.py に同じ実装が2つあった。
+"""
+
+import json
+import os
+import re
+import time
+
+from openai import OpenAI, BadRequestError
+
+from common.env import env_flag
+
+USE_LOCAL_LLM   = env_flag("USE_LOCAL_LLM")
+GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+LOCAL_LLM_URL   = os.getenv("OLLAMA_URL", "http://localhost:11434/v1")
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M")
+# カンマ区切りで複数指定でき、左から順にフォールバックする
+GEMINI_MODELS = [
+    m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").split(",") if m.strip()
+]
+
+if USE_LOCAL_LLM:
+    client = OpenAI(api_key="ollama", base_url=LOCAL_LLM_URL)
+    LLM_MODELS = [LOCAL_LLM_MODEL]
+    LLM_MODEL = LOCAL_LLM_MODEL
+    print(f"[LLM] Ollama ({LLM_MODEL}) を使用します")
+else:
+    client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL)
+    LLM_MODELS = GEMINI_MODELS
+    LLM_MODEL = LLM_MODELS[0]
+    print(f"[LLM] Gemini ({', '.join(LLM_MODELS)}) を使用します")
+
+
+def create(attempts_per_model: int = 3, **kwargs):
+    """LLM_MODELS を左から順に attempts_per_model 回ずつ試す。"""
+    last_exc = None
+    for model in LLM_MODELS:
+        for attempt in range(1, attempts_per_model + 1):
+            try:
+                return client.chat.completions.create(model=model, **kwargs)
+            except BadRequestError:
+                # 400系はリトライ不要（プロンプトやスキーマの問題）
+                raise
+            except Exception as e:
+                last_exc = e
+                if attempt < attempts_per_model:
+                    print(f"[LLM] {model} 試行{attempt}失敗、リトライします... ({e})")
+                else:
+                    print(f"[LLM] {model} {attempts_per_model}回失敗、次のモデルへ移行します ({e})")
+    raise last_exc
+
+
+def parse_json(raw: str) -> dict:
+    """LLM構造化出力のJSONをパースする。```json フェンスを剥がしてから json.loads する。"""
+    cleaned = re.sub(r"```json|```", "", raw).strip()
+    return json.loads(cleaned)
+
+
+def generate_json(system_prompt: str, user_prompt: str, schema: dict,
+                  schema_name: str = "script", temperature: float = None,
+                  debug: bool = True) -> dict:
+    """system + user + スキーマ を渡して JSON を得る汎用呼び出し。
+
+    Gemini は response_format(json_schema)、Ollama(Gemma) は構造化出力非対応なので
+    extra_body でコンテキストサイズだけ調整する。
+
+    temperature を None にすると **kwarg ごと送らない**。統合前の Shorts 側は
+    temperature を指定していなかったので、既定の None で当時と同じリクエストになる。
+    """
+    extra: dict = {}
+    if USE_LOCAL_LLM:
+        extra["extra_body"] = {
+            "options": {"num_ctx": int(os.getenv("LOCAL_LLM_CTX", "8192"))},
+            "think": False,
+        }
+    else:
+        # Gemini の OpenAI 互換エンドポイントは response_format で渡す
+        # （extra_body に response_schema を入れると400になる）
+        extra["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name, "schema": schema},
+        }
+    if temperature is not None:
+        extra["temperature"] = temperature
+
+    response = create(
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        **extra,
+    )
+    if debug:
+        print(f"[DEBUG] finish_reason: {response.choices[0].finish_reason}")
+    return parse_json(response.choices[0].message.content.strip())
+
+
+def retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,),
+          delay: float = 0, **kwargs):
+    """最大 attempts 回リトライする共通ヘルパー"""
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except catch as e:
+            if attempt == attempts:
+                raise
+            print(f"[{label}] 試行{attempt}失敗、リトライします... ({e})")
+            if delay > 0:
+                time.sleep(delay)

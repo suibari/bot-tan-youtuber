@@ -49,9 +49,9 @@ botたん動画パイプライン 共通処理
 
 import os
 import re
+import sys
 import json
 import time
-import wave
 import signal
 import hashlib
 import subprocess
@@ -59,11 +59,18 @@ import tempfile
 from datetime import timezone, timedelta
 from pathlib import Path
 
-import requests
-from openai import OpenAI, BadRequestError as _OpenAIBadRequestError
 
-from dotenv import load_dotenv
-load_dotenv()
+# `python shorts/pipeline.py` のように直接起動されると sys.path[0] が shorts/ に
+# なるので、リポジトリのルートを足して common/ を読めるようにする。
+# run.sh / run_quiz.sh も PYTHONPATH を渡すが、手で叩いたときのために両方入れておく
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from common import ardy as _ardy, llm as _llm, motion_safety, voice as _voice, xvfb as _xvfb
+from common.db import DB_CONFIG                                        # noqa: F401
+from common.env import env_flag, env_float, env_int, env_float_opt     # noqa: F401
+from common.env import LOGS_DIR, DATA_DIR, ROOT as REPO_ROOT           # noqa: F401
 
 _JST = timezone(timedelta(hours=9))
 
@@ -71,75 +78,32 @@ _JST = timezone(timedelta(hours=9))
 # 設定
 # ──────────────────────────────────────────────
 
-def env_flag(name: str, default: bool = False) -> bool:
-    """真偽値の環境変数を読む。
-
-    `SKIP_YOUTUBE=TRUE` のような大文字や `1` / `yes` も受け付ける。
-    以前は `os.getenv("SKIP_YOUTUBE") == "true"` と完全一致で見ていたため、
-    **TRUE を渡したのにスキップされず動画が公開された**（2026-08-15）。
-    真偽値の環境変数は必ずこれを通すこと。
-    """
-    v = os.getenv(name)
-    if v is None or v.strip() == "":
-        return default
-    return v.strip().lower() in ("true", "1", "yes", "on")
-
-
-
-VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
-VOICEVOX_SPEAKER = int(os.getenv("VOICEVOX_SPEAKER", "8"))
-# 動画冒頭のフック（掴みの一言）だけに使う合成パラメータ。
-# ゆっくり・抑揚強め・大きめ・少し高めにして、本編の語りと声色を変える。
+# VOICEVOX まわりは common/voice.py に集約した。ここは後方互換の再輸出。
 # 夜版は Thumbnail の一言（generate_voice の intro_text）、
-# 朝版は question_intro の1文目（掛け声）に当てる。
-# 話者(VOICEVOX_SPEAKER)は変えない。同一キャラなので声そのものは共通。
-HOOK_VOICE_PARAMS = {
-    "speedScale":      0.85,
-    "intonationScale": 1.4,
-    "volumeScale":     1.3,
-    "pitchScale":      0.05,
-}
+# 朝版は question_intro の1文目（掛け声）に HOOK_VOICE_PARAMS を当てる。
+VOICEVOX_URL      = _voice.VOICEVOX_URL
+VOICEVOX_SPEAKER  = _voice.VOICEVOX_SPEAKER
+HOOK_VOICE_PARAMS = _voice.HOOK_VOICE_PARAMS
 UNITY_EXE        = os.getenv("UNITY_EXE", "/home/suibari/Unity/Hub/Editor/6000.0.76f1/Editor/Unity")
 UNITY_PROJECT    = os.getenv("UNITY_PROJECT", "/home/suibari/bottan-video")
 # 指定するとUnityへ -vrmaMotionDir が渡り、VrmaMotionPlayer が該当モーションを差し替える。
 # 未指定なら Unity 側は完全な no-op で、従来のMixamoモーションのまま。
 VRMA_MOTION_DIR  = os.getenv("VRMA_MOTION_DIR", "")
 BGM_PATH         = os.getenv("BGM_PATH", "")
-USE_LOCAL_LLM    = env_flag("USE_LOCAL_LLM")
+USE_LOCAL_LLM    = _llm.USE_LOCAL_LLM
 
 # 動画の出力仕様（Unity Recorder の設定と一致させること）
 W, H = 1080, 1920
 FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
 
-# VOICEVOX の出力フォーマット。無音WAVを作って concat -c copy で混ぜるため一致させる
-WAV_RATE     = 24000
-WAV_CHANNELS = 1
+# VOICEVOX の出力フォーマット。無音WAVを作って結合するため一致させる
+WAV_RATE     = _voice.WAV_RATE
+WAV_CHANNELS = _voice.WAV_CHANNELS
 
-DB_CONFIG = {
-    "host":     os.getenv("DB_HOST", "192.168.1.200"),
-    "port":     int(os.getenv("DB_PORT", "5432")),
-    "dbname":   os.getenv("DB_NAME", ""),
-    "user":     os.getenv("DB_USER", ""),
-    "password": os.getenv("DB_PASSWORD", ""),
-}
-
-# LLMクライアント初期化
-if USE_LOCAL_LLM:
-    llm_client = OpenAI(
-        api_key="ollama",
-        base_url="http://localhost:11434/v1"
-    )
-    LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M")
-    LLM_MODELS = [LLM_MODEL]
-    print(f"[LLM] Ollama ({LLM_MODEL}) を使用します")
-else:
-    llm_client = OpenAI(
-        api_key=os.getenv("GEMINI_API_KEY", ""),
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
-    )
-    LLM_MODELS = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").split(",") if m.strip()]
-    LLM_MODEL = LLM_MODELS[0]
-    print(f"[LLM] Gemini ({', '.join(LLM_MODELS)}) を使用します")
+# LLMクライアントは common/llm.py で初期化済み。ここは後方互換の再輸出
+llm_client = _llm.client
+LLM_MODELS = _llm.LLM_MODELS
+LLM_MODEL  = _llm.LLM_MODEL
 
 
 # ──────────────────────────────────────────────
@@ -154,73 +118,18 @@ def _timed(label, fn, *args, **kwargs):
     return result
 
 
-def _retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,), delay: float = 0, **kwargs):
-    """最大 attempts 回リトライする共通ヘルパー"""
-    for attempt in range(1, attempts + 1):
-        try:
-            return fn(*args, **kwargs)
-        except catch as e:
-            if attempt == attempts:
-                raise
-            print(f"[{label}] 試行{attempt}失敗、リトライします... ({e})")
-            if delay > 0:
-                time.sleep(delay)
-
-
-def _llm_create(attempts_per_model: int = 3, **kwargs):
-    """LLM_MODELS を左から順に attempts_per_model 回ずつ試す。
-    400/422 などリクエスト不正エラーは即時再送しても意味がないので1回で失敗させる。
-    """
-    last_exc = None
-    for model in LLM_MODELS:
-        for attempt in range(1, attempts_per_model + 1):
-            try:
-                return llm_client.chat.completions.create(model=model, **kwargs)
-            except _OpenAIBadRequestError:
-                # 400系はリトライ不要（プロンプトやスキーマの問題）
-                raise
-            except Exception as e:
-                last_exc = e
-                if attempt < attempts_per_model:
-                    print(f"[LLM] {model} 試行{attempt}失敗、リトライします... ({e})")
-                else:
-                    print(f"[LLM] {model} {attempts_per_model}回失敗、次のモデルへ移行します ({e})")
-    raise last_exc
-
-
-def parse_script_json(raw_script: str) -> dict:
-    """LLM構造化出力のJSONをパースする。```json フェンスを剥がしてから json.loads する。"""
-    cleaned = re.sub(r"```json|```", "", raw_script).strip()
-    return json.loads(cleaned)
+# LLM 呼び出しは common/llm.py に集約した。ここは後方互換の薄い再輸出。
+_retry          = _llm.retry
+_llm_create     = _llm.create
+parse_script_json = _llm.parse_json
 
 
 def llm_json(system_prompt: str, user_prompt: str, schema: dict) -> dict:
     """system + user + スキーマ を渡して JSON を得る汎用呼び出し。
 
-    Gemini は response_format(json_schema)、Ollama(Gemma) は構造化出力非対応なので
-    extra_body でコンテキストサイズだけ調整する（pipeline.generate_script と同じ分岐）。
+    temperature は渡さない（統合前と同じリクエストになる）。
     """
-    extra_kwargs: dict = {}
-    if USE_LOCAL_LLM:
-        extra_kwargs["extra_body"] = {
-            "options": {"num_ctx": int(os.getenv("LOCAL_LLM_CTX", "8192"))},
-            "think": False,
-        }
-    else:
-        extra_kwargs["response_format"] = {
-            "type": "json_schema",
-            "json_schema": {"name": "script", "schema": schema},
-        }
-
-    response = _llm_create(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-        **extra_kwargs,
-    )
-    print(f"[DEBUG] finish_reason: {response.choices[0].finish_reason}")
-    return parse_script_json(response.choices[0].message.content.strip())
+    return _llm.generate_json(system_prompt, user_prompt, schema, schema_name="script")
 
 
 # ──────────────────────────────────────────────
@@ -285,157 +194,23 @@ def build_emotion_timeline(
 # VOICEVOX 音声合成
 # ──────────────────────────────────────────────
 
-def get_wav_duration(wav_path: str) -> float:
-    """WAVファイルの長さを秒で返す"""
-    with wave.open(wav_path, 'r') as f:
-        return f.getnframes() / float(f.getframerate())
-
-
-def _synthesize(text: str, output_path: str, extra_params: dict = None) -> None:
-    """VOICEVOXでテキストを音声合成してファイルに保存する"""
-    query_res = requests.post(
-        f"{VOICEVOX_URL}/audio_query",
-        params={"text": text, "speaker": VOICEVOX_SPEAKER}
-    )
-    query_res.raise_for_status()
-    query = query_res.json()
-    if extra_params:
-        query.update(extra_params)
-    synth_res = requests.post(
-        f"{VOICEVOX_URL}/synthesis",
-        params={"speaker": VOICEVOX_SPEAKER},
-        headers={"Content-Type": "application/json"},
-        data=json.dumps(query)
-    )
-    synth_res.raise_for_status()
-    with open(output_path, "wb") as f:
-        f.write(synth_res.content)
-
-
-def valence_arousal_to_voicevox_params(valence: float, arousal: float) -> dict:
-    """valence/arousalをVOICEVOXの音声パラメータに変換する。
-    speedScaleは一定に保つ（YouTube視聴体験のため速さの変動を避ける）。
-
-    NOTE: 本番では未使用（聞き取りやすさのため発話の感情ぶれは無効化されている）。
-    """
-    return {
-        "pitchScale":      round(arousal  * 0.08, 3),   # 興奮→高め
-        "intonationScale": round(1.0 + valence * 0.3, 3),  # ポジティブ→抑揚強め
-        "volumeScale":     round(1.0 + arousal * 0.1, 3),  # 興奮→大きめ
-    }
-
-
-def synthesize_sentences(sentences: list[dict], out_dir, prefix: str,
-                         extra_params: dict = None) -> list[tuple[str, float]]:
-    """文ごとに合成し [(wav_path, duration), ...] を返す。
-
-    duration は get_wav_duration による実測値。呼び出し側はこれを積み上げて
-    パート開始時刻を確定する（推定値を使わない）。
-    """
-    out_dir = Path(out_dir)
-    results = []
-    for i, sentence in enumerate(sentences):
-        path = str(out_dir / f"{prefix}_{i:03d}.wav")
-        _synthesize(sentence["text"], path, extra_params)
-        results.append((path, get_wav_duration(path)))
-    return results
-
-
-def make_silence_wav(output_path, duration: float) -> str:
-    """VOICEVOX と同一フォーマット (24kHz/mono/pcm_s16le) の無音WAVを作る。
-
-    フォーマットを合わせることで concat demuxer の -c copy にそのまま乗る。
-    """
-    output_path = str(output_path)
-    subprocess.run(
-        ["ffmpeg", "-y", "-f", "lavfi",
-         "-i", f"anullsrc=r={WAV_RATE}:cl=mono",
-         "-t", f"{duration:.3f}",
-         "-ar", str(WAV_RATE), "-ac", str(WAV_CHANNELS), "-c:a", "pcm_s16le",
-         output_path],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    )
-    return output_path
-
-
-def concat_wavs(paths: list[str], output_path: str) -> None:
-    """WAVを concat demuxer で結合する（全て同一フォーマットである必要がある）"""
-    list_file = output_path + ".concat_list.txt"
-    try:
-        with open(list_file, "w") as f:
-            for p in paths:
-                f.write(f"file '{p}'\n")
-        subprocess.run(
-            ["ffmpeg", "-y", "-f", "concat", "-safe", "0",
-             "-i", list_file, "-c", "copy", output_path],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    finally:
-        if Path(list_file).exists():
-            Path(list_file).unlink()
-
-
-def generate_voice(sentences: list[dict], output_path: str, intro_text: str = "") -> list[float]:
-    """VOICEVOXで文ごとに音声合成し結合する。intro_textがある場合は冒頭一言を先頭に付ける。
-    sentences: [{"text": str, "valence": float, "arousal": float}, ...]
-    戻り値: 各文の実測尺[秒]（intro は含まない）。
-
-    生成モーションを文に紐づけるのに使う。文字数比で割り当てると、漢字とかなで
-    読み上げ速度が違うぶんズレて、話している内容と動きが合わなくなる
-    """
-    print(f"[VOICEVOX] 文ごと音声生成中... (speaker: {VOICEVOX_SPEAKER})")
-    tmp_dir = Path(tempfile.gettempdir())
-    part_paths = []
-    intro_wav = output_path.replace(".wav", "_intro.wav")
-
-    try:
-        if intro_text:
-            _synthesize(intro_text, intro_wav, HOOK_VOICE_PARAMS)
-            part_paths.append(intro_wav)
-
-        durations = []
-        for i, sentence in enumerate(sentences):
-            part_path = str(tmp_dir / f"{Path(output_path).stem}_part{i:03d}.wav")
-            _synthesize(sentence["text"], part_path)
-            part_paths.append(part_path)
-            durations.append(get_wav_duration(part_path))
-
-        concat_wavs(part_paths, output_path)
-        print(f"[VOICEVOX] 音声生成完了: {output_path} ({len(sentences)}文)")
-        return durations
-
-    finally:
-        for p in part_paths:
-            if p != intro_wav:  # intro_wavは呼び出し元でcleanup
-                if Path(p).exists():
-                    Path(p).unlink()
+# 実装は common/voice.py にある。ここは後方互換の再輸出。
+get_wav_duration = _voice.get_wav_duration
+_synthesize      = _voice.synthesize
+synthesize       = _voice.synthesize
+valence_arousal_to_voicevox_params = _voice.valence_arousal_to_voicevox_params
+synthesize_sentences = _voice.synthesize_sentences
+make_silence_wav = _voice.make_silence_wav
+concat_wavs      = _voice.concat_wavs
+generate_voice   = _voice.generate_voice
+voicevox_health_check = _voice.health_check
 
 
 # ──────────────────────────────────────────────
 # 字幕タイミング生成
 # ──────────────────────────────────────────────
 
-def _query_mora_times(text: str) -> tuple[list[dict], float]:
-    """audio_queryからモーラタイミングリストと総尺(秒)を返す"""
-    res = requests.post(
-        f"{VOICEVOX_URL}/audio_query",
-        params={"text": text, "speaker": VOICEVOX_SPEAKER}
-    )
-    res.raise_for_status()
-    query = res.json()
-
-    t = float(query.get("prePhonemeLength", 0.1))
-    mora_times = []
-    for phrase in query["accent_phrases"]:
-        for mora in phrase["moras"]:
-            dur = (mora.get("consonant_length") or 0) + (mora.get("vowel_length") or 0)
-            mora_times.append({"start": t, "duration": dur})
-            t += dur
-        if phrase.get("pause_mora"):
-            p = phrase["pause_mora"]
-            t += (p.get("consonant_length") or 0) + (p.get("vowel_length") or 0)
-    total = t + float(query.get("postPhonemeLength", 0.1))
-    return mora_times, total
+_query_mora_times = _voice.query_mora_times
 
 
 def split_sentences(script: str) -> list[str]:
@@ -574,29 +349,12 @@ def _find_subtitle_time(subtitles: list[dict], keyword: str, start_from: float =
 # ──────────────────────────────────────────────
 
 def _start_xvfb() -> tuple:
-    """空きディスプレイ番号でXvfbを起動し (proc, display) を返す"""
-    import shutil
-    if not shutil.which("Xvfb"):
-        raise RuntimeError("Xvfb が見つかりません。`sudo apt install -y xvfb` でインストールしてください")
-    for n in range(99, 200):
-        lock = Path(f"/tmp/.X{n}-lock")
-        sock = Path(f"/tmp/.X11-unix/X{n}")
-        if lock.exists() or sock.exists():
-            continue
-        display = f":{n}"
-        proc = subprocess.Popen(
-            ["Xvfb", display, "-screen", "0", "1920x1080x24"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if sock.exists():
-                print(f"[Xvfb] 起動完了: DISPLAY={display}")
-                return proc, display
-            time.sleep(0.2)
-        proc.kill()
-    raise RuntimeError("Xvfb: 空きディスプレイ番号が見つかりません (99-199)")
+    """空きディスプレイ番号でXvfbを起動し (proc, display) を返す。
+
+    ライブ配信の GPU 仮想ディスプレイ（既定 :99）は除外する。奪うと Xorg が
+    起動できず、systemd が Restart=always で無限にリトライする状態になる。
+    """
+    return _xvfb.start_xvfb(reserved=(os.getenv("LIVE_DISPLAY", ":99"),))
 
 
 def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
@@ -781,50 +539,21 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
 # 以前は NTFS(sda2) 上にあったが、udisks2 の自動マウントはデスクトップセッション依存で
 # systemd timer からの無人実行では未マウントになり生成が丸ごとスキップされていた。
 # ext4 化で FUSE のオーバーヘッドも外れる（ただし同じHDDなので速度改善は限定的）
-ARDY_ENGINE_ROOT   = os.getenv("ARDY_ENGINE_ROOT", "/mnt/data/ardy-engine")
-# テキストエンコーダ(15GB)の置き場。ARDY_ENGINE_ROOT とは別に指定できる。
-# 実測: HDD(sda1) 41〜111MB/s に対し SSD(sdb2) 384MB/s。
-# HDD 上だと mmap のランダム読みで ready まで530秒以上かかり
-# ARDY_READY_TIMEOUT に間に合わないため、ここだけ SSD に置く
-ARDY_MERGED_BASE   = os.getenv("ARDY_MERGED_BASE",
-                               str(Path(ARDY_ENGINE_ROOT) / "llm2vec-base-merged"))
-ARDY_REPO          = os.getenv("ARDY_REPO", "/home/suibari/work/text-to-vrma")
-ARDY_PORT          = int(os.getenv("ARDY_PORT", "2337"))
-# true にすると既にポートで動いているサーバーをそのまま使う（開発時用）。
-# 既定は false で、古いサーバーは落として起動し直す
-ARDY_REUSE         = env_flag("ARDY_REUSE")
-ARDY_READY_TIMEOUT = float(os.getenv("ARDY_READY_TIMEOUT", "600"))
-# 3秒のモーションで実測3〜4秒。ただしGPUが混んでいると20秒、稀に140秒まで伸びる。
-# さらに長時間アイドルだったサーバーは最初のリクエストで固まることがある
-# （GPU使用率0%のまま返らない）ため、待ち続けずに諦めて動画を優先する。
-# パイプラインは生成後にサーバーを落とすので、途中で切って壊れても影響はない。
-ARDY_GEN_TIMEOUT   = float(os.getenv("ARDY_GEN_TIMEOUT", "300"))
+# ARDY エンジンの設定と起動・生成は common/ardy.py に集約した。
+# ここは後方互換の再輸出（既存の呼び出し名を変えないため）。
+ARDY_ENGINE_ROOT   = _ardy.ARDY_ENGINE_ROOT
+ARDY_MERGED_BASE   = _ardy.ARDY_MERGED_BASE
+ARDY_REPO          = _ardy.ARDY_REPO
+ARDY_PORT          = _ardy.ARDY_PORT
+ARDY_REUSE         = _ardy.ARDY_REUSE
+ARDY_READY_TIMEOUT = _ardy.ARDY_READY_TIMEOUT
+ARDY_GEN_TIMEOUT   = _ardy.ARDY_GEN_TIMEOUT
+ARDY_MIN_AVAIL_GB  = _ardy.ARDY_MIN_AVAIL_GB
+ARDY_CFG           = _ardy.ARDY_CFG
+ARDY_ARM_SPREAD    = _ardy.ARDY_ARM_SPREAD
+_ardy_url          = _ardy.url
 
 
-def _ardy_url(path: str) -> str:
-    return f"http://127.0.0.1:{ARDY_PORT}{path}"
-
-
-# ARDYサーバーは RSS 約15GB を使う（CPU側に載せる8Bエンコーダが大半）。
-# 空きがこれを下回るとスワップスラッシングを起こし、生成がGPU使用率0%のまま返らなくなる。
-# 実測: ollama の llama-server が 9.2GB 常駐していた状態で 300秒タイムアウトした
-# swap を増設した場合はスワップで吸収できるので低めでよい。
-# swap 2GB のときは 18GB 必要だったが、17GB に増設したため 13GB まで下げている
-ARDY_MIN_AVAIL_GB = float(os.getenv("ARDY_MIN_AVAIL_GB", "13"))
-
-# classifier-free guidance（1.0〜6.0）。テキスト追従の強さ。
-# 実測: 3.0→4.5→6.0 と上げても腕の振れ幅は 1.8→1.4→1.0度 とむしろ減った。
-# 「動かないプロンプト」を追従で救うことはできないので server.py の既定3.0のまま使う。
-# 動きの有無を決めるのはプロンプトの語彙（具体的な身体動作か抽象語か）だった
-ARDY_CFG = float(os.getenv("ARDY_CFG", "3.0"))
-# 腕の開き具合[度]（0〜20）。モーションではなく静的なオフセットで、
-# 実測で 6→12→18 が腕の角度 70→64→58度（体側から離れる方向）に対応した。
-# 腕が体に張り付いて見えるのを緩和するため既定(6)より少し開く。
-#
-# 12 だと脇が開いて男性的に見えるという指摘があったので 8 に下げた（2026-08-15）。
-# 0 にはしないこと。リアル体型のモーキャプをアニメ体型に当てる都合で、
-# 開きが足りないと腕（袖）が胴にめり込む（retarget.py の ARM_SPREAD_SIGN 参照）
-ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "8"))
 # セグメントのつなぎ目のクロスフェード長[秒]。server.py の既定は6フレーム(20fps=0.3秒)で、
 # 独立生成された別ポーズ同士を繋ぐには短く、「スッと切り替わった」ように見えていた。
 # server.py 側は smoothstep で混ぜるので窓の両端で速度が0になる。
@@ -957,324 +686,35 @@ def vrma_unity_args() -> list[str]:
         "-vrmaSmooth", f"{VRMA_SMOOTH}",
     ]
 
-# 実際の動画で破綻が確認できた動作。ここに入れる基準は「録画して目で見て駄目だったもの」。
-# ARDYはシードで出力が大きく変わるので、単発生成の数値では判断しないこと。
-#
-# 拍手: シードを変えた独立2サンプルとも拍手にならず、手が胸の前で中途半端に浮くだけ
-#       だった（夜版72秒で発生）。armSpread を 0 にしても変わらなかった。
-#
-# スカート姿なので使えない動作。しゃがむ・膝を深く曲げる・跳ぶ系は、
-# ARDY が予備動作として「膝を深く曲げて脚を大きく開くしゃがみ」を必ず作り、
-# カメラが正面・腰の高さにあるため下着が映る（実測: 2026-08-11 の夜版 19.3秒地点）。
-# 腰の上下移動(VRMA_HIPS_Y)を切っても脚のポーズは変わらないので、動作ごと落とす。
-# プロンプトでも禁止しているが、LLMが破ったときに事故るのでここでも遮断する
-VRMA_BANNED_RE = re.compile(
-    r"\b(jump|jumps|jumping|leap|leaps|hop|hops|hopping|squat|squats|squatting|"
-    r"crouch|crouches|crouching|kneel|kneels|kneeling|sit|sits|sitting|"
-    r"lunge|lunges|spring|springs|knees?|clap|claps|clapping|applaud|applauds)\b", re.I)
+# モーションの安全化（禁止語・主語の正規化・待機動作）は common/motion_safety.py に
+# 集約した。実測で事故った履歴に基づく値なので、緩めるときはあちらのコメントを読むこと。
+VRMA_BANNED_RE      = motion_safety.BANNED_MOTION_RE
+VRMA_IDLE_MOTIONS   = motion_safety.IDLE_MOTIONS
+reject_unsafe_motions = motion_safety.reject_unsafe_motions
 
 
-def reject_unsafe_motions(motions: list[dict], label: str = "") -> list[dict]:
-    """スカートで破綻する動作を台本の motions から取り除く。
+# ARDY サーバーの起動・待機・停止・生成は common/ardy.py にある。
+# ここは後方互換の再輸出。
+ARDY_MEM_WAIT_SEC = _ardy.ARDY_MEM_WAIT_SEC
+ARDY_FREE_OLLAMA  = _ardy.ARDY_FREE_OLLAMA
+OLLAMA_URL        = _ardy.OLLAMA_URL
 
-    落とした結果セグメントが足りなくなっても、VRMA_IDLE_MOTIONS が埋めるので穴は空かない。
-    """
-    out = []
-    for m in (motions or []):
-        text = (m.get("text") or "")
-        if VRMA_BANNED_RE.search(text):
-            print(f"[モーション] 除外{f'({label})' if label else ''}: {text[:70]}")
-            continue
-        out.append(m)
-    return out
-
-
-# 文に motion が無い／禁止動作だったときに代わりに使う待機動作。
-# plan_vrma_from_sentences から使う。
-#
-# 選定の根拠は弱い。ARDYは拡散モデルでシードによって出力が大きく変わるのに、
-# 候補ごとにシード1つでしか測っていない。角度変化の二階差分（＝カクつき）が
-# 大きいものを避けたつもりだったが、実際に録画して見比べたところ画面上の差は
-# 確認できなかった。数値はあてにせず、実際の動画で問題が出たものだけを外している。
-#
-# 実際の動画で問題が出て外したもの:
-#   claps their hands ...                拍手にならず、手が胸の前で中途半端に往復して
-#                                        震えて見える（夜版72秒。独立2サンプルで再現）
-#   keeps bouncing lightly on their toes 跳ねる動作。スカートなので下半身は使わない
-#
-# 2026-08-12: 全文にあった "facing forward"（正面固定の明示）を外した。
-# Unity が体の向きを捨てていたので書いても無意味だったが、上限つきで通すようにした
-# 以上、正面を明示すると ARDY が体を向けなくなる。
-#
-# 同じ日に、ARDY の /generate を直接叩いて spec の hips ヨーと上体ロールを実測した
-# （3秒生成・独立2シード・振幅[度]。対照は "raises one hand to their chin"）:
-#
-#   指示                                         hipsヨー幅      上体ロール幅
-#   （対照）                                       4.5 /  8.2     6.4 /  5.1
-#   turns their upper body to their right,
-#     then back to the front                      81.1 / 76.3    25.3 /  7.9
-#   leans their upper body to their left,
-#     then straightens up                         10.0 /  9.3    25.6 / 27.6
-#   slowly sways their upper body from side to
-#     side                                         6.4 /  2.7     6.2 /  2.5  ← 効かない
-#   shakes their head slowly from side to side     1.2 /  1.5   （首ヨー 4.9 / 1.1）← 効かない
-#
-# 「…して、正面に戻る」という往復の形だけが効いた。sways / shakes は対照と差が無い
-# ので、待機動作からもプロンプトの例からも外した。
-#
-# 主語は "A person / their" ではなく "A woman / her" にしてある（2026-08-15）。
-# 動きが男っぽいという指摘への対処。ARDY はテキスト条件付きの拡散モデルなので、
-# 主語の性別で分布が動くことを期待している。上の実測値は "A person / their" 版の
-# ものなので、書き換えるときは振幅が落ちていないか測り直すこと。
-VRMA_IDLE_MOTIONS = [
-    "A woman stands in place and opens both arms out to the sides at chest height.",
-    "A woman stands in place and leans her upper body to her left, then straightens up.",
-    "A woman stands in place and repeatedly nods her head down and up.",
-    "A woman stands in place and keeps tilting her head from one shoulder to the other.",
-    "A woman stands in place and clasps both hands together in front of her chest.",
-    "A woman stands in place and brings one hand up to her chin.",
-    "A woman stands in place and turns her upper body to her right, then back to the front.",
-    "A woman stands in place and raises one hand straight above her head.",
-]
-
-
-
-
-
-# 空きメモリが足りないとき、ここまで待つ[秒]。
-# ollama は既定5分のkeep_aliveでモデルを自動解放するので、待てば空くことが多い
-ARDY_MEM_WAIT_SEC = float(os.getenv("ARDY_MEM_WAIT_SEC", "360"))
-# true にすると生成前に ollama のモデルをアンロードさせる。
-# ollama は次のリクエストで自動的に読み直すので停止はしないが、
-# そちらのサービスの次回応答が数秒遅くなる。既定は無効（他サービスに触らない）
-ARDY_FREE_OLLAMA = env_flag("ARDY_FREE_OLLAMA")
-OLLAMA_URL       = os.getenv("OLLAMA_URL", "http://localhost:11434")
-
-
-def _free_ollama() -> None:
-    """ollama に読み込み済みモデルを解放させる（keep_alive=0）。失敗しても無視する。"""
-    try:
-        r = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
-        for m in r.json().get("models", []):
-            name = m.get("name")
-            if not name:
-                continue
-            requests.post(f"{OLLAMA_URL}/api/generate",
-                          json={"model": name, "keep_alive": 0}, timeout=30)
-            print(f"[ARDY] ollama のモデルを解放しました: {name} "
-                  f"({m.get('size', 0) / 1e9:.1f}GB) — 次のリクエストで自動的に読み直されます")
-    except Exception as e:
-        print(f"[ARDY] ollama の解放をスキップ（無視）: {e}")
-
-
-def ardy_wait_memory(timeout: float = None) -> bool:
-    """空きメモリが閾値を超えるまで待つ。超えたら True。"""
-    if ARDY_FREE_OLLAMA:
-        _free_ollama()
-
-    limit = ARDY_MEM_WAIT_SEC if timeout is None else timeout
-    deadline = time.time() + limit
-    warned = False
-    while True:
-        avail = _mem_available_gb()
-        if avail >= ARDY_MIN_AVAIL_GB:
-            return True
-        if time.time() >= deadline:
-            print(f"[ARDY] 空きメモリが回復しませんでした ({avail:.1f}GB < {ARDY_MIN_AVAIL_GB}GB)。"
-                  f"生成モーションをスキップします")
-            return False
-        if not warned:
-            print(f"[ARDY] 空きメモリ待ち ({avail:.1f}GB < {ARDY_MIN_AVAIL_GB}GB, 最大{limit:.0f}秒)")
-            warned = True
-        time.sleep(15)
-
-
-def _mem_available_gb() -> float:
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) / 1024 / 1024
-    except Exception:
-        pass
-    return float("inf")   # 読めないなら判定しない
-
-
-_ardy_available_cache: bool | None = None
-
-
-def ardy_available() -> bool:
-    """エンジン一式が揃っているか。NTFS未マウント時などに False になる。
-
-    ardy_start と ardy_wait_ready の両方から呼ばれる。中の `import ardy` は
-    HDD 上の venv を読むので冷えていると数十秒かかる。1回で済ませる。
-    """
-    global _ardy_available_cache
-    if _ardy_available_cache is None:
-        _ardy_available_cache = _check_ardy_available()
-    return _ardy_available_cache
-
-
-def _check_ardy_available() -> bool:
-    root = Path(ARDY_ENGINE_ROOT)
-    # ARDY_MERGED_BASE は別ドライブを指しうるので、どれが欠けたか名指しする
-    missing = [str(p) for p in (root / "venv/bin/python",
-                                Path(ARDY_MERGED_BASE),
-                                Path(ARDY_REPO) / "tools/ardy-engine/server.py",
-                                Path(ARDY_REPO) / "tools/spec2vrma.mjs")
-               if not p.exists()]
-    if missing:
-        print(f"[ARDY] エンジンが見つかりません（{', '.join(missing)}）。"
-              f"生成モーションはスキップします")
-        return False
-
-    # ファイルが揃っていても、venv の editable install が旧パスを指していると
-    # import だけが落ちる（エンジンを別ドライブへ移設したときに実際に起きた）。
-    # サーバーはモデル読み込みに4〜5分かけてから /health で error を返すので、
-    # 先に import だけ試して即座に切り分ける。
-    try:
-        r = subprocess.run([str(root / "venv/bin/python"), "-c", "import ardy"],
-                           capture_output=True, text=True, timeout=60)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"[ARDY] エンジンのimport確認ができませんでした: {e}。生成モーションはスキップします")
-        return False
-    if r.returncode != 0:
-        lines = (r.stderr or "").strip().splitlines()
-        print(f"[ARDY] エンジンのimportに失敗しました: {lines[-1] if lines else '原因不明'} "
-              f"（{root}/venv に `pip install -e {root}/ardy` で貼り直してください）。"
-              f"生成モーションはスキップします")
-        return False
-    return True
-
-
-def ardy_health() -> dict | None:
-    try:
-        return requests.get(_ardy_url("/health"), timeout=5).json()
-    except Exception:
-        return None
-
-
-def _kill_stray_server() -> None:
-    """ポートを掴んでいる ARDY サーバーを落とす。自分が起動したものでなくても止める。"""
-    marker = f"{ARDY_ENGINE_ROOT}/venv/bin/python"
-    try:
-        out = subprocess.run(["ps", "-eo", "pid,cmd"], capture_output=True, text=True).stdout
-    except Exception:
-        return
-    for line in out.splitlines():
-        if "server.py" in line and ("--port" in line) and (marker in line or "ardy-engine" in line):
-            pid = line.split(None, 1)[0]
-            if not pid.isdigit():
-                continue
-            try:
-                os.kill(int(pid), signal.SIGKILL)
-                print(f"[ARDY] 既存サーバー PID={pid} を停止しました")
-            except (ProcessLookupError, PermissionError, ValueError):
-                pass
-    # ポートが解放されるまで少し待つ
-    for _ in range(10):
-        if ardy_health() is None:
-            return
-        time.sleep(1)
-
-
-def ardy_start():
-    """ARDYサーバーを起動する。
-
-    既に起動済みならそれを再利用し None を返す（そのサーバーは ardy_stop で落とさない）。
-    エンジンが無い場合も None を返す。起動できたかどうかは ardy_wait_ready() で判定すること。
-    """
-    if not ardy_available():
-        return None
-
-    # サーバーは約15GB必要。足りないまま起動すると読み込み自体がスワップで
-    # 10分以上かかる（実測: 600秒待っても準備完了にならず）ので、空くまで待つ
-    if not ardy_wait_memory():
-        return None
-
-    h = ardy_health()
-    if h is not None:
-        if ARDY_REUSE:
-            print(f"[ARDY] 既存のサーバーを再利用します (status={h.get('status')})。"
-                  f"このサーバーはパイプライン終了時に停止しません")
-            return None
-        # 既定では再利用しない。長く生きたサーバーは生成が返らなくなることがあり
-        # （GPU使用率0%のままタイムアウト）、それを掴むと丸ごと生成を落とすため、
-        # 落として自分で起動し直す。ポートはこのパイプライン専用とみなす
-        print("[ARDY] 既存のサーバーを停止して起動し直します "
-              "（古いサーバーは生成が返らないことがあるため。ARDY_REUSE=true で再利用可）")
-        _kill_stray_server()
-
-    root = Path(ARDY_ENGINE_ROOT)
-    env = os.environ.copy()
-    # これが無いと 8B のテキストエンコーダが GPU に載って CUDA OOM になる。
-    # Electron版も同じ値を渡している (electron/ardy-client.cjs)
-    env["TEXT_ENCODER_DEVICE"] = "cpu"
-    env["HF_HOME"] = str(root / "hf-cache")
-
-    cmd = [str(root / "venv/bin/python"),
-           str(Path(ARDY_REPO) / "tools/ardy-engine/server.py"),
-           "--port", str(ARDY_PORT),
-           "--merged-base", ARDY_MERGED_BASE]
-    print(f"[ARDY] サーバー起動: {' '.join(cmd)}")
-    # 出力を捨てると起動に失敗したとき /health の error 文字列しか手掛かりが無くなる。
-    # トレースバックを残す（プロセス終了時にOSが閉じるのでfpは持ち回らない）
-    log_path = Path(__file__).resolve().parent / "logs" / f"ardy_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"[ARDY] サーバーログ: {log_path}")
-    return subprocess.Popen(cmd, env=env,
-                            stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
-                            preexec_fn=os.setsid)
-
-
-def ardy_wait_ready(timeout: float = None) -> bool:
-    """GET /health が status=ok になるまで待つ。モデル読み込みに4〜5分かかる。"""
-    # サーバーも立っておらずエンジンも無いなら、待っても上がらない。
-    # ここで即抜けないと NTFS 未マウント時に毎回10分止まる
-    if ardy_health() is None and (not ardy_available()
-                                  or _mem_available_gb() < ARDY_MIN_AVAIL_GB):
-        return False
-
-    deadline = time.time() + (ARDY_READY_TIMEOUT if timeout is None else timeout)
-    last = None
-    while time.time() < deadline:
-        h = ardy_health()
-        if h is not None:
-            status = h.get("status")
-            if status == "ok":
-                print(f"[ARDY] 準備完了 (model={h.get('model')} device={h.get('device')})")
-                return True
-            if status == "error":
-                print(f"[ARDY] 起動に失敗しました: {h.get('error')}")
-                return False
-            cur = (h.get("stage"), round(h.get("progress") or 0, 2))
-            if cur != last:
-                print(f"[ARDY] 読み込み中... stage={cur[0]} progress={cur[1]}")
-                last = cur
-        time.sleep(5)
-    print(f"[ARDY] 準備完了になりませんでした（{ARDY_READY_TIMEOUT if timeout is None else timeout:.0f}秒待機）")
-    return False
+_free_ollama       = _ardy._free_ollama
+ardy_wait_memory   = _ardy.wait_memory
+_mem_available_gb  = _ardy.mem_available_gb
+ardy_available     = _ardy.available
+ardy_health        = _ardy.health
+_kill_stray_server = _ardy.kill_stray_server
+ardy_start         = _ardy.start
+ardy_wait_ready    = _ardy.wait_ready
+ardy_to_vrma       = _ardy.to_vrma
+ardy_stop          = _ardy.stop
 
 
 def ardy_generate(text: str, duration: float, seed: int, out_json: str) -> bool:
     """英語の動作説明文からモーションspec JSONを生成する。"""
-    try:
-        r = requests.post(_ardy_url("/generate"),
-                          json={"text": text, "duration": float(duration), "seed": int(seed),
-                                "cfg": ARDY_CFG, "armSpread": ARDY_ARM_SPREAD},
-                          timeout=ARDY_GEN_TIMEOUT)
-        spec = r.json()
-    except Exception as e:
-        print(f"[ARDY] 生成に失敗: {e}")
-        return False
-
-    if "tracks" not in spec:
-        print(f"[ARDY] 生成結果が不正です: {str(spec)[:200]}")
-        return False
-
-    Path(out_json).write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
-    print(f"[ARDY] 生成: {spec.get('duration')}秒 / {len(spec['tracks'])}ボーン / "
-          f"seed={seed} cfg={ARDY_CFG} armSpread={ARDY_ARM_SPREAD}")
-    return True
+    return _ardy.generate_spec(out_json, text=text, duration=duration,
+                               seed=seed) is not None
 
 
 def ardy_generate_segments(segments: list[dict], seed: int, out_json: str) -> float | None:
@@ -1283,71 +723,16 @@ def ardy_generate_segments(segments: list[dict], seed: int, out_json: str) -> fl
     segments: [{"text": 英文, "duration": 秒}, ...]
     戻り値: 生成された長さ[秒]。失敗時は None。
 
-    ARDY側は各セグメントを履歴なしで独立生成し、終端の位置・向きに次を整列して
-    ARDY_BLEND_SEC 秒でクロスフェードする（server.py の _generate_stitched）。履歴を引き継ぐ方式と
-    違って前の動きの慣性に負けないので、単発生成と同じテキスト追従度のまま
-    つなぎ目の無い長いモーションが得られる。
+    サーバー側は segments_req[:12] で黙って切り捨てるので、こちらで必ず守る。
+    タイムアウトは実測の倍を見ておく（既定300秒では50秒のブロックが必ず溢れる）。
     """
     if not segments:
         return None
     segments = segments[:ARDY_MAX_SEGMENTS]
     total = sum(float(s["duration"]) for s in segments)
-    # 実測の倍を見ておく。既定300秒では50秒のブロックが必ず溢れる
     timeout = max(ARDY_GEN_TIMEOUT, total * ARDY_GEN_SEC_PER_SEC * 2)
-
-    try:
-        r = requests.post(_ardy_url("/generate"),
-                          json={"segments": [{"text": s["text"], "duration": float(s["duration"])}
-                                             for s in segments],
-                                "seed": int(seed),
-                                "cfg": ARDY_CFG, "armSpread": ARDY_ARM_SPREAD,
-                                "blendSec": ARDY_BLEND_SEC},
-                          timeout=timeout)
-        spec = r.json()
-    except Exception as e:
-        print(f"[ARDY] 生成に失敗: {e}")
-        return None
-
-    if "tracks" not in spec:
-        print(f"[ARDY] 生成結果が不正です: {str(spec)[:200]}")
-        return None
-
-    Path(out_json).write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
-    print(f"[ARDY] 生成: {spec.get('duration')}秒 / {len(segments)}セグメント / "
-          f"{len(spec['tracks'])}ボーン / seed={seed} cfg={ARDY_CFG} "
-          f"armSpread={ARDY_ARM_SPREAD} blendSec={ARDY_BLEND_SEC}")
-    return float(spec.get("duration") or total)
-
-
-def ardy_to_vrma(spec_json: str, out_vrma: str) -> bool:
-    """spec JSON を .vrma (GLB) に変換する。three.js しか使わない純JSなのでNodeだけで動く。"""
-    try:
-        subprocess.run(
-            ["node", str(Path(ARDY_REPO) / "tools/spec2vrma.mjs"), spec_json, out_vrma],
-            check=True, capture_output=True, timeout=120)
-        return True
-    except Exception as e:
-        detail = getattr(e, "stderr", b"")
-        print(f"[ARDY] .vrma 変換に失敗: {e} {detail[:200] if detail else ''}")
-        return False
-
-
-def ardy_stop(proc) -> None:
-    """ardy_start が起動したサーバーを落とす。None（再利用時）なら何もしない。"""
-    if proc is None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=20)
-    except (ProcessLookupError, subprocess.TimeoutExpired):
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-    except Exception as e:
-        print(f"[ARDY] 停止時のエラー（無視）: {e}")
-    print("[ARDY] サーバーを停止しました")
+    return _ardy.generate_spec(out_json, segments=segments, seed=seed,
+                               blend_sec=ARDY_BLEND_SEC, timeout=timeout)
 
 
 # 【呼び出し元なし】2026-08-12 に朝版を文ベース（plan_vrma_from_sentences）へ移したため、
@@ -1442,31 +827,9 @@ def dedupe_vrma_segments(segments: list[dict], window: int = 4) -> list[dict]:
 
 # 指示文の先頭を "A woman stands in place and ..." に揃える正規表現。
 # 「A <なにか> stands in place [facing forward] [and|.]」までを丸ごと拾う
-_MOTION_PREFIX_RE = re.compile(
-    r"^\s*an?\s+\w+(\s+\w+)?\s+stands?\s+in\s+place"
-    r"(\s+facing\s+forward)?\s*(and\s+|,\s*|\.\s*)?", re.I)
-
-MOTION_SUBJECT = "A woman stands in place and "
-
-
-def normalize_motion_text(text: str) -> str:
-    """モーション指示文の主語を "A woman stands in place and ..." に揃える。
-
-    プロンプトで「必ずこの形で始める」と指示しているが、**LLM は普通に破る**。
-    実測（2026-08-12 / 08-15 の朝版）では主語ごと落として
-    `raises one hand up to her chin` のような断片を返しており、
-    ARDY には主語なしの文が渡っていた。禁止語と同じくコード側を最後の砦にする。
-
-    主語が女性であることは ARDY の条件付けに効かせたい要素なので、
-    `A person` と書かれていた場合も含めて書き換える。
-    """
-    text = (text or "").strip()
-    if not text:
-        return text
-    body = _MOTION_PREFIX_RE.sub("", text).strip()
-    if not body:                      # 主語だけで中身が無いなら捨てる
-        return ""
-    return MOTION_SUBJECT + body[0].lower() + body[1:]
+_MOTION_PREFIX_RE    = motion_safety._MOTION_PREFIX_RE
+MOTION_SUBJECT       = motion_safety.MOTION_SUBJECT
+normalize_motion_text = motion_safety.normalize_motion_text
 
 
 def plan_vrma_from_sentences(spans: list[dict], window_start: float, window_end: float,

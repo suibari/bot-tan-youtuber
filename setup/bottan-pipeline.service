@@ -1,0 +1,18 @@
+[Unit]
+Description=botたん YouTube自動投稿パイプライン（夜のShorts）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=/bin/bash __INSTALL_DIR__/run.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=3600
+TimeoutStopSec=60
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

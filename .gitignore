@@ -223,5 +223,22 @@ __marimo__/
 unity-scripts/*.meta
 
 test*.py
+# live の Unity 疎通確認スクリプトは live 側リポジトリで追跡されていたので残す
+!tools/test_unity.py
 # クイズ消費台帳（機械が追記するので git 管理しない）
+data/quiz_used.csv
+
+# ── botたん固有 ────────────────────────────────
+# 秘密情報。DB・Gemini・YouTube の資格情報が入る
+.env
+
+logs/
+
+# ARDY が生成した .vrma。配信を重ねるほど増える。再生成できるので追跡しない
+data/motions/
+
+# OBS が読む字幕・コメント欄。実行時に書かれる
+data/obs/
+
+# クイズの消費台帳。パイプラインが追記する
 data/quiz_used.csv

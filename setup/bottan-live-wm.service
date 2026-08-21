@@ -1,0 +1,20 @@
+[Unit]
+Description=botたんライブ配信用ウィンドウマネージャ (openbox on :99)
+Documentation=https://github.com/suibari
+# OBS の XComposite ウィンドウキャプチャは EWMH 準拠のウィンドウマネージャが
+# 居ないと「XComposite capture disabled.」でプラグインごと無効化され、
+# ソース追加のプルダウンに「ウィンドウキャプチャ」自体が現れなくなる。
+# 見た目の装飾のためではなく、キャプチャを成立させるために必須。
+After=bottan-live-xorg.service
+Requires=bottan-live-xorg.service
+
+[Service]
+Type=simple
+User=__USER__
+Environment=DISPLAY=:99
+ExecStart=/usr/bin/openbox --sm-disable --config-file /etc/X11/openbox-bottan-live.xml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
