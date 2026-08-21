@@ -11,12 +11,124 @@ schemaFilter が ['public','affirmative_bot'] なので、drizzle の定義に�
 affirmative_bot に置くと DROP 候補になってしまう。別スキーマなら触られない。
 """
 
+import hashlib
 import json
+import queue
+import threading
 
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import Json, RealDictCursor
 
 # 接続とスキーマ名は common/db.py が原典（Shorts の DB アクセスと共通）
 from common.db import LIVE_SCHEMA, connect  # noqa: F401
+
+
+class BotMemoryWriter:
+    """配信のホットパスを止めずに共通bot memoryへ書き込む。"""
+
+    def __init__(self, executor=None):
+        self._executor = executor or self._execute
+        self._queue = queue.Queue()
+        self._stop = threading.Event()
+        self._thread = None
+        self._warned = False
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="bot-memory-writer")
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._queue.join()
+        self._stop.set()
+        self._queue.put(None)
+        self._thread.join(timeout=5)
+
+    def ingest_comment(self, message_id: str, broadcast_id: str, author_id: str,
+                       author_name: str, content: str, metadata: dict = None) -> None:
+        if message_id and content:
+            self._queue.put(("upsert", {
+                "message_id": message_id,
+                "broadcast_id": broadcast_id,
+                "author_id": author_id,
+                "content": content,
+                "metadata": {"broadcastId": broadcast_id,
+                             "authorName": author_name, **(metadata or {})},
+            }))
+
+    def update_response(self, message_id: str, response: str) -> None:
+        if message_id and response:
+            self._queue.put(("response", {"message_id": message_id, "response": response}))
+
+    def tombstone(self, message_id: str) -> None:
+        if message_id:
+            self._queue.put(("delete", {"message_id": message_id}))
+
+    def _run(self) -> None:
+        while True:
+            action = self._queue.get()
+            try:
+                if action is None:
+                    return
+                self._executor(*action)
+                self._warned = False
+            except Exception as e:
+                if not self._warned:
+                    print(f"[memory] 共通記憶へ保存できません（配信は継続します）: {e}")
+                    self._warned = True
+            finally:
+                self._queue.task_done()
+
+    @staticmethod
+    def _execute(kind: str, payload: dict) -> None:
+        with connect() as conn:
+            with conn.cursor() as cur:
+                if kind == "upsert":
+                    digest = hashlib.sha256(payload["content"].encode("utf-8")).hexdigest()
+                    cur.execute("""
+                        INSERT INTO affirmative_bot.bot_memory_documents
+                            (source_type, source_id, author_id, content, occurred_at,
+                             metadata, content_hash, created_at, updated_at)
+                        VALUES ('youtube_live_comment', %s, %s, %s, now(),
+                                %s, %s, now(), now())
+                        ON CONFLICT (source_type, source_id) DO UPDATE SET
+                            author_id = EXCLUDED.author_id,
+                            content = EXCLUDED.content,
+                            metadata = EXCLUDED.metadata,
+                            content_hash = EXCLUDED.content_hash,
+                            embedding = CASE
+                                WHEN affirmative_bot.bot_memory_documents.content_hash
+                                     = EXCLUDED.content_hash
+                                THEN affirmative_bot.bot_memory_documents.embedding
+                                ELSE NULL
+                            END,
+                            embedding_model = CASE
+                                WHEN affirmative_bot.bot_memory_documents.content_hash
+                                     = EXCLUDED.content_hash
+                                THEN affirmative_bot.bot_memory_documents.embedding_model
+                                ELSE NULL
+                            END,
+                            deleted_at = NULL,
+                            updated_at = now()
+                    """, (payload["message_id"], payload["author_id"], payload["content"],
+                          Json(payload["metadata"]), digest))
+                elif kind == "response":
+                    cur.execute("""
+                        UPDATE affirmative_bot.bot_memory_documents
+                        SET bot_response = %s, updated_at = now()
+                        WHERE source_type = 'youtube_live_comment' AND source_id = %s
+                    """, (payload["response"], payload["message_id"]))
+                elif kind == "delete":
+                    cur.execute("""
+                        UPDATE affirmative_bot.bot_memory_documents
+                        SET deleted_at = COALESCE(deleted_at, now()), updated_at = now()
+                        WHERE source_type = 'youtube_live_comment' AND source_id = %s
+                    """, (payload["message_id"],))
+            conn.commit()
 
 
 def ensure_schema() -> None:

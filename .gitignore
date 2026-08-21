@@ -223,6 +223,9 @@ __marimo__/
 unity-scripts/*.meta
 
 test*.py
+# 標準 unittest は実装と一緒に追跡する
+!tests/
+!tests/test_*.py
 # live の Unity 疎通確認スクリプトは live 側リポジトリで追跡されていたので残す
 !tools/test_unity.py
 # クイズ消費台帳（機械が追記するので git 管理しない）

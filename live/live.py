@@ -63,6 +63,7 @@ class LiveSession:
         self.broadcast = None
         self.obs = None
         self.poller = None
+        self.memory_writer = memory.BotMemoryWriter()
 
         self.system_prompt = persona.build_system_prompt()
         self.recent_replies = []
@@ -82,6 +83,7 @@ class LiveSession:
 
         print("[準備] DB を確認します")
         memory.ensure_schema()
+        self.memory_writer.start()
         bot = memory.get_biorhythm()
         print(f"[準備] botたんの状態: {bot['status']} / energy={bot['energy']:.1f} / {bot['mood'][:40]}")
 
@@ -162,7 +164,23 @@ class LiveSession:
             notify.live_started(self.broadcast.url, self.broadcast.title)
 
         live_chat_id = self.broadcast.live_chat_id if self.broadcast else None
-        self.poller = chat.make_poller(live_chat_id, self.queue)
+        def remember_comment(comment):
+            self.memory_writer.ingest_comment(
+                comment.message_id,
+                self.broadcast.broadcast_id if self.broadcast else "dry-run",
+                comment.channel_id,
+                comment.author,
+                comment.text,
+                {"isSuperChat": comment.is_super_chat,
+                 "isMember": comment.is_member,
+                 "isOwner": comment.is_owner},
+            )
+
+        self.poller = chat.make_poller(
+            live_chat_id, self.queue,
+            on_comment=remember_comment,
+            on_delete=self.memory_writer.tombstone,
+        )
         self.poller.start()
         self.started_at = time.monotonic()
 
@@ -329,11 +347,13 @@ class LiveSession:
 
         self.replied_count += 1
         energy.add_comment_energy()
+        response_text = " ".join(l["ja"] for l in reply["lines"])
+        self.memory_writer.update_response(comment.message_id, response_text)
         try:
             memory.save_comment(
                 self.broadcast.broadcast_id if self.broadcast else "dry-run",
                 comment.author, comment.channel_id, comment.text,
-                " ".join(l["ja"] for l in reply["lines"]), bot.get("energy", 0),
+                response_text, bot.get("energy", 0),
             )
         except Exception as e:
             print(f"[live] 配信ログを保存できません（無視します）: {e}")
@@ -431,6 +451,7 @@ class LiveSession:
 
         if self.poller is not None:
             self.poller.stop()
+        self.memory_writer.stop()
 
         if self.broadcast is not None:
             self.broadcast.finish()

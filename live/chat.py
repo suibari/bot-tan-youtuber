@@ -14,6 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Optional
 
 from config import COMMENT_USER_COOLDOWN_SEC, DRY_RUN, FAKE_COMMENTS
 import safety
@@ -26,6 +27,7 @@ class Comment:
     author: str
     channel_id: str
     text: str
+    message_id: str = ""
     is_super_chat: bool = False
     is_member: bool = False
     is_owner: bool = False
@@ -113,7 +115,9 @@ class CommentQueue:
 class ChatPoller:
     """ライブチャットを別スレッドで読み続ける。"""
 
-    def __init__(self, live_chat_id: str, queue: CommentQueue):
+    def __init__(self, live_chat_id: str, queue: CommentQueue,
+                 on_comment: Optional[Callable[[Comment], None]] = None,
+                 on_delete: Optional[Callable[[str], None]] = None):
         self.live_chat_id = live_chat_id
         self.queue = queue
         self.recent = deque(maxlen=20)      # コメント欄の表示用
@@ -121,6 +125,8 @@ class ChatPoller:
         self._thread = None
         self._stop = threading.Event()
         self._page_token = None
+        self._on_comment = on_comment
+        self._on_delete = on_delete
 
     def start(self) -> None:
         self._stop.clear()
@@ -165,8 +171,17 @@ class ChatPoller:
         snippet = item.get("snippet", {})
         author = item.get("authorDetails", {})
 
-        # テキストメッセージとスパチャだけ扱う。参加通知などは無視
         kind = snippet.get("type")
+        if kind == "messageDeletedEvent":
+            deleted_id = snippet.get("messageDeletedDetails", {}).get("deletedMessageId", "")
+            if deleted_id and self._on_delete:
+                try:
+                    self._on_delete(deleted_id)
+                except Exception as e:
+                    print(f"[chat] 削除同期を依頼できません（配信は継続します）: {e}")
+            return
+
+        # テキストメッセージとスパチャだけ扱う。参加通知などは無視
         if kind not in ("textMessageEvent", "superChatEvent", "superStickerEvent"):
             return
 
@@ -184,12 +199,18 @@ class ChatPoller:
             author=name,
             channel_id=author.get("channelId", ""),
             text=text,
+            message_id=item.get("id", ""),
             is_super_chat=kind in ("superChatEvent", "superStickerEvent"),
             is_member=bool(author.get("isChatSponsor")),
             is_owner=bool(author.get("isChatOwner")),
         )
         self.recent.append({"author": comment.author, "text": comment.text})
         self.queue.push(comment)
+        if self._on_comment:
+            try:
+                self._on_comment(comment)
+            except Exception as e:
+                print(f"[chat] コメントを記憶キューへ渡せません（配信は継続します）: {e}")
         # コメント欄はここで書く。配信ループの雑務（数秒おき）に任せると、
         # 視聴者から見て「自分のコメントが画面に出るまで」がそのぶん遅れる
         try:
@@ -205,13 +226,15 @@ class FakeChatPoller:
     delay は前のコメントからの秒数。省略すると5秒。
     """
 
-    def __init__(self, queue: CommentQueue, path: str = None):
+    def __init__(self, queue: CommentQueue, path: str = None,
+                 on_comment: Optional[Callable[[Comment], None]] = None):
         self.queue = queue
         self.recent = deque(maxlen=20)
         self.dropped = 0
         self.path = path or FAKE_COMMENTS
         self._thread = None
         self._stop = threading.Event()
+        self._on_comment = on_comment
 
     def start(self) -> None:
         self._stop.clear()
@@ -228,7 +251,7 @@ class FakeChatPoller:
             print(f"[chat] 偽コメントのファイルがありません: {self.path}")
             return
         items = json.loads(Path(self.path).read_text(encoding="utf-8"))
-        for item in items:
+        for index, item in enumerate(items):
             if self._stop.wait(float(item.get("delay", 5))):
                 return
             ok, text, why = safety.sanitize_comment(item.get("text", ""))
@@ -240,15 +263,23 @@ class FakeChatPoller:
                 author=item.get("author", "テスト視聴者"),
                 channel_id=item.get("channel_id", item.get("author", "test")),
                 text=text,
+                message_id=item.get("message_id", f"fake:{index}"),
                 is_super_chat=bool(item.get("super_chat")),
             )
             self.recent.append({"author": c.author, "text": c.text})
             self.queue.push(c)
+            if self._on_comment:
+                try:
+                    self._on_comment(c)
+                except Exception as e:
+                    print(f"[chat] 偽コメントを記憶キューへ渡せません: {e}")
             print(f"[chat] 偽コメント投入: {c.author}: {c.text}")
 
 
-def make_poller(live_chat_id: str, queue: CommentQueue):
+def make_poller(live_chat_id: str, queue: CommentQueue,
+                on_comment: Optional[Callable[[Comment], None]] = None,
+                on_delete: Optional[Callable[[str], None]] = None):
     """DRY_RUN なら偽コメント、そうでなければ本物のチャットを読む。"""
     if DRY_RUN or not live_chat_id:
-        return FakeChatPoller(queue)
-    return ChatPoller(live_chat_id, queue)
+        return FakeChatPoller(queue, on_comment=on_comment)
+    return ChatPoller(live_chat_id, queue, on_comment=on_comment, on_delete=on_delete)
