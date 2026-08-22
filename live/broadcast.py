@@ -9,6 +9,7 @@ enableAutoStart は使わない。21:00 ちょうどに live へ遷移させた�
 
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Iterable
 
 from config import YOUTUBE_PRIVACY
 from youtube_auth import get_client
@@ -25,7 +26,9 @@ TITLE_MARK = "【全肯定botたん】"
 STALE_STATUSES = ("created", "ready", "testStarting", "testing")
 
 
-def cleanup_stale(title_mark: str = TITLE_MARK) -> int:
+def cleanup_stale(title_mark: str = TITLE_MARK,
+                  preserve_ids: Iterable[str] = (),
+                  scheduled_before: datetime | None = None) -> int:
     """一度も live まで行かなかった自分の配信枠を消す。
 
     配信開始に失敗すると枠だけが `ready` のまま YouTube に残る。放っておくと
@@ -36,15 +39,25 @@ def cleanup_stale(title_mark: str = TITLE_MARK) -> int:
     作った枠以外は対象外にする。
     """
     yt = get_client()
+    preserved = set(preserve_ids)
     removed = 0
     res = yt.liveBroadcasts().list(part="id,snippet,status",
                                    broadcastStatus="upcoming",
                                    broadcastType="all", maxResults=50).execute()
     for b in res.get("items", []):
+        if b["id"] in preserved:
+            continue
         if b["status"]["lifeCycleStatus"] not in STALE_STATUSES:
             continue
         if title_mark not in b["snippet"].get("title", ""):
             continue
+        if scheduled_before is not None:
+            raw_start = b["snippet"].get("scheduledStartTime")
+            if not raw_start:
+                continue
+            scheduled_start = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+            if scheduled_start > scheduled_before.astimezone(timezone.utc):
+                continue
         try:
             yt.liveBroadcasts().delete(id=b["id"]).execute()
             print(f"[YouTube] 配信されなかった枠を片付けました: {b['id']} "
@@ -73,8 +86,58 @@ class Broadcast:
     def url(self) -> str:
         return f"https://www.youtube.com/watch?v={self.broadcast_id}" if self.broadcast_id else ""
 
-    def create(self, title: str, description: str, scheduled_start: datetime) -> "Broadcast":
-        """配信枠とストリームを作って紐づける。"""
+    @classmethod
+    def load(cls, broadcast_id: str) -> "Broadcast | None":
+        """既存の配信枠を読み込み、20:40 の本配信で再利用できる形にする。"""
+        yt = get_client()
+        res = yt.liveBroadcasts().list(
+            part="id,snippet,status,contentDetails", id=broadcast_id,
+        ).execute()
+        items = res.get("items", [])
+        if not items:
+            return None
+        item = items[0]
+        status = item.get("status", {}).get("lifeCycleStatus")
+        if status in ("complete", "revoked"):
+            return None
+
+        value = cls()
+        value.broadcast_id = item["id"]
+        value.title = item.get("snippet", {}).get("title")
+        value.live_chat_id = item.get("snippet", {}).get("liveChatId")
+        value.stream_id = item.get("contentDetails", {}).get("boundStreamId")
+        if value.stream_id:
+            value._load_stream_ingestion()
+        return value
+
+    @classmethod
+    def find_scheduled(cls, scheduled_start: datetime,
+                       title_mark: str = TITLE_MARK) -> "Broadcast | None":
+        """同じ開始時刻に作成済みの自分の枠をYouTube上から探す。"""
+        yt = get_client()
+        res = yt.liveBroadcasts().list(
+            part="id,snippet,status,contentDetails",
+            broadcastStatus="upcoming",
+            broadcastType="all",
+            maxResults=50,
+        ).execute()
+        expected = scheduled_start.astimezone(timezone.utc)
+        for item in res.get("items", []):
+            snippet = item.get("snippet", {})
+            if title_mark not in snippet.get("title", ""):
+                continue
+            raw_start = snippet.get("scheduledStartTime")
+            if not raw_start:
+                continue
+            actual = datetime.fromisoformat(raw_start.replace("Z", "+00:00"))
+            if abs((actual - expected).total_seconds()) >= 60:
+                continue
+            return cls.load(item["id"])
+        return None
+
+    def create_event(self, title: str, description: str,
+                     scheduled_start: datetime) -> "Broadcast":
+        """公開URLを確定するため、配信枠だけを作る。"""
         yt = get_client()
         self.title = title
 
@@ -112,10 +175,39 @@ class Broadcast:
         self.live_chat_id = res.get("snippet", {}).get("liveChatId")
         print(f"[YouTube] 配信枠を作成: {self.url}")
 
+        return self
+
+    def _load_stream_ingestion(self) -> bool:
+        """紐づけ済みストリームのRTMP情報をYouTubeから取り直す。"""
+        if not self.stream_id:
+            return False
+        yt = get_client()
+        res = yt.liveStreams().list(
+            part="cdn,status", id=self.stream_id,
+        ).execute()
+        items = res.get("items", [])
+        if not items:
+            self.stream_id = None
+            return False
+        ingestion = items[0].get("cdn", {}).get("ingestionInfo", {})
+        self.ingestion_address = ingestion.get("ingestionAddress")
+        self.stream_name = ingestion.get("streamName")
+        return bool(self.ingestion_address and self.stream_name)
+
+    def create_stream_and_bind(self) -> "Broadcast":
+        """配信枠へRTMPストリームを用意する。既存のbindがあれば再利用する。"""
+        if not self.broadcast_id:
+            raise RuntimeError("配信枠がありません")
+        if self.stream_id and self._load_stream_ingestion():
+            print(f"[YouTube] 紐づけ済みストリームを再利用: {self.stream_id}")
+            return self
+
+        yt = get_client()
+
         res = yt.liveStreams().insert(
             part="snippet,cdn,contentDetails",
             body={
-                "snippet": {"title": f"{title} (stream)"},
+                "snippet": {"title": f"{self.title} (stream)"},
                 "cdn": {
                     "frameRate": "30fps",
                     "ingestionType": "rtmp",
@@ -141,6 +233,11 @@ class Broadcast:
         if not self.live_chat_id:
             self.live_chat_id = self._fetch_live_chat_id()
         return self
+
+    def create(self, title: str, description: str,
+               scheduled_start: datetime) -> "Broadcast":
+        """後方互換用。配信枠とストリームを続けて作成する。"""
+        return self.create_event(title, description, scheduled_start).create_stream_and_bind()
 
     def _fetch_live_chat_id(self) -> str:
         yt = get_client()

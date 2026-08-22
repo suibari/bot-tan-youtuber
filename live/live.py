@@ -28,6 +28,7 @@ import motion as motion_mod
 import notify
 import persona
 import safety
+import schedule as live_schedule
 import subtitle
 import unity_client
 import unity_live
@@ -156,22 +157,43 @@ class LiveSession:
             return
 
         import broadcast as broadcast_mod
-        # 前回の失敗で残った枠を先に片付ける。溜まると YouTube 側が
-        # 分かりにくくなるうえ、どれが今日の枠か見分けがつかなくなる
+        scheduled_start, scheduled_end = live_schedule.today_schedule()
+        title, description = live_schedule.broadcast_text(scheduled_start)
+
+        prepared = memory.get_prepared_broadcast(scheduled_start)
+        if prepared:
+            self.broadcast = broadcast_mod.Broadcast.load(prepared["broadcast_id"])
+            if self.broadcast:
+                print(f"[YouTube] 4時に準備した配信枠を再利用: {self.broadcast.url}")
+
+        # DB保存だけ失敗した場合もYouTube上の同日枠を拾い、重複作成しない。
+        if self.broadcast is None:
+            self.broadcast = broadcast_mod.Broadcast.find_scheduled(scheduled_start)
+            if self.broadcast:
+                print(f"[YouTube] YouTube上の当日配信枠を再利用: {self.broadcast.url}")
+
+        if self.broadcast is None:
+            print("[YouTube] 準備済み枠がないため、その場で作成します")
+            self.broadcast = broadcast_mod.Broadcast().create_event(
+                title, description, scheduled_start,
+            )
+
         try:
-            broadcast_mod.cleanup_stale()
+            broadcast_mod.cleanup_stale(
+                preserve_ids=[self.broadcast.broadcast_id],
+                scheduled_before=scheduled_start,
+            )
         except Exception as e:
             print(f"[YouTube] 古い枠の片付けに失敗（続行します）: {e}")
 
-        today = datetime.now().strftime("%Y年%-m月%-d日")
-        title = f"【全肯定botたん】夜のおしゃべり配信 {today}"
-        description = (
-            "全肯定botたんが、コメントに全部お返事する1時間の配信だよ。\n"
-            "毎日21時から22時までやってるよ。気軽に話しかけてね。\n\n"
-            "ボイス: VOICEVOX:春日部つむぎ\n"
+        memory.save_prepared_broadcast(
+            self.broadcast.broadcast_id,
+            self.broadcast.url,
+            self.broadcast.title or title,
+            scheduled_start,
+            scheduled_end,
         )
-        self.broadcast = broadcast_mod.Broadcast().create(
-            title, description, _today_at(LIVE_START_HHMM))
+        self.broadcast.create_stream_and_bind()
 
         self.obs.set_stream_target(
             self.broadcast.ingestion_address, self.broadcast.stream_name)

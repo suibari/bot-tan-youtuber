@@ -164,6 +164,18 @@ def ensure_schema() -> None:
                     created_at    timestamptz NOT NULL DEFAULT now()
                 )
             """)
+            # broadcasts はこのPythonサービスが所有するスキーマなので、既存環境にも
+            # 破壊なしで列を足す。Drizzleの管理対象には入れない。
+            cur.execute(f"""
+                ALTER TABLE {LIVE_SCHEMA}.broadcasts
+                    ADD COLUMN IF NOT EXISTS scheduled_start_at timestamptz,
+                    ADD COLUMN IF NOT EXISTS scheduled_end_at timestamptz,
+                    ADD COLUMN IF NOT EXISTS prepared_at timestamptz
+            """)
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS broadcasts_scheduled_start_idx
+                ON {LIVE_SCHEMA}.broadcasts (scheduled_start_at DESC)
+            """)
         conn.commit()
     print(f"[memory] {LIVE_SCHEMA} スキーマを確認しました")
 
@@ -282,6 +294,43 @@ def get_previous_live_highlights(limit: int = 5) -> list:
                 LIMIT %s
             """, (limit,))
             return [dict(r) for r in cur.fetchall()]
+
+
+def save_prepared_broadcast(broadcast_id: str, url: str, title: str,
+                            scheduled_start, scheduled_end) -> None:
+    """先行作成した配信枠を保存する。RTMP情報は資格情報なので保存しない。"""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO {LIVE_SCHEMA}.broadcasts
+                    (broadcast_id, url, title, scheduled_start_at,
+                     scheduled_end_at, prepared_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (broadcast_id) DO UPDATE
+                    SET url = EXCLUDED.url,
+                        title = EXCLUDED.title,
+                        scheduled_start_at = EXCLUDED.scheduled_start_at,
+                        scheduled_end_at = EXCLUDED.scheduled_end_at,
+                        prepared_at = now(),
+                        ended_at = NULL
+            """, (broadcast_id, url, title, scheduled_start, scheduled_end))
+        conn.commit()
+
+
+def get_prepared_broadcast(scheduled_start) -> dict | None:
+    """同じ開始時刻の最新の未終了枠を返す。"""
+    with connect() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT broadcast_id, url, title, scheduled_start_at,
+                       scheduled_end_at, prepared_at
+                FROM {LIVE_SCHEMA}.broadcasts
+                WHERE scheduled_start_at = %s AND ended_at IS NULL
+                ORDER BY prepared_at DESC NULLS LAST, created_at DESC
+                LIMIT 1
+            """, (scheduled_start,))
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 def start_broadcast(broadcast_id: str, url: str, title: str) -> None:

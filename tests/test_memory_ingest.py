@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -96,6 +97,70 @@ class ChatMemoryIngestTest(unittest.TestCase):
         writer.tombstone("message-4")
         writer.stop()
         self.assertEqual(attempts, ["upsert", "delete"])
+
+
+class BroadcastMemoryTest(unittest.TestCase):
+    class Cursor:
+        def __init__(self, row=None):
+            self.queries = []
+            self.row = row
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query, params=None):
+            self.queries.append((query, params))
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __init__(self, cursor):
+            self.value = cursor
+            self.commits = 0
+
+        def cursor(self, **_kwargs):
+            return self.value
+
+        def commit(self):
+            self.commits += 1
+
+    @staticmethod
+    @contextmanager
+    def connection(value):
+        yield value
+
+    def test_ensure_schema_adds_schedule_columns_compatibly(self):
+        cursor = self.Cursor()
+        conn = self.Connection(cursor)
+        with patch.object(memory, "connect", lambda: self.connection(conn)):
+            memory.ensure_schema()
+        sql = "\n".join(query for query, _ in cursor.queries)
+        self.assertIn("ADD COLUMN IF NOT EXISTS scheduled_start_at", sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS scheduled_end_at", sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS prepared_at", sql)
+        self.assertEqual(conn.commits, 1)
+
+    def test_prepared_broadcast_upsert_and_lookup(self):
+        expected = {
+            "broadcast_id": "broadcast-1",
+            "url": "https://www.youtube.com/watch?v=broadcast-1",
+        }
+        cursor = self.Cursor(row=expected)
+        conn = self.Connection(cursor)
+        with patch.object(memory, "connect", lambda: self.connection(conn)):
+            memory.save_prepared_broadcast(
+                "broadcast-1", expected["url"], "title", "start", "end",
+            )
+            row = memory.get_prepared_broadcast("start")
+        self.assertEqual(row, expected)
+        self.assertTrue(any("ON CONFLICT (broadcast_id)" in query
+                            for query, _ in cursor.queries))
+        self.assertTrue(any("scheduled_start_at = %s" in query
+                            for query, _ in cursor.queries))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+[Unit]
+Description=botたん YouTubeライブ配信枠を毎日JST 4:00に作成する
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Tokyo
+Persistent=false
+Unit=bottan-live-prepare.service
+
+[Install]
+WantedBy=timers.target

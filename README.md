@@ -7,6 +7,7 @@
 |---|---|---|---|
 | `shorts/` | 夜の Shorts（Nagi のポスト紹介）| `run.sh` | 毎日 18:00 JST |
 | `shorts/` | 朝の勘違いクイズ Shorts | `run_quiz.sh` | 毎日 06:00 JST |
+| `live/` | 当日ライブの配信枠だけを先行作成 | `live/prepare_broadcast.py` | 毎日 04:00 JST |
 | `live/` | YouTube ライブ配信（AITuber）| `run_live.sh` | 毎日 20:40 起動 / 21:00–22:00 配信 |
 | `common/` | 上記が共有する処理 | — | — |
 
@@ -28,6 +29,8 @@ shorts/           Shorts の生成と投稿
   pipeline.py       夜版 / quiz_pipeline.py 朝版
 live/             ライブ配信
   config.py         配信の設定。common/ の再輸出ファサードでもある
+  schedule.py       JSTの開始・終了時刻と配信タイトル
+  prepare_broadcast.py  当日枠だけを作り共有DBへ保存する4時ジョブ
   live.py           配信のメインループ
 tools/            手動で使う道具（プール構築・OBS シーン構築・Unity 単体確認）
 setup/            systemd ユニットと Xorg/openbox の設定＋インストーラ
@@ -303,6 +306,8 @@ curl -X POST 127.0.0.1:2338/camera -d '{"x":-0.25,"y":1.35,"z":0.7}'
 sudo bash setup/install_units.sh
 ```
 
+04:00 に当日21時の配信枠と視聴URLだけを作成し、20:40 の本配信が同じ枠へ
+ストリームを紐づける。OBS・Unity・RTMP送出は20:40まで起動しない。
 20:40 起動 → 21:00 live → 21:55 クロージング → 22:00 complete。
 `Persistent=false` にしてあるので、起動に失敗した日を後から取り返さない
 （変な時刻に配信枠が増えるのを防ぐ）。

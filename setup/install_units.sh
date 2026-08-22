@@ -52,6 +52,7 @@ install_unit() {
 
 for u in bottan-pipeline.service bottan-pipeline.timer \
          bottan-quiz.service bottan-quiz.timer \
+         bottan-live-prepare.service bottan-live-prepare.timer \
          bottan-live.service bottan-live.timer; do
     install_unit "$u"
 done
@@ -65,11 +66,13 @@ if [ ! -f /etc/systemd/system/bottan-live-xorg.service ]; then
     echo "      ライブ配信を使うなら sudo bash setup/install_xorg.sh を先に実行してください。" >&2
 fi
 
-systemctl enable bottan-pipeline.timer bottan-quiz.timer bottan-live.timer
+systemctl enable bottan-pipeline.timer bottan-quiz.timer \
+    bottan-live-prepare.timer bottan-live.timer
 
 echo
 echo "次回の起動予定:"
-systemctl list-timers bottan-pipeline.timer bottan-quiz.timer bottan-live.timer --no-pager
+systemctl list-timers bottan-pipeline.timer bottan-quiz.timer \
+    bottan-live-prepare.timer bottan-live.timer --no-pager
 
 echo
 echo "時間帯が重なっていないか確認してください（録画と配信は flock で直列化されますが、"
