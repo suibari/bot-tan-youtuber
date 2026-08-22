@@ -17,6 +17,7 @@ from pathlib import Path
 import requests
 
 from common.env import env_int
+from common.pronunciation import apply_pronunciations, preload_pronunciations  # noqa: F401
 
 VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
 VOICEVOX_SPEAKER = env_int("VOICEVOX_SPEAKER", 8)   # VOICEVOX: 春日部つむぎ ノーマル
@@ -71,9 +72,10 @@ def get_wav_duration(wav_path) -> float:
 
 
 def audio_query(text: str) -> dict:
+    spoken_text = apply_pronunciations(text)
     res = requests.post(
         f"{VOICEVOX_URL}/audio_query",
-        params={"text": text, "speaker": VOICEVOX_SPEAKER},
+        params={"text": spoken_text, "speaker": VOICEVOX_SPEAKER},
         timeout=_TIMEOUT,
     )
     res.raise_for_status()

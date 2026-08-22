@@ -11,6 +11,7 @@ from common.voice import (  # noqa: F401
     get_wav_duration,
     health_check,
     make_silence_wav,
+    preload_pronunciations,
     synthesize,
     synthesize_lines,
 )

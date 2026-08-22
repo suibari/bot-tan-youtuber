@@ -104,6 +104,8 @@ class LiveSession:
         bot = memory.get_biorhythm()
         print(f"[準備] botたんの状態: {bot['status']} / energy={bot['energy']:.1f} / {bot['mood'][:40]}")
 
+        print("[準備] 読み辞書を確認します")
+        voice.preload_pronunciations()
         print("[準備] VOICEVOX を確認します")
         speaker = voice.health_check()
         print(f"[準備] 話者: {speaker}")
