@@ -496,3 +496,7 @@ pgvector も埋め込みテーブルも実在しない。`bsky-affirmative-bot` 
 配信側から `POST /energy` を投げると同じコメントで二重に加算されるので投げない。
 読みは `memory.get_biorhythm()` で `bot_state` を直接引く（内部スケール
 0〜10000 を 0〜100 に直して返す）。
+
+## ライセンス
+
+本ソフトウェアは MIT License の下で公開されています。詳細は [LICENSE](./LICENSE) を参照してください。
