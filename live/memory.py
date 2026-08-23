@@ -220,18 +220,28 @@ def get_today_activities(limit: int = 8) -> list:
             return [dict(r) for r in cur.fetchall()]
 
 
-# ── Bluesky でのやりとり ─────────────────────────────
+# ── SNS で見かけた投稿 ───────────────────────────────
+#
+# botたんのホームは Nagi、Bluesky は毎日通う出張先。フリートークの枠も
+# 両方に用意する（片方しか無いと、そちらだけが居場所であるかのように喋る）。
 
-def get_recent_replies(limit: int = 5) -> list:
+def get_bsky_posts(limit: int = 5, min_score: int = 88) -> list:
+    """Bluesky の高得点ポスト。get_nagi_posts の Bluesky 版。
+
+    `affirmative_bot.posts` は巻き取りウィンドウで、botたんが反応した投稿が
+    本文とスコアつきで入っている。nagi 側と違い deleted_at / kossori に
+    相当する列は無いので、条件はスコアと日付だけ。
+    """
     with connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT reply, created_at
-                FROM affirmative_bot.replies
-                WHERE created_at >= NOW() - INTERVAL '1 days'
-                ORDER BY created_at DESC
+                SELECT post AS post_text, score, created_at
+                FROM affirmative_bot.posts
+                WHERE score >= %s
+                  AND created_at >= NOW() - INTERVAL '1 days'
+                ORDER BY score DESC
                 LIMIT %s
-            """, (limit,))
+            """, (min_score, limit))
             return [dict(r) for r in cur.fetchall()]
 
 

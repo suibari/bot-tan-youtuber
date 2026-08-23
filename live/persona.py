@@ -316,6 +316,10 @@ def _memory_block(mem: dict) -> str:
         text = (post.get("post_text") or "").replace("\n", " ")[:80]
         out.append(f"- SNSのNagiで見かけた投稿：{text}")
 
+    for post in (mem.get("bsky_posts") or [])[:2]:
+        text = (post.get("post_text") or "").replace("\n", " ")[:80]
+        out.append(f"- Blueskyで見かけた投稿：{text}")
+
     short = mem.get("latest_short") or {}
     if short.get("title"):
         out.append(f"- 昨日出した動画：{short['title']}")
@@ -467,6 +471,38 @@ def build_filler_prompt(topic_hint, bot: dict, mem: dict = None,
     if block:
         parts.append("")
         parts.append(block)
+    return "\n".join(parts)
+
+
+def build_followup_prompt(theme: str, topic_hint=None, bot: dict = None,
+                          recent_replies: list = None) -> str:
+    """いま話しているテーマを、別の角度から掘り下げるためのプロンプト。
+
+    「答えて終わり」にせず、出た話題に一言足して続ける。実際のVTuberの間の
+    持たせ方に近づけるためのもので、フリートークより短く、話題は変えない。
+
+    topic_hint（RAGの資料）は**無くてもよい**。資料が引けるまで黙るのは本末転倒で、
+    その場合は履歴とテーマだけで別の角度を出させる。
+    """
+    parts = [
+        "いま自分が話していた話題を、もう一歩だけ掘り下げてください。",
+        "**話題は変えないこと。** 同じことを言い換えるのではなく、"
+        "その話題に関連する別の角度をひとつだけ出して、短く続けてください。",
+        "1〜2文で終わらせること。まとめや締めの言葉は要りません。",
+        "",
+        f"## さっき話していたこと\n{theme}",
+        "",
+    ]
+    if topic_hint:
+        parts.append(f"## 掘り下げに使ってよい資料\n{_filler_topic_block(topic_hint)}")
+        parts.append("")
+    if recent_replies:
+        parts.append("## 直前に自分が話したこと（同じ話を繰り返さないこと）")
+        for r in recent_replies[-4:]:
+            parts.append(f"- {r}")
+        parts.append("")
+
+    parts.append(_bot_state_block(bot or {}))
     return "\n".join(parts)
 
 

@@ -47,12 +47,21 @@ else:
     print(f"[LLM] Gemini ({', '.join(LLM_MODELS)}) を使用します")
 
 
+# 再試行の間に置く待ち[秒]。左から順に使い、足りなければ最後の値を繰り返す。
+#
+# 以前は待ちが一切無く、429（レート制限）を食うと3回を一瞬で使い切って
+# 次のモデルへ移っていた。間を置かずに投げ直すのはレート制限を悪化させるだけで、
+# そのぶん配信のメインループが止まる。長く待ちすぎても止まるので、頭は打たせる。
+LLM_RETRY_BACKOFF_SEC = (0.5, 1.0, 2.0)
+
+
 def create(attempts_per_model: int = 3, **kwargs):
     """LLM_MODELS を左から順に attempts_per_model 回ずつ試す。
 
     SDK 側のリトライは切ってある（max_retries=0）。ここで数える回数が
     そのまま実際の試行回数なので、最悪の待ち時間は
-    LLM_TIMEOUT_SEC × attempts_per_model × len(LLM_MODELS) で見積もれる。
+    LLM_TIMEOUT_SEC × attempts_per_model × len(LLM_MODELS) に
+    LLM_RETRY_BACKOFF_SEC の合計を足したもので見積もれる。
     """
     last_exc = None
     for model in LLM_MODELS:
@@ -65,7 +74,11 @@ def create(attempts_per_model: int = 3, **kwargs):
             except Exception as e:
                 last_exc = e
                 if attempt < attempts_per_model:
-                    print(f"[LLM] {model} 試行{attempt}失敗、リトライします... ({e})")
+                    delay = LLM_RETRY_BACKOFF_SEC[
+                        min(attempt - 1, len(LLM_RETRY_BACKOFF_SEC) - 1)]
+                    print(f"[LLM] {model} 試行{attempt}失敗、{delay:.1f}秒待って"
+                          f"リトライします... ({e})")
+                    time.sleep(delay)
                 else:
                     print(f"[LLM] {model} {attempts_per_model}回失敗、次のモデルへ移行します ({e})")
     raise last_exc

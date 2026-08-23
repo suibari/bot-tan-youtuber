@@ -35,7 +35,9 @@ import unity_client
 import unity_live
 import voice
 from config import (
-    DRY_RUN, ENERGY_REFRESH_SEC, FILLER_IDLE_SEC, IDLE_ENABLED, LIVE_CLOSING_HHMM,
+    DRY_RUN, ENERGY_REFRESH_SEC, FILLER_IDLE_SEC, FILLER_STOP_LEAD_SEC,
+    FOLLOWUP_IDLE_SEC, FOLLOWUP_MAX_DEPTH, FOLLOWUP_TTL_SEC,
+    IDLE_ENABLED, LIVE_CLOSING_HHMM,
     LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
     BOT_CONTEXT_TTL_SEC, FPS_LOG_SEC, LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
     SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT,
@@ -94,6 +96,10 @@ class LiveSession:
         # botたんの状態のキャッシュ（_bot_context 参照）
         self._bot_cache = None
         self._bot_cache_at = 0.0
+        # いま話しているテーマ（_begin_thread / speak_followup 参照）
+        self._thread = None
+        # キュー統計を最後に出した時刻
+        self._queue_log_at = 0.0
         # メインループを止めない雑務スレッド（_start_chores 参照）
         self._chores = None
 
@@ -460,6 +466,8 @@ class LiveSession:
             return
         self.conversation.add_comment_turn(
             comment.channel_id, comment.author, comment.text, spoken_text)
+        # このコメントの話題を、次の掘り下げのテーマにする
+        self._begin_thread(f"{comment.text}\n{spoken_text}")
 
         started = self._speech_started_at
         print(f"[live] 反応まで {started - comment.received_at:.1f}秒 "
@@ -496,9 +504,78 @@ class LiveSession:
         spoken = self._speak(reply, tag="フリートーク", interruptible=True)
         if spoken:
             self.conversation.add_solo_turn("フリートーク", spoken)
+            # フリートークも掘り下げの対象にする。これで
+            # 「話題 → 掘り下げ → 掘り下げ → 次の話題」と続くようになる
+            self._begin_thread(spoken)
         if spoken and topic["memory_ids"] and not reply.get("_fallback"):
             output_ref = self.broadcast.broadcast_id if self.broadcast else "dry-run"
             self.planner.record_usage(topic["memory_ids"], output_ref)
+
+    # ── 掘り下げ ──────────────────────────────────────
+
+    def _begin_thread(self, theme: str) -> None:
+        """いま話しているテーマを覚える。**ここではネットワークを触らない。**
+
+        RAG を実際に引くのは雑務スレッド（_start_chores）。ここで引くと、
+        そのぶん次のコメントへの反応が遅れる。
+        """
+        theme = (theme or "").strip()
+        if not theme:
+            self._thread = None
+            return
+        self._thread = {"theme": theme, "depth": 0, "at": time.monotonic()}
+        try:
+            self.planner.set_followup_theme(theme)
+        except Exception as e:
+            print(f"[live] 掘り下げのテーマを渡せません（無視します）: {e}")
+
+    def _followup_due(self) -> bool:
+        """いま掘り下げてよいか。"""
+        if not self._thread:
+            return False
+        if self._thread["depth"] >= FOLLOWUP_MAX_DEPTH:
+            return False
+        now = time.monotonic()
+        if now - self._thread["at"] > FOLLOWUP_TTL_SEC:
+            self._thread = None
+            return False
+        return now - self.last_speech_at > FOLLOWUP_IDLE_SEC
+
+    def speak_followup(self) -> None:
+        """いまのテーマを別の角度から一言足す。
+
+        資料（RAG）が無くても喋る。引けるまで黙るのは本末転倒。
+        """
+        thread = self._thread
+        if not thread:
+            return
+        try:
+            material = self.planner.next_followup()
+        except Exception as e:
+            print(f"[live] 掘り下げの資料を引けません（無視します）: {e}")
+            material = None
+
+        prompt = persona.build_followup_prompt(
+            thread["theme"],
+            material["hint"] if material else None,
+            self._bot_context(),
+            recent_replies=self.conversation.recent_replies(),
+        )
+        history = persona.build_history(self.conversation.recent_turns())
+        reply = self._generate(prompt, history)
+        spoken = self._speak(reply, tag="掘り下げ", interruptible=True)
+        if not spoken:
+            # 喋れなかったテーマを抱えたままだと、同じ失敗を繰り返す
+            self._thread = None
+            return
+
+        self.conversation.add_solo_turn("掘り下げ", spoken)
+        thread["depth"] += 1
+        if thread["depth"] >= FOLLOWUP_MAX_DEPTH:
+            self._thread = None
+        if material and material["memory_ids"] and not reply.get("_fallback"):
+            output_ref = self.broadcast.broadcast_id if self.broadcast else "dry-run"
+            self.planner.record_usage(material["memory_ids"], output_ref)
 
     def speak_scripted(self, instruction: str, tag: str) -> None:
         """オープニング・クロージング。会話履歴にも積む（場の流れが飛ばないように）。"""
@@ -527,6 +604,16 @@ class LiveSession:
                 except Exception as e:
                     print(f"[live] コメント処理でエラー（続行します）: {e}")
                     traceback.print_exc()
+            elif self._closing_soon(closing_at):
+                # 終了間際は自分から喋らない。ここで長い独り言を始めると、
+                # そのぶん最後のコメントに返事できないまま配信が終わる
+                time.sleep(0.5)
+            elif self._followup_due():
+                try:
+                    self.speak_followup()
+                except Exception as e:
+                    print(f"[live] 掘り下げでエラー（続行します）: {e}")
+                    self._thread = None
             elif time.monotonic() - self.last_speech_at > FILLER_IDLE_SEC:
                 try:
                     self.speak_filler()
@@ -540,11 +627,29 @@ class LiveSession:
                 self._housekeeping()
                 last_housekeeping = now
 
+        # ここを抜けた時点で残っているコメントには、もう返事できない。
+        # 何件取り残したかは配信後に効き具合を見る唯一の手がかりになる
+        self._log_queue("[live] クロージングへ入ります")
+
         self.speak_scripted(
             "配信のクロージングです。「botたん」という自分の名前を必ず言って、"
             "高評価とチャンネル登録がうれしいことを伝えて、「また明日ね」で締めてください。"
             "日付は言わないこと。",
             "クロージング")
+
+    def _closing_soon(self, closing_at: datetime) -> bool:
+        """クロージングまで FILLER_STOP_LEAD_SEC を切ったか。"""
+        if FILLER_STOP_LEAD_SEC <= 0:
+            return False
+        return datetime.now() >= closing_at - timedelta(seconds=FILLER_STOP_LEAD_SEC)
+
+    def _log_queue(self, label: str) -> None:
+        try:
+            st = self.queue.stats()
+        except Exception:
+            return
+        print(f"{label} キュー: 待ち{st['waiting']}件 / 最古 {st['oldest']:.0f}秒 / "
+              f"受信 {st['received']}件 / 破棄 {st['dropped']}件")
 
     def _start_chores(self) -> None:
         """DB や LAN を触る雑務を別スレッドへ追い出す。
@@ -573,6 +678,13 @@ class LiveSession:
                         self.planner.refresh_memory()
                     except Exception as e:
                         print(f"[live] 記憶を引き直せません（無視します）: {e}")
+                # 掘り下げは「テーマが変わっていたら引く」ので毎周見てよい。
+                # 返事を喋っている 15〜25秒 のあいだに終わるので、掘り下げる
+                # 時点では候補が揃っている
+                try:
+                    self.planner.prefetch_followup()
+                except Exception as e:
+                    print(f"[live] 掘り下げの先読みを始められません（無視します）: {e}")
                 if now - rag_at > 30:
                     rag_at = now
                     try:
@@ -601,6 +713,12 @@ class LiveSession:
             subtitle.write_clock()
         except Exception:
             pass
+
+        # 待ち行列の様子。返事が遅れているのが滞留のせいなのか、
+        # 溢れて捨てているのかは、これが無いと切り分けられない
+        if time.monotonic() - self._queue_log_at > 30:
+            self._queue_log_at = time.monotonic()
+            self._log_queue("[live]")
 
         # ARDY が作り終えたモーションを拾う。プールに入っているので
         # 次に pick したときから使われる
@@ -633,10 +751,12 @@ class LiveSession:
         self.idle.stop()
         self.subs.stop()
         subtitle.clear()
-        subtitle.clear_comments()
 
+        # コメント欄を消すのは**ポーラーを止めてから**。先に消すと、止まるまでの
+        # あいだに届いたコメントを ChatPoller._accept が書き戻してしまう
         if self.poller is not None:
             self.poller.stop()
+        subtitle.clear_comments()
         self.memory_writer.stop()
 
         if self.broadcast is not None:

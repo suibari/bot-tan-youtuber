@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "live"))
 # コールバック境界の外なので、import時だけ最小スタブへ差し替える。
 config_stub = types.ModuleType("config")
 config_stub.COMMENT_USER_COOLDOWN_SEC = 60
+config_stub.COMMENT_MAX_AGE_SEC = 180
 config_stub.DRY_RUN = False
 config_stub.FAKE_COMMENTS = ""
 sys.modules["config"] = config_stub

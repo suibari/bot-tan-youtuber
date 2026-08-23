@@ -75,10 +75,14 @@ LIVE_AUDIO_SINK = os.getenv("LIVE_AUDIO_SINK", "bottan_live")
 # ── 待機中の演出 ──────────────────────────────────
 # 喋っていない間もモーションと表情を動かす。止まっていると人形に見える
 IDLE_ENABLED       = env_flag("IDLE_ENABLED", True)
-IDLE_MOTION_MIN_SEC = env_float("IDLE_MOTION_MIN_SEC", 9.0)
+# しぐさの間隔。1本が約9秒なので、9〜20秒だと待機時間の4割は棒立ちになる
+IDLE_MOTION_MIN_SEC = env_float("IDLE_MOTION_MIN_SEC", 6.0)
 IDLE_MOTION_MAX_SEC = env_float("IDLE_MOTION_MAX_SEC", 20.0)
-IDLE_EMOTION_MIN_SEC = env_float("IDLE_EMOTION_MIN_SEC", 6.0)
-IDLE_EMOTION_MAX_SEC = env_float("IDLE_EMOTION_MAX_SEC", 14.0)
+# 表情を動かす間隔。Unity 側が Lerp で繋ぐので、短くしても百面相にはならない
+IDLE_EMOTION_MIN_SEC = env_float("IDLE_EMOTION_MIN_SEC", 3.0)
+IDLE_EMOTION_MAX_SEC = env_float("IDLE_EMOTION_MAX_SEC", 8.0)
+# ほほえみパルスを保つ長さ[秒]。黙っている間にときどき笑顔を作る
+IDLE_SMILE_HOLD_SEC = env_float("IDLE_SMILE_HOLD_SEC", 1.5)
 
 # ── VOICEVOX ─────────────────────────────────────
 # 10101 は AivisSpeech Engine の既定ポートでもある。起動時に /speakers で実体を確認する
@@ -185,8 +189,21 @@ FPS_LOG_SEC = env_float("FPS_LOG_SEC", 60.0)
 BOT_CONTEXT_TTL_SEC = env_float("BOT_CONTEXT_TTL_SEC", 20.0)
 
 # ── 配信の振る舞い ────────────────────────────────
-# コメントがこの秒数途切れたらフリートークを挟む
-FILLER_IDLE_SEC = env_float("FILLER_IDLE_SEC", 90.0)
+# コメントがこの秒数途切れたらフリートークを挟む。
+# 90秒だと「黙っている時間」が長すぎて放送事故に見える。短くすると LLM と
+# VOICEVOX の呼び出し回数が増えるので、詰めるならレート制限に注意すること
+FILLER_IDLE_SEC = env_float("FILLER_IDLE_SEC", 25.0)
+# クロージングの何秒前からフリートークと掘り下げをやめるか。
+# ここから先はコメントの消化に専念する（run_loop は LIVE_CLOSING_HHMM で
+# 抜けてしまい、それ以降のコメントには一切反応できないため）
+FILLER_STOP_LEAD_SEC = env_float("FILLER_STOP_LEAD_SEC", 120.0)
+# 直近の発話からこの秒数空いたら、いま話しているテーマを掘り下げる。
+# 「答えて終わり」にせず、別の角度をもう一言足して間を埋める
+FOLLOWUP_IDLE_SEC = env_float("FOLLOWUP_IDLE_SEC", 8.0)
+# 1つのテーマを何回まで掘るか。深追いすると話が一人歩きする
+FOLLOWUP_MAX_DEPTH = env_int("FOLLOWUP_MAX_DEPTH", 2)
+# テーマの寿命[秒]。これを過ぎたら掘り下げず、新しい話題へ移る
+FOLLOWUP_TTL_SEC = env_float("FOLLOWUP_TTL_SEC", 120.0)
 # 同一ユーザーの連投をこの秒数だけ間引く。
 # **他に返事できるコメントが無いときは無視される**（chat.CommentQueue._next_index）。
 # 1人しか居ないのに黙ってフリートークへ流れると、会話が続かないため
@@ -199,6 +216,11 @@ LIVE_HISTORY_TURNS = env_int("LIVE_HISTORY_TURNS", 6)
 LIVE_HISTORY_USER_TURNS = env_int("LIVE_HISTORY_USER_TURNS", 3)
 # 視聴者コメントの文字数上限。これを超える分は切り捨てる
 COMMENT_MAX_CHARS = env_int("COMMENT_MAX_CHARS", 200)
+# 一般視聴者のコメントをこの秒数まで待たせたら、返事せずに捨てる。
+# 取り出しは同じ優先度なら古い順なので、滞留を放っておくと「5分前のコメントに
+# いま返事する」状態になり、視聴者から見た遅れが配信の後半ほど伸びていく。
+# 0 以下で無効。スパチャ・メンバー・オーナーは古くても捨てない
+COMMENT_MAX_AGE_SEC = env_float("COMMENT_MAX_AGE_SEC", 180.0)
 
 # ── 運用 ─────────────────────────────────────────
 DRY_RUN         = env_flag("DRY_RUN")          # YouTube に触らずローカルだけで回す

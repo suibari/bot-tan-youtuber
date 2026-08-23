@@ -62,6 +62,73 @@ class PronunciationCacheTest(unittest.TestCase):
             loader=lambda: [("Nagi", "ナギ")], enabled=True)
         self.assertEqual(cache.apply("NagiとNagisa"), "ナギとNagisa")
 
+    def test_separators_inside_the_surface_are_ignored(self):
+        """登録は連結表記でも、喋るときは区切りが入る。
+
+        2026-08-23 の配信で `ファイアーエムブレム万紫千紅` を登録してあったのに
+        「ファイアーエムブレム 万紫千紅」と喋って素読みした。
+        """
+        cache = PronunciationCache(loader=lambda: [
+            ("ファイアーエムブレム万紫千紅", "ファイアーエムブレム、バンシセンコウ"),
+        ], enabled=True)
+        for written in ("ファイアーエムブレム万紫千紅",
+                        "ファイアーエムブレム 万紫千紅",
+                        "ファイアーエムブレム\u3000万紫千紅",
+                        "ファイアーエムブレム、万紫千紅",
+                        "ファイアーエムブレム・万紫千紅"):
+            with self.subTest(written=written):
+                self.assertEqual(cache.apply(written),
+                                 "ファイアーエムブレム、バンシセンコウ")
+
+    def test_separator_is_only_allowed_where_the_script_changes(self):
+        """どこにでも区切りを許すと、関係ない語に食い込む。"""
+        cache = PronunciationCache(
+            loader=lambda: [("アニメ", "アニメ映像")], enabled=True)
+        self.assertEqual(cache.apply("アニ、メートル"), "アニ、メートル")
+
+    def test_long_vowel_mark_is_not_a_boundary(self):
+        """`ー` は読みの一部。ここで切れると別語に当たる。"""
+        cache = PronunciationCache(
+            loader=lambda: [("ラーメン", "ラーメン料理")], enabled=True)
+        self.assertEqual(cache.apply("ラー、メン屋"), "ラー、メン屋")
+        self.assertEqual(cache.apply("ラーメン屋"), "ラーメン料理屋")
+
+    def test_ascii_case_variants_fall_back_to_the_registered_reading(self):
+        cache = PronunciationCache(
+            loader=lambda: [("YouTube", "ユーチューブ")], enabled=True)
+        for written in ("YouTube", "youtube", "Youtube", "YOUTUBE"):
+            with self.subTest(written=written):
+                self.assertEqual(cache.apply(written), "ユーチューブ")
+
+    def test_case_distinguishes_words_registered_as_different_readings(self):
+        """`Halo`(ヘイロー) と `halo`(ハロー) は別語として登録されている。"""
+        cache = PronunciationCache(loader=lambda: [
+            ("Halo", "ヘイロー"),
+            ("halo", "ハロー"),
+        ], enabled=True)
+        self.assertEqual(cache.apply("Halo"), "ヘイロー")
+        self.assertEqual(cache.apply("halo"), "ハロー")
+
+    def test_colliding_registrations_do_not_raise(self):
+        """区切りと大小を潰すと衝突する登録があっても落ちない。"""
+        cache = PronunciationCache(loader=lambda: [
+            ("Umamusume Cinderella Grey", "ウマムスメ、シンデレラ、グレイ"),
+            ("umamusume cinderella grey", "ウマムスメ、シンデレラ、グレイ"),
+        ], enabled=True)
+        self.assertEqual(cache.apply("Umamusume Cinderella Grey"),
+                         "ウマムスメ、シンデレラ、グレイ")
+        self.assertEqual(cache.apply("umamusume cinderella grey"),
+                         "ウマムスメ、シンデレラ、グレイ")
+
+    def test_both_spellings_are_found_when_both_are_registered(self):
+        """区切りの有無だけが違う登録が両方あっても、どちらの書かれ方でも拾う。"""
+        cache = PronunciationCache(loader=lambda: [
+            ("Blue Sky", "ブルー、スカイ"),
+            ("Bluesky", "ブルースカイ"),
+        ], enabled=True)
+        self.assertEqual(cache.apply("Bluesky"), "ブルースカイ")
+        self.assertEqual(cache.apply("Blue Sky"), "ブルー、スカイ")
+
     def test_failed_refresh_keeps_last_good_cache(self):
         calls = 0
 

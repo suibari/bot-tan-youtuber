@@ -481,8 +481,18 @@ Nagi が SNS の名前だと書いていないのに、プロンプト側は「N
   ごとに次を投げ、常に2本が重なった状態を保つ。録画パイプラインが
   時刻表を事前計算して 0.5秒 重ねて置いているのと同じことを、尺が先に分からない
   配信では時間で刻んでやっている。表情は `_speak` が決めるのでここでは振らない
-- **待機中**: 9〜20秒おきにプールのモーションを1本（落ち着いたカテゴリを厚めに抽選）、
-  6〜14秒おきに valence/arousal を少し振る（直前の発話の感情を素の顔として引き継ぐ）
+- **待機中**: 6〜20秒おきにプールのモーションを1本（落ち着いたカテゴリを厚めに抽選）。
+  1本が約9秒なので、下限が9秒だと待機時間の4割が Animator の Idle（棒立ち）になる
+- **待機中の表情**: 3〜8秒おきに動かす。1/4 の確率で「ほほえみパルス」
+  （valence を 0.85〜0.95 まで上げて `IDLE_SMILE_HOLD_SEC` 保持してから戻す）、
+  1/10 で「はっと顔」（arousal を上げる）、残りは従来のランダムウォーク。
+  直前の発話の感情を素の顔として引き継ぐ
+
+  Unity が受け取れるのは valence/arousal の2軸だけで、**ウィンクのような個別の
+  表情は指定できない**（`LiveController` に `/expression` が無い）。表情の
+  バリエーションを作れるのは値の動かし方だけなので、はっきり分かる山を混ぜている。
+  ウィンクを入れるなら Unity 側に手を入れること（VRM には `blinkLeft`/`blinkRight`
+  プリセットも `Fcl_EYE_Close_L/R` モーフもある）
 
 `IDLE_ENABLED=false` で止まるのは待機中のぶんだけで、発話中は動く。
 
@@ -535,13 +545,122 @@ ARDY が予備動作として「膝を深く曲げて脚を大きく開くしゃ
 `schemaFilter` が `['public','affirmative_bot']` なので、drizzle の定義に無い
 テーブルをそこへ置くと **DROP 候補になる**ため。
 
-### 「botたんRAG」について
+### 記憶は SQL と Bot Memory API の2本立て
 
-pgvector も埋め込みテーブルも実在しない。`bsky-affirmative-bot` の埋め込みは
-`packages/bot_brain/src/gemini/embeddingTexts.ts` でその場で計算して捨てており、
-永続化されていない。記憶の実体は `affirmative_bot` スキーマの素の RDB なので、
-`memory.py` が SQL で引いてプロンプトに載せている。
-将来ベクトル検索が要るなら `bottan_live.comments` に `embedding` 列を足す形になる。
+**素の SQL**（`live/memory.py`）は、その日の行動・Nagi と Bluesky の高得点ポスト・
+直近のショート・前回配信のコメントを決め打ちで引く。フリートークの固定枠はこちら。
+
+**Bot Memory API**（`live/bot_memory_client.py`）が本来の RAG。biorhythm_server の
+LAN 内 API `POST /memory/search` を叩き、埋め込みと `pg_trgm` のハイブリッド検索は
+**サーバ側**で走る。`affirmative_bot.bot_memory_documents` に実体があり、
+`source_type` は `bsky_affirmed_post` / `nagi_affirmed_post` / `bsky_received_reply` /
+`nagi_received_reply` / `bsky_received_like` / `nagi_received_reaction` /
+`biorhythm` / `youtube_live_comment` の8種。
+
+配信で届いたコメントは `memory.BotMemoryWriter` が
+`bot_memory_documents`（`source_type='youtube_live_comment'`）へ非同期で upsert する。
+本文が変わったら `embedding` を NULL に落として、サーバに埋め直させる。
+
+検索はクエリが長いほど遅い（実測: 100文字 1.9秒 / 300文字 3.2秒 / 1000文字 9.1秒）。
+サーバがクエリ全文を埋め込んだうえ、`similarity` と `ilike` をクエリ全文で全行に
+当てるため。`BOT_MEMORY_QUERY_MAX_CHARS`（既定500）で頭を打たせている。
+
+**メインループから叩かないこと。** 先読みは `_start_chores()` の雑務スレッドが行い、
+ホットパスはキャッシュを読むだけにする。
+
+### 同じ話題を二度出さない
+
+`FillerPlanner` は配信中に出した話題を `_used` に貯め、**一度出た話題は二度選ばない**。
+キーは `(種別, 空白を潰した本文の先頭60文字)`。本文の完全一致で見ていると、
+空白差だけで同じ話がすり抜ける。
+
+在庫は RAG を除くと最大38件（hobby 11 / ask 6 / mood・nagi・bsky・previous_live が
+各5まで / short 1）。`FILLER_IDLE_SEC` が25秒なので1時間の配信では**枯れうる**。
+枯れたら `_used` を畳んで2周目に入る（`[filler] 話題を一巡したので…`）。
+同じ話が二度出るのはよくないが、黙るよりはよい。
+
+畳む前に、抽選で拾えなかっただけなのか本当に尽きたのかを**種別を順に当たって
+確かめる**こと。`_KINDS` には重複があり、袋のどこから引き始めるかで一巡しても
+触らない種別が出るので、抽選の空振りだけで畳むと在庫を残したまま2周目に入る。
+
+**Nagi と Bluesky は同格に扱う。** botたんのホームは Nagi、Bluesky は毎日通う出張先で、
+ペルソナにも「Blueskyだけがあなたの居場所であるかのように話さないこと」と書いてある。
+`nagi` にだけ固定枠があると逆の偏りが出るので、`bsky`（`affirmative_bot.posts`）も
+同じ形で置いてある。
+
+### 話題を掘り下げる
+
+コメントに答えて終わりにせず、出たテーマに別の角度をもう一言足す。
+`reply_to_comment` と `speak_filler` の末尾で `_begin_thread()` がテーマを覚え、
+`FOLLOWUP_IDLE_SEC`（既定8秒）空いたら `speak_followup()` が続きを喋る。
+`FOLLOWUP_MAX_DEPTH`（既定2）まで掘ったら次の話題へ移る。
+
+フリートークの後もテーマを立てるので、
+`話題 → 掘り下げ → 掘り下げ → 次の話題` と自然に多段になる。
+
+- **テーマの登録でネットワークを触らないこと。** `_begin_thread` はフラグを立てるだけで、
+  RAG を引くのは雑務スレッドの `prefetch_followup()`。返事を喋っている15〜25秒の
+  あいだに引き終わるので、掘り下げる時点では候補が揃っている
+- **資料が無くても喋る。** RAG が引けるまで黙るのは本末転倒
+- 掘り下げも `interruptible=True`。コメントが来たら文の切れ目で切り上がる
+- クロージングの `FILLER_STOP_LEAD_SEC`（既定120秒）前からは、フリートークも
+  掘り下げも出さずコメントの消化に専念する。`run_loop` は `LIVE_CLOSING_HHMM` で
+  抜けてしまい、**それ以降に届いたコメントには一切反応できない**
+
+### コメントを捨てるとき
+
+`CommentQueue` は返事せずに捨てた件数を `dropped` に積み、捨てるたびにログを出す。
+数えていないと「コメント欄には出たのに返事が来ない」に気づけない。
+
+- **溢れ**（`maxlen`=200 超）: 優先度が低く、かつ古いものから捨てる。
+  並べ替えは `(priority, -received_at)` で、残すのは先頭 maxlen 件。
+  **受信時刻を昇順にしてはいけない** — 末尾＝「一般視聴者のいちばん新しいコメント」が
+  捨てられ、意図と正反対になる（実際そうなっていた）
+- **滞留**（`COMMENT_MAX_AGE_SEC`、既定180秒）: それ以上待たせた一般コメントは捨てる。
+  取り出しは同じ優先度なら古い順なので、放っておくと「5分前のコメントにいま返事する」
+  状態になり、視聴者から見た遅れが配信の後半ほど伸びていく。
+  **スパチャ・メンバー・オーナーは古くても捨てない**
+
+待ち行列の様子は30秒ごとに出る:
+
+```
+[live] キュー: 待ち12件 / 最古 84秒 / 受信 137件 / 破棄 4件
+```
+
+返事が遅れているのが滞留のせいなのか溢れて捨てているのかは、これでしか切り分けられない。
+
+### 読みの直しは DB の1本管理
+
+読み間違いは `affirmative_bot.bot_memory_pronunciations` に登録して直す。
+`common/pronunciation.py` が**VOICEVOX へ送るテキストそのものを置換**する
+（`audio_query()` が `/audio_query` に投げる直前）。字幕に出る日本語は元のまま。
+
+**VOICEVOX エンジンのユーザー辞書は使わない。** エンジン側の辞書
+（`~/voicevox_user_dict/user_dict.json`）とは独立していて、DB へ入れても
+そちらには反映されない。二重に管理すると、どちらが効いているのか分からなくなる。
+
+置換は区切り（半角/全角スペース・中黒・読点）をまたいで当たる。登録どおりの
+一字一句でしか当たらないと実際にはまず外れる。2026-08-23 の配信では
+`ファイアーエムブレム万紫千紅` と登録してあったのに「ファイアーエムブレム 万紫千紅」と
+喋って素読みした。区切りを許すのは**文字種が変わる位置と、登録側に区切りがあった位置だけ**
+（どこでも許すと `アニメ` が「アニ、メートル」に当たる）。長音 `ー` は読みの一部なので
+境界にしない。ASCII は大小を無視するが、`Halo`(ヘイロー) と `halo`(ハロー) のように
+大小で別語として登録されているものは、大小を保ったキーで先に引くので混ざらない。
+
+**複合語は最小単位でも登録すること。** 長い surface だけに頼ると、
+その一部だけを喋ったときに必ず外れる（`万紫千紅` 単体の行が無いと救えない）。
+
+登録・無効化は bsky-affirmative-bot 側の CLI から行う（SQL を直接叩かない）:
+
+```bash
+pnpm tts-pronunciation -- set <surface> <spoken-form> [work|proper_noun]
+pnpm tts-pronunciation -- disable <surface>
+pnpm tts-pronunciation -- list
+```
+
+表の原典は `bsky-affirmative-bot/packages/database/src/botMemoryPronunciation.ts`。
+自動学習（`origin='auto'`）は `manual` と `disabled` の行を書き換えないので、
+手で入れた読みが後から流されることはない。surface は NFKC で正規化されて入る。
 
 ### energy
 

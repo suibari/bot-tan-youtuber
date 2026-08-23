@@ -16,7 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from config import COMMENT_USER_COOLDOWN_SEC, DRY_RUN, FAKE_COMMENTS
+from config import (COMMENT_MAX_AGE_SEC, COMMENT_USER_COOLDOWN_SEC,
+                    DRY_RUN, FAKE_COMMENTS)
 import safety
 import subtitle
 from youtube_auth import get_client
@@ -50,24 +51,70 @@ class CommentQueue:
     コメントが永久に読まれなくなる。
     """
 
-    def __init__(self, cooldown_sec: float = None, maxlen: int = 200):
+    def __init__(self, cooldown_sec: float = None, maxlen: int = 200,
+                 max_age_sec: float = None):
         self._items: list = []
         self._lock = threading.Lock()
         self._last_replied = {}
         self._cooldown = COMMENT_USER_COOLDOWN_SEC if cooldown_sec is None else cooldown_sec
         self._maxlen = maxlen
+        self._max_age = COMMENT_MAX_AGE_SEC if max_age_sec is None else max_age_sec
         self.seen_authors = set()
         self.total_received = 0
+        # 返事せずに捨てた件数。溢れも古すぎたぶんもここに積む。
+        # 数えていないと「コメント欄には出たのに返事が来ない」に気づけない
+        self.dropped = 0
 
     def push(self, comment: Comment) -> bool:
         with self._lock:
             self._items.append(comment)
             self.total_received += 1
-            # 溢れたら古い低優先度のものから捨てる。配信は待ってくれない
+            # 溢れたら「優先度が低く、かつ古いもの」から捨てる。配信は待ってくれない。
+            #
+            # 残すのはソート後の先頭 maxlen 件なので、**受信時刻は降順**にすること。
+            # 昇順にすると末尾＝「一般視聴者のいちばん新しいコメント」が捨てられ、
+            # 意図と正反対になる（実際そうなっていた）。取り出しは古い順なので、
+            # ここで新しいものを残すのと矛盾しない
             if len(self._items) > self._maxlen:
-                self._items.sort(key=lambda c: (c.priority, c.received_at))
+                self._items.sort(key=lambda c: (c.priority, -c.received_at))
+                lost = len(self._items) - self._maxlen
                 self._items = self._items[:self._maxlen]
+                self.dropped += lost
+                print(f"[chat] 返事待ちが{self._maxlen}件を超えたので"
+                      f"{lost}件捨てました（累計{self.dropped}件）")
             return True
+
+    def _evict_stale(self, now: float) -> None:
+        """古すぎるコメントを捨てる。呼ぶ側でロックすること。
+
+        取り出しは同じ優先度なら古い順なので、滞留したまま放っておくと
+        「5分前のコメントにいま返事する」状態になる。視聴者から見た遅れは
+        待ち行列の長さそのものなので、頭を打たせる。
+
+        **スパチャ・メンバー・オーナーは古くても捨てない。**
+        """
+        if self._max_age <= 0:
+            return
+        fresh = [c for c in self._items
+                 if c.priority < 2 or now - c.received_at <= self._max_age]
+        lost = len(self._items) - len(fresh)
+        if lost:
+            self._items = fresh
+            self.dropped += lost
+            print(f"[chat] {self._max_age:.0f}秒以上待たせたコメントを{lost}件"
+                  f"捨てました（累計{self.dropped}件）")
+
+    def stats(self) -> dict:
+        """待ち行列の様子。配信中の観測用（_housekeeping から呼ぶ）。"""
+        now = time.monotonic()
+        with self._lock:
+            return {
+                "waiting": len(self._items),
+                "oldest": max((now - c.received_at for c in self._items),
+                              default=0.0),
+                "received": self.total_received,
+                "dropped": self.dropped,
+            }
 
     def _next_index(self, now: float):
         """返事してよいコメントの位置。無ければ None。呼ぶ側でロックすること。
@@ -77,6 +124,7 @@ class CommentQueue:
         待っているのがその人だけなのに60秒黙ってフリートークへ流れると、
         1対1で話しかけられている状況で会話が続かない。
         """
+        self._evict_stale(now)
         self._items.sort(key=lambda c: (c.priority, c.received_at))
         held = None
         for i, c in enumerate(self._items):

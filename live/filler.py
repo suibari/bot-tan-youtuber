@@ -1,10 +1,14 @@
-"""コメントが途切れているときのフリートーク。
+"""コメントが途切れているときのフリートークと、その話題の掘り下げ。
 
 番組進行は固定しない。コメントが最優先で、空いた時間をここで埋める。
-同じ話を繰り返すのが一番つまらないので、ネタは必ずローテーションさせる。
+同じ話を繰り返すのが一番つまらないので、**配信中に一度出した話題は二度出さない**。
+ネタが一巡したら使用済みを畳んで2周目に入る（無言になるよりはよい）。
 
 生成は先読みする。コメントが途切れてから作り始めると、LLMと音声合成の
 待ち時間ぶんだけ無音が伸びる。
+
+botたんのホームは Nagi、Bluesky は毎日通う出張先。**どちらにも固定枠を置く**。
+片方しか無いと、そちらだけが居場所であるかのように喋ってしまう。
 """
 
 import random
@@ -21,12 +25,19 @@ class TopicRotator:
     def __init__(self, kinds: list):
         self.kinds = list(kinds)
         self._bag = []
+        self._last = None
 
     def next(self) -> str:
         if not self._bag:
             self._bag = list(self.kinds)
             random.shuffle(self._bag)
-        return self._bag.pop()
+            # 袋の切れ目で同じものが続かないようにする。pop() は末尾から
+            # 取るので、末尾が直前と同じなら別の位置と入れ替える
+            if len(self._bag) > 1 and self._bag[-1] == self._last:
+                swap = random.randrange(len(self._bag) - 1)
+                self._bag[-1], self._bag[swap] = self._bag[swap], self._bag[-1]
+        self._last = self._bag.pop()
+        return self._last
 
 
 # ペルソナ由来のひとりごとネタ。DB を引かずに always 使える
@@ -44,11 +55,31 @@ _HOBBY_TOPICS = [
     "いま書いてみたい本の話。誰かを励ます本を書きたいという夢について。",
 ]
 
-_KINDS = ["rag", "rag", "mood", "nagi", "short", "previous_live", "hobby", "hobby", "ask"]
+# コメントを促す問いかけ。1種類だけだと配信中に何度も同じことを聞くことになる
+_ASK_TOPICS = [
+    "視聴者に話しかけて、コメントしやすい問いかけをして。答えやすくて、重くない話題にすること。",
+    "今日あったちょっといいことを聞いてみて。小さなことでいいと伝えること。",
+    "いま何を飲んでいるか、何を食べたかを聞いてみて。",
+    "最近ハマっているものを聞いてみて。作品でも食べ物でもいいと伝えること。",
+    "今日はどんな天気だったか聞いてみて。空の話につなげてもいい。",
+    "明日やろうと思っていることを聞いてみて。小さな予定でいいと伝えること。",
+]
+
+_KINDS = ["rag", "rag", "mood", "nagi", "bsky", "short",
+          "previous_live", "hobby", "hobby", "ask"]
+
+
+def _topic_key(kind: str, text: str) -> tuple:
+    """配信内の重複判定に使うキー。
+
+    空白を潰してから頭を取る。本文の完全一致で見ていると、空白差だけで
+    同じ話がすり抜ける。
+    """
+    return (kind, "".join(str(text or "").split())[:60])
 
 
 class FillerPlanner:
-    """次に話すフリートークのネタを用意する。
+    """次に話すフリートークのネタと、いま話しているテーマの掘り下げを用意する。
 
     DB アクセスは配信ループを止めないよう別スレッドで行い、結果をキャッシュする。
     """
@@ -56,14 +87,42 @@ class FillerPlanner:
     def __init__(self, memory_client=None):
         self.rotator = TopicRotator(_KINDS)
         self.hobby = TopicRotator(_HOBBY_TOPICS)
+        self.ask = TopicRotator(_ASK_TOPICS)
         self._cache = {}
         self._lock = threading.Lock()
-        self._used_nagi = set()
-        self._used_prev = set()
-        self._used_rag = set()
+        # 配信中に使った話題。_lock とは別にしておく（_build は _lock を
+        # 握った状態から呼ばれることがあり、同じ錠を二度取ると固まる）
+        self._used_lock = threading.Lock()
+        self._used = set()
         self._rag_candidates = []
         self._rag_refreshing = False
         self._rag_client = memory_client or BotMemoryClient()
+        # 掘り下げ用。フリートークの候補とは別に持つ（クエリの作り方が違う）
+        self._followup_theme = ""
+        self._followup_candidates = []
+        self._followup_pending = False
+        self._followup_refreshing = False
+
+    # ── 使用済みの管理 ────────────────────────────────
+
+    def _is_used(self, key) -> bool:
+        with self._used_lock:
+            return key in self._used
+
+    def _mark_used(self, key) -> None:
+        with self._used_lock:
+            self._used.add(key)
+
+    def _used_rag_ids(self) -> list:
+        with self._used_lock:
+            return [key[1] for key in self._used
+                    if key[0] == "rag" and isinstance(key[1], int)]
+
+    def reset_used(self) -> None:
+        with self._used_lock:
+            self._used.clear()
+
+    # ── 記憶 ──────────────────────────────────────────
 
     def refresh_memory(self) -> dict:
         """DBから記憶を引き直す。数分に1回でよい。"""
@@ -71,6 +130,7 @@ class FillerPlanner:
         for key, fn in (
             ("activities",    lambda: memory.get_today_activities(5)),
             ("nagi_posts",    lambda: memory.get_nagi_posts(5)),
+            ("bsky_posts",    lambda: memory.get_bsky_posts(5)),
             ("latest_short",  memory.get_latest_short),
             ("previous_live", lambda: memory.get_previous_live_highlights(5)),
         ):
@@ -88,16 +148,43 @@ class FillerPlanner:
         with self._lock:
             return dict(self._cache)
 
+    # ── フリートークのお題 ────────────────────────────
+
     def next_topic(self) -> dict:
-        """次のお題と、そのお題が実際に参照する記憶IDを返す。"""
-        mem = self.cache
-        for _ in range(len(_KINDS)):
-            kind = self.rotator.next()
-            hint = self._build(kind, mem)
-            if hint:
-                return hint
+        """次のお題と、そのお題が実際に参照する記憶IDを返す。
+
+        一巡して何も残らなければ使用済みを畳んで2周目に入る。同じ話が二度出るのは
+        よくないが、黙るよりはよい。
+        """
+        topic = self._pick_topic()
+        if topic is not None:
+            return topic
+
+        print("[filler] 話題を一巡したので使用済みをリセットします")
+        self.reset_used()
+        topic = self._pick_topic()
+        if topic is not None:
+            return topic
+
         # DBが全滅していてもひとりごとは話せる
         return {"hint": self.hobby.next(), "memory_ids": []}
+
+    def _pick_topic(self):
+        mem = self.cache
+        for _ in range(len(_KINDS)):
+            topic = self._build(self.rotator.next(), mem)
+            if topic:
+                return topic
+        # 抽選で拾えなかっただけで、まだ残っているネタがあるかもしれない。
+        # _KINDS には重複があるうえ、袋のどこから引き始めるかで一巡しても
+        # 触らない種別が出る。使用済みを畳む前に、種別を順に当たって確かめる
+        for kind in dict.fromkeys(_KINDS):
+            topic = self._build(kind, mem)
+            if topic:
+                return topic
+        return None
+
+    # ── RAG の先読み ──────────────────────────────────
 
     def prefetch_rag(self, bot: dict, recent_comments=None,
                      recent_replies=None) -> bool:
@@ -127,7 +214,7 @@ class FillerPlanner:
             try:
                 candidates = self._rag_client.search(
                     query,
-                    exclude_document_ids=list(self._used_rag),
+                    exclude_document_ids=self._used_rag_ids(),
                     limit=10,
                 )
                 with self._lock:
@@ -143,6 +230,77 @@ class FillerPlanner:
         threading.Thread(target=run, daemon=True, name="bot-memory-prefetch").start()
         return True
 
+    # ── 掘り下げ ──────────────────────────────────────
+
+    def set_followup_theme(self, theme: str) -> None:
+        """いま話しているテーマを覚える。**ここではネットワークを触らない。**
+
+        呼ぶのは配信のメインループなので、ここで RAG を引くとそのぶん
+        次のコメントへの反応が遅れる。実際に引くのは雑務スレッドの
+        prefetch_followup()。
+        """
+        theme = (theme or "").strip()
+        with self._lock:
+            self._followup_theme = theme
+            self._followup_pending = bool(theme)
+            # 前のテーマの候補は使わない。別の話の掘り下げになってしまう
+            self._followup_candidates = []
+
+    def prefetch_followup(self) -> bool:
+        """テーマが変わっていたら候補を引き直す。雑務スレッドから毎秒呼んでよい。"""
+        with self._lock:
+            if self._followup_refreshing or not self._followup_pending:
+                return False
+            if not self._rag_client.enabled:
+                self._followup_pending = False
+                return False
+            theme = self._followup_theme[:BOT_MEMORY_QUERY_MAX_CHARS]
+            self._followup_pending = False
+            self._followup_refreshing = True
+
+        def run():
+            try:
+                candidates = self._rag_client.search(
+                    theme, exclude_document_ids=self._used_rag_ids(), limit=5)
+                with self._lock:
+                    # 引いている間にテーマが変わっていたら捨てる
+                    if self._followup_theme[:BOT_MEMORY_QUERY_MAX_CHARS] == theme:
+                        self._followup_candidates = candidates
+            except Exception as error:
+                print(f"[filler] 掘り下げの先読みでエラー（無視します）: {error}")
+            finally:
+                with self._lock:
+                    self._followup_refreshing = False
+
+        threading.Thread(target=run, daemon=True, name="bot-memory-followup").start()
+        return True
+
+    def next_followup(self):
+        """掘り下げに使う資料を1件。無ければ None。
+
+        None でも掘り下げ自体はできる（資料なしで別の角度を出させる）ので、
+        呼び出し側はここが空でも黙らないこと。
+        """
+        with self._lock:
+            candidates = list(self._followup_candidates)
+        for candidate in candidates:
+            document_id = candidate.get("id")
+            key = ("rag", document_id)
+            if self._is_used(key):
+                continue
+            content = (candidate.get("content") or "").replace("\n", " ").strip()
+            if not content:
+                continue
+            self._mark_used(key)
+            return {
+                "hint": {
+                    "rag_source": candidate.get("source") or "memory",
+                    "rag_content": content[:300],
+                },
+                "memory_ids": [document_id],
+            }
+        return None
+
     def record_usage(self, document_ids: list, output_ref: str = "") -> bool:
         threading.Thread(
             target=self._rag_client.record_usage,
@@ -152,73 +310,120 @@ class FillerPlanner:
         ).start()
         return True
 
+    # ── お題の組み立て ────────────────────────────────
+
     def _build(self, kind: str, mem: dict):
+        """そのお題をいま出せるなら dict を、出せないなら None を返す。
+
+        戻り値の "key" が配信内の重複判定に使われる。**返すときにその場で
+        使用済みの印を付ける**（_pick_topic は最初に返ってきたものをそのまま
+        使うので、ここで付けても取りこぼさない）。
+        """
         if kind == "rag":
             with self._lock:
                 candidates = list(self._rag_candidates)
             for candidate in candidates:
                 document_id = candidate.get("id")
-                if document_id in self._used_rag:
+                key = ("rag", document_id)
+                if self._is_used(key):
                     continue
-                self._used_rag.add(document_id)
-                source = candidate.get("source") or "memory"
-                content = candidate.get("content", "").replace("\n", " ").strip()
+                content = (candidate.get("content") or "").replace("\n", " ").strip()
                 if not content:
                     continue
+                self._mark_used(key)
                 return {
                     "hint": {
-                        "rag_source": source,
+                        "rag_source": candidate.get("source") or "memory",
                         "rag_content": content[:300],
                     },
                     "memory_ids": [document_id],
+                    "key": key,
                 }
             return None
 
         if kind == "hobby":
-            return {"hint": self.hobby.next(), "memory_ids": []}
+            return self._from_rotator("hobby", self.hobby, len(_HOBBY_TOPICS))
 
         if kind == "ask":
-            return {"hint": ("視聴者に話しかけて、コメントしやすい問いかけをして。"
-                             "答えやすくて、重くない話題にすること。"),
-                    "memory_ids": []}
+            return self._from_rotator("ask", self.ask, len(_ASK_TOPICS))
 
         if kind == "mood":
-            acts = mem.get("activities") or []
-            if not acts:
-                return ""
-            act = acts[0]
-            return {"hint": (f"さっきまで「{act.get('mood', '')}」をしていた話をして。"
-                             f"その様子を視聴者に伝えるように話すこと。"),
-                    "memory_ids": []}
+            # 以前は activities[0] 固定だったので、同じ行動の話が何度も出ていた
+            for act in (mem.get("activities") or []):
+                mood = (act.get("mood") or "").strip()
+                if not mood:
+                    continue
+                key = _topic_key("mood", mood)
+                if self._is_used(key):
+                    continue
+                self._mark_used(key)
+                return {"hint": (f"さっきまで「{mood}」をしていた話をして。"
+                                 f"その様子を視聴者に伝えるように話すこと。"),
+                        "memory_ids": [], "key": key}
+            return None
 
         if kind == "nagi":
-            for post in (mem.get("nagi_posts") or []):
-                text = (post.get("post_text") or "").replace("\n", " ").strip()
-                if not text or text in self._used_nagi:
-                    continue
-                self._used_nagi.add(text)
-                return {"hint": (f"SNSのNagiで見かけた投稿に反応して。投稿の内容：「{text[:100]}」\n"
-                                 f"投稿した人の名前は出さないこと。内容にだけ触れて全肯定して。"),
-                        "memory_ids": []}
-            return ""
+            return self._from_posts(
+                "nagi", mem.get("nagi_posts"),
+                "SNSのNagiで見かけた投稿に反応して。投稿の内容：「{text}」\n"
+                "投稿した人の名前は出さないこと。内容にだけ触れて全肯定して。")
+
+        if kind == "bsky":
+            return self._from_posts(
+                "bsky", mem.get("bsky_posts"),
+                "Blueskyで見かけた投稿に反応して。投稿の内容：「{text}」\n"
+                "投稿した人の名前は出さないこと。内容にだけ触れて全肯定して。")
 
         if kind == "short":
             short = mem.get("latest_short") or {}
-            if not short.get("title"):
-                return ""
-            return {"hint": (f"昨日出したショート動画「{short['title']}」の話をして。"
+            title = (short.get("title") or "").strip()
+            if not title:
+                return None
+            key = _topic_key("short", title)
+            if self._is_used(key):
+                return None
+            self._mark_used(key)
+            return {"hint": (f"昨日出したショート動画「{title}」の話をして。"
                              f"見てくれた人にお礼を言うこと。"),
-                    "memory_ids": []}
+                    "memory_ids": [], "key": key}
 
         if kind == "previous_live":
             for prev in (mem.get("previous_live") or []):
                 comment = (prev.get("comment") or "").strip()
-                if not comment or comment in self._used_prev:
+                if not comment:
                     continue
-                self._used_prev.add(comment)
+                key = _topic_key("prev", comment)
+                if self._is_used(key):
+                    continue
+                self._mark_used(key)
                 return {"hint": (f"前の配信で「{comment[:60]}」っていう話が出たのを"
                                  f"思い出した、という話をして。名前は出さないこと。"),
-                        "memory_ids": []}
-            return ""
+                        "memory_ids": [], "key": key}
+            return None
 
-        return ""
+        return None
+
+    def _from_rotator(self, kind: str, rotator: TopicRotator, size: int):
+        """固定文のお題。一巡ぶん引いてみて、未使用のものがあれば返す。"""
+        for _ in range(size):
+            hint = rotator.next()
+            key = _topic_key(kind, hint)
+            if self._is_used(key):
+                continue
+            self._mark_used(key)
+            return {"hint": hint, "memory_ids": [], "key": key}
+        return None
+
+    def _from_posts(self, kind: str, posts, template: str):
+        """SNS で見かけた投稿のお題。Nagi と Bluesky で同じ形。"""
+        for post in (posts or []):
+            text = (post.get("post_text") or "").replace("\n", " ").strip()
+            if not text:
+                continue
+            key = _topic_key(kind, text)
+            if self._is_used(key):
+                continue
+            self._mark_used(key)
+            return {"hint": template.format(text=text[:100]),
+                    "memory_ids": [], "key": key}
+        return None
