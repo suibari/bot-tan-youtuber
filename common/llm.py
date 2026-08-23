@@ -79,7 +79,7 @@ def parse_json(raw: str) -> dict:
 
 def generate_json(system_prompt: str, user_prompt: str, schema: dict,
                   schema_name: str = "script", temperature: float = None,
-                  debug: bool = True) -> dict:
+                  debug: bool = True, history: list = None) -> dict:
     """system + user + スキーマ を渡して JSON を得る汎用呼び出し。
 
     Gemini は response_format(json_schema)、Ollama(Gemma) は構造化出力非対応なので
@@ -87,6 +87,12 @@ def generate_json(system_prompt: str, user_prompt: str, schema: dict,
 
     temperature を None にすると **kwarg ごと送らない**。統合前の Shorts 側は
     temperature を指定していなかったので、既定の None で当時と同じリクエストになる。
+
+    history は [{"user": ..., "assistant": ...}, ...] を古い順に。配信で会話を
+    つなげるために使う。**既定の None なら messages は従来どおり [system, user] の
+    2要素**なので、Shorts 側の呼び出しは何も変わらない。
+    Gemini は OpenAI 互換エンドポイント越しなので chat セッションという概念は無く、
+    毎回 messages を組み立て直すのが唯一の渡し方になる。
     """
     extra: dict = {}
     if USE_LOCAL_LLM:
@@ -104,13 +110,20 @@ def generate_json(system_prompt: str, user_prompt: str, schema: dict,
     if temperature is not None:
         extra["temperature"] = temperature
 
-    response = create(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-        **extra,
-    )
+    messages = [{"role": "system", "content": system_prompt}]
+    # 壊れたターンで配信を止めない。片方でも欠けていれば黙って飛ばす
+    for turn in (history or []):
+        if not isinstance(turn, dict):
+            continue
+        said = (turn.get("user") or "").strip()
+        answered = (turn.get("assistant") or "").strip()
+        if not said or not answered:
+            continue
+        messages.append({"role": "user",      "content": said})
+        messages.append({"role": "assistant", "content": answered})
+    messages.append({"role": "user", "content": user_prompt})
+
+    response = create(messages=messages, **extra)
     if debug:
         print(f"[DEBUG] finish_reason: {response.choices[0].finish_reason}")
     return parse_json(response.choices[0].message.content.strip())

@@ -329,6 +329,11 @@ sudo bash setup/install_units.sh
 # 一気通貫（YouTube・OBS・ARDY 抜き、偽コメントを流し込む）
 ./run_live.sh DRY_RUN=true SKIP_ARDY=true FAKE_COMMENTS=data/fake_comments.json
 
+# 会話が続くか（同じ人が話しかけ続ける偽コメント）。前のやりとりを受けた返事に
+# なっているか、同じ人の2件目が60秒待たずに返っているかをログで見る
+./run_live.sh DRY_RUN=true SKIP_ARDY=true \
+              FAKE_COMMENTS=data/fake_comments_conversation.json
+
 # 同上を「いま」から数分で一周させる。LIVE_START_HHMM の既定は 21:00 で、
 # 未来だとその時刻まで sleep するので、3つとも近い時刻に上書きすること
 S=$(date -d '+5 min' +%H:%M); C=$(date -d '+11 min' +%H:%M); E=$(date -d '+13 min' +%H:%M)
@@ -373,7 +378,7 @@ curl localhost:2338/status
 | コメント欄への反映 | 最大10秒 | `ChatPoller._accept` が受信と同時に `comments.txt` を書く。以前は10秒ごとの雑務に任せていた |
 | 直前の発話が終わるのを待つ | 5〜15秒 | **ここがいちばん効いている。** フリートークは `interruptible=True` で、文と文の切れ目でコメントの有無を見て切り上げる。コメントへの返信は途中で切らない方針なので、ここは残る |
 | DB（気分・energy） | 0〜数秒 | `_bot_context()` は `BOT_CONTEXT_TTL_SEC`（既定20秒）キャッシュし、DB は1往復だけ。以前は同じ行を2回引いて接続を2本張っていた |
-| LLM | 約2秒 | 実測（gemini-2.5-flash、2〜3文の構造化出力）。`LLM_TIMEOUT_SEC`（既定20秒）で頭を打たせる |
+| LLM | 約2秒 | 実測（gemini-2.5-flash、2〜3文の構造化出力）。`LLM_TIMEOUT_SEC`（既定20秒）で頭を打たせる。会話履歴（`LIVE_HISTORY_TURNS` ぶん）は入力トークンだけを増やす。1ターン100〜150字で、system prompt の約8500字に対して6ターンでも1割ほど |
 | VOICEVOX + 送信 | 0.1〜0.7秒 | 全文まとめてではなく**1文ずつ**合成して Unity のキューへ流し込む。喋り出しまで実測 0.12秒 |
 | ARDY のモーション生成 | 4.6〜12.8秒 | **待たない。** プールから即座に1本引いて再生し、生成は別スレッドで走らせて次回以降に回す（`live/motion.py`） |
 
@@ -411,6 +416,59 @@ OBS の `text_ft2_source_v2` を `from_file` で使うと、**約1秒に1回し�
 
 文と文の間の 0.25秒 の無音は `voice.synthesize_lines(tail_gap=...)` が作る。
 1文ずつ別々に送るので、こちらで作らないと詰まって聞こえる。
+
+**コメント欄は配信の始めに空にすること**（`subtitle.clear_comments()`、`prepare()` で呼ぶ）。
+`comments.txt` はファイルに残り続けるので、消さないと配信開始から最初のコメントが
+来るまで前回配信のコメントが並んだままになる。`clear()` は字幕（ja/en）だけを消す
+（発話のたびに呼ばれるので、ここでコメント欄まで消してはいけない）。
+
+### 会話をつなぐ
+
+**コメント1件＝独立したLLM呼び出し、ではない。** 配信中のやりとりは
+`live/conversation.py` の `ConversationLog` に1本の時系列として積み、
+`common/llm.py:generate_json(history=...)` が `messages` のマルチターン
+（`user` / `assistant` の交互）に展開して渡す。Gemini は OpenAI 互換
+エンドポイント越しなので chat セッションは無く、毎回 messages を組み立て直す形になる。
+
+- **フリートークとオープニング・クロージングも同じ時系列に積む。**
+  積まないと「さっき自分が何を話していたか」が飛ぶ
+- `assistant` に入れるのは読み上げた日本語だけ。返答のJSON全体を積むと
+  `en` / `motion_en` / valence / arousal のぶんトークンが数倍になる。出力形式は
+  毎回 `response_format` で強制されるので、履歴が平文でも崩れない
+- `user` に入れるのも「送り主：/ 内容：」の短い形。プロンプト本文まるごとを積むと、
+  botの状態ブロックと記憶ブロックがターン数ぶん重複する
+- 場の流れから押し出されたぶんも含めて、**いま返す相手とのやりとり**だけは
+  本文に「## この人とさっきまで話していたこと」として添える。
+  流れに残っているターンは二重にならないよう取り除く（`live.py:reply_to_comment`）
+- 履歴は**当日の配信内だけ**のメモリ。DB へは書かない（`memory.save_comment()` が
+  既に `bottan_live.comments` へ書いている）
+
+統合前は botたん自身の発話を8件持つだけで、**視聴者が何を言ったかはどこにも
+残っていなかった**。しかもそれを「## 直前に自分が話したこと（同じ言い回しを
+繰り返さないこと）」という*逆向き*の制約で渡していたので、話を続けるどころか
+話題を逸らす方向に効いていた。「一つ前の会話を忘れている」の正体がこれ。
+いまはコメント返信からこのブロックを外し、フリートーク（同じネタの繰り返し防止が
+主目的）にだけ残している。
+
+### 同一ユーザーのクールダウンは条件付き
+
+`COMMENT_USER_COOLDOWN_SEC`（既定60秒）は「1人が喋り続けて他の視聴者のコメントが
+読まれなくなる」のを防ぐためのもので、**他に返事できるコメントが無いときは無視する**
+（`chat.CommentQueue._next_index`）。待っているのがその人だけなのに60秒黙って
+フリートークへ流れると、1対1で話しかけられている状況で会話が続かない。
+
+`has_pending()` も同じ判定を通るので、フリートークはその人のコメントで切り上がる。
+
+### ペルソナは原典のコピーで、放っておくとドリフトする
+
+`live/persona.py` の `_CHARACTER_TEMPLATE` は
+`bsky-affirmative-bot/packages/shared-configs/src/config/index.ts` の
+`SYSTEM_INSTRUCTION` のコピー（語彙リストだけ実行時に読む）。原典は活発に更新されるので、
+**触るときは必ず原典と差分を取ること。** docstring に同期時点のコミットを書いてある。
+
+実際、統合時のコピーには「# 住んでいる場所（Nagi と Bluesky）」が無く、
+Nagi が SNS の名前だと書いていないのに、プロンプト側は「Nagiで見かけた投稿」を
+渡していた。結果、配信で「Nagiさん」と人名のように呼んでいた。
 
 ### モーションを途切れさせない
 

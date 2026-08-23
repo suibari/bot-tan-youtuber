@@ -187,8 +187,16 @@ BOT_CONTEXT_TTL_SEC = env_float("BOT_CONTEXT_TTL_SEC", 20.0)
 # ── 配信の振る舞い ────────────────────────────────
 # コメントがこの秒数途切れたらフリートークを挟む
 FILLER_IDLE_SEC = env_float("FILLER_IDLE_SEC", 90.0)
-# 同一ユーザーの連投をこの秒数だけ間引く
+# 同一ユーザーの連投をこの秒数だけ間引く。
+# **他に返事できるコメントが無いときは無視される**（chat.CommentQueue._next_index）。
+# 1人しか居ないのに黙ってフリートークへ流れると、会話が続かないため
 COMMENT_USER_COOLDOWN_SEC = env_float("COMMENT_USER_COOLDOWN_SEC", 60.0)
+# LLM へ会話履歴として渡す「場の流れ」のターン数（コメント返答もフリートークも1ターン）。
+# 増やすほど話はつながるが、そのぶん入力トークンが増えて返事が遅くなる。
+# 1ターンは日本語で 100〜150字ほど。system prompt が約7000字あるので、6ターンで1割弱
+LIVE_HISTORY_TURNS = env_int("LIVE_HISTORY_TURNS", 6)
+# 上の流れから押し出されても、いま返す相手とのやりとりだけは覚えておく件数
+LIVE_HISTORY_USER_TURNS = env_int("LIVE_HISTORY_USER_TURNS", 3)
 # 視聴者コメントの文字数上限。これを超える分は切り捨てる
 COMMENT_MAX_CHARS = env_int("COMMENT_MAX_CHARS", 200)
 

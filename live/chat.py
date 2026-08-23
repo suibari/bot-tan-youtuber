@@ -70,16 +70,25 @@ class CommentQueue:
             return True
 
     def _next_index(self, now: float):
-        """返事してよいコメントの位置。無ければ None。呼ぶ側でロックすること。"""
+        """返事してよいコメントの位置。無ければ None。呼ぶ側でロックすること。
+
+        クールダウンは「1人が喋り続けると他の視聴者のコメントが読まれなくなる」のを
+        防ぐためのもの。**他に返事できる人が居ないなら、その心配は無いので無視する。**
+        待っているのがその人だけなのに60秒黙ってフリートークへ流れると、
+        1対1で話しかけられている状況で会話が続かない。
+        """
         self._items.sort(key=lambda c: (c.priority, c.received_at))
+        held = None
         for i, c in enumerate(self._items):
             last = self._last_replied.get(c.channel_id)
             # スパチャはクールダウンを無視する（対価を払っている）
             if last is not None and not c.is_super_chat \
                     and now - last < self._cooldown:
+                if held is None:
+                    held = i
                 continue
             return i
-        return None
+        return held
 
     def pop(self) -> Comment:
         """次に返事すべきコメントを1件取り出す。無ければ None。"""

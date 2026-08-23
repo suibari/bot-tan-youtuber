@@ -18,6 +18,7 @@ import traceback
 from datetime import datetime, timedelta
 
 import chat
+import conversation
 import energy
 import filler
 import idle
@@ -36,7 +37,8 @@ import voice
 from config import (
     DRY_RUN, ENERGY_REFRESH_SEC, FILLER_IDLE_SEC, IDLE_ENABLED, LIVE_CLOSING_HHMM,
     LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
-    BOT_CONTEXT_TTL_SEC, FPS_LOG_SEC, SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT,
+    BOT_CONTEXT_TTL_SEC, FPS_LOG_SEC, LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
+    SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT,
     WORK_DIR, ensure_dirs,
 )
 
@@ -77,7 +79,10 @@ class LiveSession:
         self.memory_writer = memory.BotMemoryWriter()
 
         self.system_prompt = persona.build_system_prompt()
-        self.recent_replies = []
+        # 配信中の会話。以前は自分の発話テキストを8件持つだけで、視聴者が何を
+        # 言ったかはどこにも残っていなかった（conversation.py の説明を参照）
+        self.conversation = conversation.ConversationLog(
+            max_turns=LIVE_HISTORY_TURNS, per_user_turns=LIVE_HISTORY_USER_TURNS)
         self.replied_count = 0
         self.last_speech_at = 0.0
         self.started_at = None
@@ -97,6 +102,9 @@ class LiveSession:
     def prepare(self) -> None:
         ensure_dirs()
         subtitle.clear()
+        # 前回配信のコメントがファイルに残っている。消さないと初コメが来るまで
+        # 画面に前回のコメントが並んだままになる
+        subtitle.clear_comments()
         subtitle.write_clock()
 
         print("[準備] DB を確認します")
@@ -276,10 +284,10 @@ class LiveSession:
         bot["now"] = datetime.now().strftime("%H:%M")
         return bot
 
-    def _generate(self, user_prompt: str) -> dict:
+    def _generate(self, user_prompt: str, history: list = None) -> dict:
         """LLM に投げる。落ちたら定型で返す（無言にしない）。"""
         try:
-            return llm.generate_reply(self.system_prompt, user_prompt)
+            return llm.generate_reply(self.system_prompt, user_prompt, history)
         except Exception as e:
             print(f"[live] LLM が応答しません、定型で返します: {e}")
             import random
@@ -290,7 +298,7 @@ class LiveSession:
                 "_fallback": True,
             }
 
-    def _speak(self, reply: dict, tag: str = "", interruptible: bool = False) -> bool:
+    def _speak(self, reply: dict, tag: str = "", interruptible: bool = False) -> str:
         """1回ぶんの発話。音声・モーション・字幕をまとめて行い、喋り終わるまで待つ。
 
         文は1つずつ合成して Unity のキューへ流し込む。全文の合成を待ってから
@@ -300,12 +308,13 @@ class LiveSession:
         フリートークを最後まで喋りきってからでないとコメントに反応できない、
         という往復の遅さが初回の配信でいちばん効いていた。
 
-        どこかが落ちても配信は続ける。返り値は実際に喋れたかどうか。
+        どこかが落ちても配信は続ける。**返り値は実際に喋った日本語**（喋れなければ空文字）。
+        途中で切り上げたぶんは含まないので、そのまま会話履歴に積んでよい。
         """
         lines = safety.sanitize_reply_lines(reply.get("lines"))
         if not lines:
             print("[live] 読み上げる文が残らなかったのでスキップします")
-            return False
+            return ""
 
         valence = reply.get("valence", 0.0)
         arousal = reply.get("arousal", 0.0)
@@ -373,17 +382,15 @@ class LiveSession:
         if spoken == 0:
             self.subs.stop()
             self.idle.speak_end()
-            return False
+            return ""
 
         self._wait_speech_end()
         self.idle.speak_end()
         self.last_speech_at = time.monotonic()
 
         text = " ".join(l["ja"] for l in lines[:spoken])
-        self.recent_replies.append(text)
-        self.recent_replies = self.recent_replies[-8:]
         print(f"[live] 発話{f'({tag})' if tag else ''}: {text[:60]}")
-        return True
+        return text
 
     def _wait_line(self, duration: float, interruptible: bool,
                    lead: float = 0.7) -> bool:
@@ -432,15 +439,27 @@ class LiveSession:
         bot = self._bot_context()
         t_ctx = time.monotonic()
 
+        # 場の流れは messages のマルチターンで、この人とのやりとりは本文で渡す。
+        # 流れに残っているターンを本文にも書くと二重になるので、id() で取り除く
+        # （同じ dict を ConversationLog が両方から参照している）
+        turns = self.conversation.recent_turns()
+        history = persona.build_history(turns)
+        in_history = {id(turn) for turn in turns}
+        user_history = [turn for turn in self.conversation.user_turns(comment.channel_id)
+                        if id(turn) not in in_history]
+
         prompt = persona.build_comment_prompt(
             comment.author, comment.text, bot, self.planner.cache,
             is_first_time=first, is_super_chat=comment.is_super_chat,
-            recent_replies=self.recent_replies,
+            user_history=user_history,
         )
-        reply = self._generate(prompt)
+        reply = self._generate(prompt, history)
         t_llm = time.monotonic()
-        if not self._speak(reply, tag=comment.author):
+        spoken_text = self._speak(reply, tag=comment.author)
+        if not spoken_text:
             return
+        self.conversation.add_comment_turn(
+            comment.channel_id, comment.author, comment.text, spoken_text)
 
         started = self._speech_started_at
         print(f"[live] 反応まで {started - comment.received_at:.1f}秒 "
@@ -451,13 +470,14 @@ class LiveSession:
         self.replied_count += 1
         # energy はここでは足さない。下の memory.save_comment() が入れた行を
         # biorhythm_server が拾って加算する（live/energy.py の説明を参照）
-        response_text = " ".join(l["ja"] for l in reply["lines"])
-        self.memory_writer.update_response(comment.message_id, response_text)
+        # 実際に喋ったぶんだけを残す。合成が途中で落ちたとき、口に出していない
+        # 文まで「こう返した」として記録すると、次の配信の記憶がずれる
+        self.memory_writer.update_response(comment.message_id, spoken_text)
         try:
             memory.save_comment(
                 self.broadcast.broadcast_id if self.broadcast else "dry-run",
                 comment.author, comment.channel_id, comment.text,
-                response_text, bot.get("energy", 0),
+                spoken_text, bot.get("energy", 0),
             )
         except Exception as e:
             print(f"[live] 配信ログを保存できません（無視します）: {e}")
@@ -465,21 +485,29 @@ class LiveSession:
     def speak_filler(self) -> None:
         bot = self._bot_context()
         topic = self.planner.next_topic()
+        history = persona.build_history(self.conversation.recent_turns())
         prompt = persona.build_filler_prompt(
             topic["hint"], bot, self.planner.cache,
-            recent_replies=self.recent_replies,
+            recent_replies=self.conversation.recent_replies(),
         )
         # フリートークはコメントが来たら途中でやめる。最後まで喋りきってから
         # でないと反応できないのが、往復の遅さのいちばん大きな要因だった
-        reply = self._generate(prompt)
+        reply = self._generate(prompt, history)
         spoken = self._speak(reply, tag="フリートーク", interruptible=True)
+        if spoken:
+            self.conversation.add_solo_turn("フリートーク", spoken)
         if spoken and topic["memory_ids"] and not reply.get("_fallback"):
             output_ref = self.broadcast.broadcast_id if self.broadcast else "dry-run"
             self.planner.record_usage(topic["memory_ids"], output_ref)
 
     def speak_scripted(self, instruction: str, tag: str) -> None:
-        reply = self._generate(persona.build_scripted_prompt(instruction, self._bot_context()))
-        self._speak(reply, tag=tag)
+        """オープニング・クロージング。会話履歴にも積む（場の流れが飛ばないように）。"""
+        history = persona.build_history(self.conversation.recent_turns())
+        reply = self._generate(
+            persona.build_scripted_prompt(instruction, self._bot_context()), history)
+        spoken = self._speak(reply, tag=tag)
+        if spoken:
+            self.conversation.add_solo_turn(tag, spoken)
 
     def run_loop(self) -> None:
         closing_at = _today_at(LIVE_CLOSING_HHMM)
@@ -551,7 +579,7 @@ class LiveSession:
                         self.planner.prefetch_rag(
                             self._bot_context(),
                             recent_comments=list(self.poller.recent) if self.poller else [],
-                            recent_replies=self.recent_replies,
+                            recent_replies=self.conversation.recent_replies(),
                         )
                     except Exception as e:
                         print(f"[live] RAG 先読みを始められません（無視します）: {e}")
@@ -605,6 +633,7 @@ class LiveSession:
         self.idle.stop()
         self.subs.stop()
         subtitle.clear()
+        subtitle.clear_comments()
 
         if self.poller is not None:
             self.poller.stop()

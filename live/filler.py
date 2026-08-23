@@ -197,7 +197,7 @@ class FillerPlanner:
                 if not text or text in self._used_nagi:
                     continue
                 self._used_nagi.add(text)
-                return {"hint": (f"Nagiで見かけた投稿に反応して。投稿の内容：「{text[:100]}」\n"
+                return {"hint": (f"SNSのNagiで見かけた投稿に反応して。投稿の内容：「{text[:100]}」\n"
                                  f"投稿した人の名前は出さないこと。内容にだけ触れて全肯定して。"),
                         "memory_ids": []}
             return ""
