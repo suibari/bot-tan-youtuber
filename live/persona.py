@@ -291,8 +291,14 @@ def _bot_state_block(bot: dict) -> str:
 
     bsky-affirmative-bot の packages/bot_brain/src/gemini/util.ts:15-21 と
     同じ趣旨のブロック。energy は数値ではなくラベルで渡す。
+
+    **「寄せてください」とは言わない。** mood は 20〜90分ごとにしか変わらないので、
+    寄せろと指示すると1時間の配信の全発話が同じ行動の話になる（2026-08-24 の配信で
+    「FLASHBULB」の話が61発話中14回出た）。話題を運ぶのはお題（topic_hint）の仕事で、
+    ここは口調と気分を決めるだけ。mood 行そのものも、一度口に出したら
+    live.LiveSession._bot_for_prompt() が落とす。
     """
-    lines = ["## いまのあなたの状況（返事をこれに寄せてください）"]
+    lines = ["## いまのあなたの状況（口調と気分の参考。話題として持ち出す必要はない）"]
     if bot.get("now"):
         lines.append(f"- 時刻：{bot['now']}")
     if bot.get("status"):
@@ -303,14 +309,39 @@ def _bot_state_block(bot: dict) -> str:
     return "\n".join(lines)
 
 
-def _memory_block(mem: dict) -> str:
-    """記憶。DBから引いたものを人が読める形にして渡す。"""
+def _memory_block(mem: dict, mood: str = "", used_terms=None) -> str:
+    """記憶。DBから引いたものを人が読める形にして渡す。
+
+    activities は `_bot_state_block` と**同じ biorhythm_history を引いている**ので、
+    先頭行はいまの mood とほぼ必ず同じ文になる。素で並べると1つのプロンプトに
+    同じ文が2回入るので、mood と一致する行は落とす。
+
+    used_terms（お題としてもう出したネタの固有名詞。FillerPlanner.used_terms()）を
+    含む行も落とす。同じネタが文面違いで履歴に何行も入っていることがあり
+    （FLASHBULB は 10:01 と 11:52 の2行あった）、mood との文字列一致だけでは
+    落としきれない。
+
+    **ここで topics を import しない。** persona は config だけに依存させておくと、
+    テストがスタブ1個で読み込める（tests/test_followup.py:71）。語の抽出は
+    呼ぶ側（filler.FillerPlanner）の仕事で、ここは渡された語で絞るだけ。
+    """
     if not mem:
         return ""
     out = ["## あなたが覚えていること（話題に使ってよい）"]
 
-    for act in (mem.get("activities") or [])[:3]:
-        out.append(f"- 今日やってたこと：{act.get('mood', '')}")
+    said = {str(term).casefold() for term in (used_terms or [])}
+    mood_text = "".join(str(mood or "").split())
+    shown = 0
+    for act in (mem.get("activities") or []):
+        text = (act.get("mood") or "").strip()
+        if not text or "".join(text.split()) == mood_text:
+            continue
+        if said and any(term in text.casefold() for term in said):
+            continue
+        out.append(f"- 今日やってたこと：{text}")
+        shown += 1
+        if shown >= 2:
+            break
 
     for post in (mem.get("nagi_posts") or [])[:2]:
         text = (post.get("post_text") or "").replace("\n", " ")[:80]
@@ -379,7 +410,8 @@ def build_comment_prompt(comment_author: str, comment_text: str,
                          bot: dict, mem: dict = None,
                          is_first_time: bool = False,
                          is_super_chat: bool = False,
-                         user_history: list = None) -> str:
+                         user_history: list = None,
+                         used_terms=None) -> str:
     """視聴者コメントへの返事を作るためのユーザープロンプト。
 
     直前までの場の流れは messages のマルチターン（build_history）で渡すので、
@@ -415,7 +447,7 @@ def build_comment_prompt(comment_author: str, comment_text: str,
 
     parts.append("")
     parts.append(_bot_state_block(bot))
-    block = _memory_block(mem)
+    block = _memory_block(mem, _mood_of(bot), used_terms)
     if block:
         parts.append("")
         parts.append(block)
@@ -434,6 +466,16 @@ _RAG_SOURCE_LABELS = {
 }
 
 
+def _mood_of(bot: dict) -> str:
+    """記憶ブロックの重複除去に使う mood。
+
+    live.LiveSession._bot_for_prompt() が mood を落としたあとも、記憶ブロックからは
+    同じ話を落としたい（プロンプトに載っていないだけで、もう話した話題だから）。
+    落とす前の値は "mood_raw" に残してある。
+    """
+    return str(bot.get("mood_raw") or bot.get("mood") or "")
+
+
 def _filler_topic_block(topic_hint) -> str:
     if not isinstance(topic_hint, dict):
         return str(topic_hint)
@@ -450,7 +492,8 @@ def _filler_topic_block(topic_hint) -> str:
 
 
 def build_filler_prompt(topic_hint, bot: dict, mem: dict = None,
-                        recent_replies: list = None) -> str:
+                        recent_replies: list = None,
+                        used_terms=None) -> str:
     """コメントが途切れているときのフリートーク用プロンプト。"""
     parts = [
         "いまコメントが途切れています。ひとりごとを話して場をつないでください。",
@@ -467,7 +510,7 @@ def build_filler_prompt(topic_hint, bot: dict, mem: dict = None,
         parts.append("")
 
     parts.append(_bot_state_block(bot))
-    block = _memory_block(mem)
+    block = _memory_block(mem, _mood_of(bot), used_terms)
     if block:
         parts.append("")
         parts.append(block)

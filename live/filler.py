@@ -15,6 +15,7 @@ import random
 import threading
 
 import memory
+import topics
 from bot_memory_client import BotMemoryClient
 from config import BOT_MEMORY_QUERY_MAX_CHARS
 
@@ -72,9 +73,15 @@ _KINDS = ["rag", "rag", "mood", "nagi", "bsky", "short",
 def _topic_key(kind: str, text: str) -> tuple:
     """配信内の重複判定に使うキー。
 
-    空白を潰してから頭を取る。本文の完全一致で見ていると、空白差だけで
-    同じ話がすり抜ける。
+    固有名詞が拾えるならそれを並べたものをキーにする。頭の60文字で見ていると、
+    同じネタでも言い回しが違うだけで別物として通ってしまう（2026-08-24 の配信では
+    「お風呂で『FLASHBULB』を聴きながら…」が文面違いで履歴に2行あった）。
+
+    語が拾えないときだけ、従来どおり空白を潰した頭60文字に落ちる。
     """
+    found = topics.terms(text)
+    if found:
+        return (kind, "|".join(sorted(topics.term_key(term) for term in found)))
     return (kind, "".join(str(text or "").split())[:60])
 
 
@@ -94,6 +101,9 @@ class FillerPlanner:
         # 握った状態から呼ばれることがあり、同じ錠を二度取ると固まる）
         self._used_lock = threading.Lock()
         self._used = set()
+        # 出したお題に含まれていた固有名詞。キーが違っても中身が同じネタを
+        # 弾くために使う（RAG は同じ話が別 document_id で何件も入っている）
+        self._used_terms = set()
         self._rag_candidates = []
         self._rag_refreshing = False
         self._rag_client = memory_client or BotMemoryClient()
@@ -109,9 +119,24 @@ class FillerPlanner:
         with self._used_lock:
             return key in self._used
 
-    def _mark_used(self, key) -> None:
+    def _mark_used(self, key, text: str = "") -> None:
         with self._used_lock:
             self._used.add(key)
+            if text:
+                self._used_terms |= topics.keys(text)
+
+    def used_terms(self) -> set:
+        """お題として出したネタの固有名詞。記憶ブロックの絞り込みにも使う。"""
+        with self._used_lock:
+            return set(self._used_terms)
+
+    def _overlaps(self, text: str) -> bool:
+        """そのお題が、もう出したネタと固有名詞で重なるか。
+
+        **固定文のお題（hobby / ask）には掛けないこと。** 人手で書き分けた
+        レパートリーなので、重なりで潰すと在庫が痩せる。
+        """
+        return topics.overlaps(text, self.used_terms())
 
     def _used_rag_ids(self) -> list:
         with self._used_lock:
@@ -121,6 +146,7 @@ class FillerPlanner:
     def reset_used(self) -> None:
         with self._used_lock:
             self._used.clear()
+            self._used_terms.clear()
 
     # ── 記憶 ──────────────────────────────────────────
 
@@ -166,8 +192,11 @@ class FillerPlanner:
         if topic is not None:
             return topic
 
-        # DBが全滅していてもひとりごとは話せる
-        return {"hint": self.hobby.next(), "memory_ids": []}
+        # DBが全滅していてもひとりごとは話せる。
+        # ここも key を返す（呼ぶ側が話題の種別をログに出すのと、
+        # tests/test_filler_topics.py が key を見ているため）
+        hint = self.hobby.next()
+        return {"hint": hint, "memory_ids": [], "key": _topic_key("hobby", hint)}
 
     def _pick_topic(self):
         mem = self.cache
@@ -291,7 +320,9 @@ class FillerPlanner:
             content = (candidate.get("content") or "").replace("\n", " ").strip()
             if not content:
                 continue
-            self._mark_used(key)
+            if self._overlaps(content):
+                continue
+            self._mark_used(key, content)
             return {
                 "hint": {
                     "rag_source": candidate.get("source") or "memory",
@@ -330,7 +361,12 @@ class FillerPlanner:
                 content = (candidate.get("content") or "").replace("\n", " ").strip()
                 if not content:
                     continue
-                self._mark_used(key)
+                # 同じ話が別 document_id で何件も入っていることがある。
+                # excludeDocumentIds は ID 単位なので、受け取ってから中身で捨てる
+                if self._overlaps(content):
+                    print(f"[filler] もう出したネタと重なるので飛ばします: {content[:30]}")
+                    continue
+                self._mark_used(key, content)
                 return {
                     "hint": {
                         "rag_source": candidate.get("source") or "memory",
@@ -354,9 +390,9 @@ class FillerPlanner:
                 if not mood:
                     continue
                 key = _topic_key("mood", mood)
-                if self._is_used(key):
+                if self._is_used(key) or self._overlaps(mood):
                     continue
-                self._mark_used(key)
+                self._mark_used(key, mood)
                 return {"hint": (f"さっきまで「{mood}」をしていた話をして。"
                                  f"その様子を視聴者に伝えるように話すこと。"),
                         "memory_ids": [], "key": key}
@@ -382,7 +418,7 @@ class FillerPlanner:
             key = _topic_key("short", title)
             if self._is_used(key):
                 return None
-            self._mark_used(key)
+            self._mark_used(key, title)
             return {"hint": (f"昨日出したショート動画「{title}」の話をして。"
                              f"見てくれた人にお礼を言うこと。"),
                     "memory_ids": [], "key": key}
@@ -393,9 +429,9 @@ class FillerPlanner:
                 if not comment:
                     continue
                 key = _topic_key("prev", comment)
-                if self._is_used(key):
+                if self._is_used(key) or self._overlaps(comment):
                     continue
-                self._mark_used(key)
+                self._mark_used(key, comment)
                 return {"hint": (f"前の配信で「{comment[:60]}」っていう話が出たのを"
                                  f"思い出した、という話をして。名前は出さないこと。"),
                         "memory_ids": [], "key": key}
@@ -410,7 +446,10 @@ class FillerPlanner:
             key = _topic_key(kind, hint)
             if self._is_used(key):
                 continue
-            self._mark_used(key)
+            # 重なり判定は掛けない（固定文は人手で書き分けたレパートリーなので、
+            # 潰すと在庫が痩せる）。ただし語は台帳に入れる。ここで GIANT の話を
+            # したら、同じ話題の RAG 候補は弾いてよい
+            self._mark_used(key, hint)
             return {"hint": hint, "memory_ids": [], "key": key}
         return None
 
@@ -421,9 +460,9 @@ class FillerPlanner:
             if not text:
                 continue
             key = _topic_key(kind, text)
-            if self._is_used(key):
+            if self._is_used(key) or self._overlaps(text):
                 continue
-            self._mark_used(key)
+            self._mark_used(key, text)
             return {"hint": template.format(text=text[:100]),
                     "memory_ids": [], "key": key}
         return None

@@ -31,6 +31,7 @@ import persona
 import safety
 import schedule as live_schedule
 import subtitle
+import topics
 import unity_client
 import unity_live
 import voice
@@ -39,7 +40,8 @@ from config import (
     FOLLOWUP_IDLE_SEC, FOLLOWUP_MAX_DEPTH, FOLLOWUP_TTL_SEC,
     IDLE_ENABLED, LIVE_CLOSING_HHMM,
     LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
-    BOT_CONTEXT_TTL_SEC, FPS_LOG_SEC, LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
+    BOT_CONTEXT_TTL_SEC, BOT_MOOD_SERVE_LIMIT, FPS_LOG_SEC,
+    LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
     SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT,
     WORK_DIR, ensure_dirs,
 )
@@ -96,6 +98,8 @@ class LiveSession:
         # botたんの状態のキャッシュ（_bot_context 参照）
         self._bot_cache = None
         self._bot_cache_at = 0.0
+        # いまの mood をあと何回プロンプトに載せてよいか（_bot_for_prompt 参照）
+        self._mood_state = {"text": "", "served": 0}
         # いま話しているテーマ（_begin_thread / speak_followup 参照）
         self._thread = None
         # キュー統計を最後に出した時刻
@@ -290,6 +294,49 @@ class LiveSession:
         bot["now"] = datetime.now().strftime("%H:%M")
         return bot
 
+    def _bot_for_prompt(self, bot: dict, consume: bool = True) -> dict:
+        """プロンプトに載せる用の状態。**一度載せた mood は落とす。**
+
+        mood（さっきまでしてたこと）は biorhythm 由来で 20〜90分ごとにしか
+        変わらない。1時間の配信では全発話に同じ文が乗るので、素で入れ続けると
+        LLM がそこへ寄っていく。2026-08-24 の配信で「FLASHBULB」の話が
+        61発話中14回、しかも逐語でほぼ同じフリートークが3回出たのがこれ。
+
+        **「話したかどうか」ではなく「載せた回数」で切る。** 載せれば高い確率で
+        その話をする（それが上の症状そのもの）ので、結果は変わらないうえ、
+        発話から固有名詞を拾う必要がなくなる。mood の3件に1件はカギ括弧が無く、
+        語の抽出に頼ると取りこぼす。
+
+        mood が更新されれば数え直すので、配信中に2〜3回は近況を話せる。
+        落としたあとも記憶ブロックからは同じ話を外したいので、元の文は
+        "mood_raw" に残す（persona._mood_of が読む）。
+
+        **_bot_context() 側ではやらない。** あちらは RAG 先読みの雑務スレッドからも
+        呼ばれるので、そこで予算を使い切ってしまう。雑務スレッドから
+        「いま mood を使ってよいか」だけ知りたいときは consume=False で呼ぶ。
+        """
+        bot = dict(bot or {})
+        mood = str(bot.get("mood") or "")
+        bot["mood_raw"] = mood
+        if not mood:
+            return bot
+
+        state = self._mood_state
+        if state["text"] != mood:
+            state = {"text": mood, "served": 0}
+            self._mood_state = state
+
+        if state["served"] >= BOT_MOOD_SERVE_LIMIT:
+            if not state.get("logged"):
+                state["logged"] = True
+                print(f"[live] 載せ切ったので mood をプロンプトから外します: {mood[:30]}")
+            bot["mood"] = ""
+            return bot
+
+        if consume:
+            state["served"] += 1
+        return bot
+
     def _generate(self, user_prompt: str, history: list = None) -> dict:
         """LLM に投げる。落ちたら定型で返す（無言にしない）。"""
         try:
@@ -455,9 +502,11 @@ class LiveSession:
                         if id(turn) not in in_history]
 
         prompt = persona.build_comment_prompt(
-            comment.author, comment.text, bot, self.planner.cache,
+            comment.author, comment.text, self._bot_for_prompt(bot),
+            self.planner.cache,
             is_first_time=first, is_super_chat=comment.is_super_chat,
             user_history=user_history,
+            used_terms=self.planner.used_terms(),
         )
         reply = self._generate(prompt, history)
         t_llm = time.monotonic()
@@ -495,13 +544,18 @@ class LiveSession:
         topic = self.planner.next_topic()
         history = persona.build_history(self.conversation.recent_turns())
         prompt = persona.build_filler_prompt(
-            topic["hint"], bot, self.planner.cache,
+            topic["hint"], self._bot_for_prompt(bot), self.planner.cache,
             recent_replies=self.conversation.recent_replies(),
+            used_terms=self.planner.used_terms(),
         )
         # フリートークはコメントが来たら途中でやめる。最後まで喋りきってから
         # でないと反応できないのが、往復の遅さのいちばん大きな要因だった
         reply = self._generate(prompt, history)
-        spoken = self._speak(reply, tag="フリートーク", interruptible=True)
+        # 話題の種別をログに残す。これが無いと、配信後に「なぜ同じ話ばかり
+        # したのか」を切り分けるのに DB を引く羽目になる（実際そうなった）
+        kind = topic.get("key", ("",))[0] if topic.get("key") else ""
+        spoken = self._speak(reply, tag=f"フリートーク/{kind}" if kind else "フリートーク",
+                             interruptible=True)
         if spoken:
             self.conversation.add_solo_turn("フリートーク", spoken)
             # フリートークも掘り下げの対象にする。これで
@@ -558,7 +612,7 @@ class LiveSession:
         prompt = persona.build_followup_prompt(
             thread["theme"],
             material["hint"] if material else None,
-            self._bot_context(),
+            self._bot_for_prompt(self._bot_context()),
             recent_replies=self.conversation.recent_replies(),
         )
         history = persona.build_history(self.conversation.recent_turns())
@@ -581,7 +635,9 @@ class LiveSession:
         """オープニング・クロージング。会話履歴にも積む（場の流れが飛ばないように）。"""
         history = persona.build_history(self.conversation.recent_turns())
         reply = self._generate(
-            persona.build_scripted_prompt(instruction, self._bot_context()), history)
+            persona.build_scripted_prompt(
+                instruction, self._bot_for_prompt(self._bot_context())),
+            history)
         spoken = self._speak(reply, tag=tag)
         if spoken:
             self.conversation.add_solo_turn(tag, spoken)
@@ -688,8 +744,10 @@ class LiveSession:
                 if now - rag_at > 30:
                     rag_at = now
                     try:
+                        # mood が枯れていたらクエリからも外す。載せないと決めた
+                        # 話題で検索し続けると、返ってくる候補が全部弾かれる
                         self.planner.prefetch_rag(
-                            self._bot_context(),
+                            self._bot_for_prompt(self._bot_context(), consume=False),
                             recent_comments=list(self.poller.recent) if self.poller else [],
                             recent_replies=self.conversation.recent_replies(),
                         )

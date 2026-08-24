@@ -35,7 +35,8 @@ def load_live():
         FOLLOWUP_IDLE_SEC=8.0, FOLLOWUP_MAX_DEPTH=2, FOLLOWUP_TTL_SEC=120.0,
         IDLE_ENABLED=True, LIVE_CLOSING_HHMM="21:55", LIVE_END_HHMM="22:00",
         LIVE_GO_LIVE_RETRY_SEC=300, LIVE_START_HHMM="21:00",
-        LIVE_TESTING_LEAD_SEC=120, BOT_CONTEXT_TTL_SEC=20.0, FPS_LOG_SEC=60.0,
+        LIVE_TESTING_LEAD_SEC=120, BOT_CONTEXT_TTL_SEC=20.0,
+        BOT_MOOD_SERVE_LIMIT=1, FPS_LOG_SEC=60.0,
         LIVE_HISTORY_TURNS=6, LIVE_HISTORY_USER_TURNS=3, SKIP_ARDY=True,
         SUBTITLE_LEAD_SEC=0.0, UNITY_PROJECT="/tmp/unity",
         WORK_DIR=Path("/tmp/bottan-live-test"), ensure_dirs=lambda: None,
@@ -56,6 +57,7 @@ def load_live():
         "safety": _stub("safety"),
         "schedule": _stub("schedule"),
         "subtitle": _stub("subtitle", SubtitleScheduler=object),
+        # topics は依存ゼロなので実物を読ませる（mood の消費判定を通したい）
         "unity_client": _stub("unity_client", UnityError=RuntimeError),
         "unity_live": _stub("unity_live", UnityLive=object),
         "voice": _stub("voice"),
@@ -93,7 +95,60 @@ def bare_session():
     session._thread = None
     session.last_speech_at = time.monotonic()
     session.planner = FakePlanner()
+    session._mood_state = {"text": "", "served": 0}
     return session
+
+
+MOOD = ("全肯定botたんは、お風呂で「FLASHBULB」を聴きながら、"
+        "今日の出来事を思い出しているよ。")
+
+
+class MoodServingTest(unittest.TestCase):
+    """mood を全プロンプトに載せ続けない。
+
+    mood は biorhythm 由来で 20〜90分ごとにしか変わらないので、素で入れると
+    1時間の配信の全発話に同じ文が乗る。2026-08-24 の配信で「FLASHBULB」の話が
+    61発話中14回出たのがこれ。
+    """
+
+    def test_the_mood_is_served_once(self):
+        session = bare_session()
+        self.assertEqual(session._bot_for_prompt({"mood": MOOD})["mood"], MOOD)
+        self.assertEqual(session._bot_for_prompt({"mood": MOOD})["mood"], "")
+
+    def test_it_stays_dropped(self):
+        session = bare_session()
+        session._bot_for_prompt({"mood": MOOD})
+        for _ in range(5):
+            self.assertEqual(session._bot_for_prompt({"mood": MOOD})["mood"], "")
+
+    def test_a_new_mood_starts_over(self):
+        """20〜90分ごとの更新で復活する。配信中に2〜3回は近況を話せる。"""
+        session = bare_session()
+        session._bot_for_prompt({"mood": MOOD})
+        self.assertEqual(session._bot_for_prompt({"mood": MOOD})["mood"], "")
+        other = "モルフォと公園を散歩していた"
+        self.assertEqual(session._bot_for_prompt({"mood": other})["mood"], other)
+
+    def test_the_original_mood_is_kept_for_the_memory_block(self):
+        """載せないと決めたあとも、記憶ブロックからは同じ話を落としたい。"""
+        session = bare_session()
+        session._bot_for_prompt({"mood": MOOD})
+        bot = session._bot_for_prompt({"mood": MOOD})
+        self.assertEqual(bot["mood"], "")
+        self.assertEqual(bot["mood_raw"], MOOD)
+
+    def test_peeking_does_not_spend_the_budget(self):
+        """雑務スレッド（RAG 先読み）は消費せずに覗くだけ。"""
+        session = bare_session()
+        for _ in range(10):
+            session._bot_for_prompt({"mood": MOOD}, consume=False)
+        self.assertEqual(session._bot_for_prompt({"mood": MOOD})["mood"], MOOD)
+
+    def test_an_empty_mood_is_harmless(self):
+        session = bare_session()
+        self.assertEqual(session._bot_for_prompt({})["mood_raw"], "")
+        self.assertEqual(session._bot_for_prompt({"mood": ""})["mood_raw"], "")
 
 
 class ClosingSoonTest(unittest.TestCase):

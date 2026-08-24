@@ -182,5 +182,67 @@ class BlueskyTopicTest(unittest.TestCase):
         self.assertIsNotNone(planner._build("bsky", planner.cache))
 
 
+class SameStoryInOtherWordingTest(unittest.TestCase):
+    """言い回しが違うだけの同じネタを、二度出さないこと。
+
+    2026-08-24 の配信で「FLASHBULB」の話が繰り返された。biorhythm_history には
+    同じ曲を聴いている行が文面違いで2行入っており、頭60文字のキーでは
+    別物として通っていた。以下は実データそのまま。
+    """
+
+    MOOD_A = ("全肯定botたんは、お風呂で「FLASHBULB」を聴きながら、"
+              "今日の出来事をモルフォと一緒に思い出しているところです。")
+    MOOD_B = ("全肯定botたんは、お風呂で「FLASHBULB」を聴きながら、"
+              "今日の出来事を思い出しているよ。モルフォは家で静かに待っているみたい。")
+
+    def test_the_same_song_is_not_offered_twice(self):
+        planner = planner_with_memory({
+            "activities": [{"mood": self.MOOD_A}, {"mood": self.MOOD_B}],
+        })
+        self.assertIsNotNone(planner._build("mood", planner.cache))
+        self.assertIsNone(planner._build("mood", planner.cache),
+                          "同じ曲の話が言い回し違いで二度出ている")
+
+    def test_unrelated_activities_are_still_offered(self):
+        """過剰に弾いていないこと。無関係な行動は two とも出る。"""
+        planner = planner_with_memory({
+            "activities": [{"mood": "公園を散歩していた"}, {"mood": "本を読んでいた"}],
+        })
+        self.assertIsNotNone(planner._build("mood", planner.cache))
+        self.assertIsNotNone(planner._build("mood", planner.cache))
+        self.assertIsNone(planner._build("mood", planner.cache))
+
+    def test_a_topic_from_one_kind_blocks_the_same_story_in_another(self):
+        """種別をまたいでも同じネタなら弾く。RAG と mood に同じ話が入っている。"""
+        planner = planner_with_memory({
+            "activities": [{"mood": self.MOOD_A}],
+            "previous_live": [{"comment": "FLASHBULBって曲、いいよね"}],
+        })
+        self.assertIsNotNone(planner._build("mood", planner.cache))
+        self.assertIsNone(planner._build("previous_live", planner.cache))
+
+    def test_resetting_forgets_the_words_too(self):
+        """畳んだら語も忘れる。忘れないと2周目に何も出せなくなる。"""
+        planner = planner_with_memory({
+            "activities": [{"mood": self.MOOD_A}, {"mood": self.MOOD_B}],
+        })
+        self.assertIsNotNone(planner._build("mood", planner.cache))
+        planner.reset_used()
+        self.assertIsNotNone(planner._build("mood", planner.cache))
+
+    def test_the_last_resort_topic_still_has_a_key(self):
+        """在庫が空でも黙らない。話題の種別をログに出すので key も要る。
+
+        _pick_topic が二度とも空を返す＝DBが全滅した状態を作る。
+        この救済パスだけ key を持っていなかった。
+        """
+        planner = planner_with_memory({})
+        planner._pick_topic = lambda: None
+        topic = planner.next_topic()
+        self.assertIn("key", topic)
+        self.assertEqual(topic["key"][0], "hobby")
+        self.assertTrue(topic["hint"])
+
+
 if __name__ == "__main__":
     unittest.main()
