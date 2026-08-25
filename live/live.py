@@ -516,7 +516,9 @@ class LiveSession:
         self.conversation.add_comment_turn(
             comment.channel_id, comment.author, comment.text, spoken_text)
         # このコメントの話題を、次の掘り下げのテーマにする
-        self._begin_thread(f"{comment.text}\n{spoken_text}")
+        # 視聴者の身の上話をそのまま自分の体験にしないよう、出どころを添える
+        self._begin_thread(f"{comment.text}\n{spoken_text}",
+                           origin="配信で視聴者から届いたコメント")
 
         started = self._speech_started_at
         print(f"[live] 反応まで {started - comment.received_at:.1f}秒 "
@@ -554,30 +556,38 @@ class LiveSession:
         # 話題の種別をログに残す。これが無いと、配信後に「なぜ同じ話ばかり
         # したのか」を切り分けるのに DB を引く羽目になる（実際そうなった）
         kind = topic.get("key", ("",))[0] if topic.get("key") else ""
+        # 他人の投稿に反応した発話は、そのことを履歴と掘り下げに持ち回る。
+        # 札が無いと、次のターンからは「自分が言ったこと」しか残らない
+        origin = persona.topic_origin(topic)
         spoken = self._speak(reply, tag=f"フリートーク/{kind}" if kind else "フリートーク",
                              interruptible=True)
         if spoken:
-            self.conversation.add_solo_turn("フリートーク", spoken)
+            self.conversation.add_solo_turn("フリートーク", spoken, origin=origin)
             # フリートークも掘り下げの対象にする。これで
             # 「話題 → 掘り下げ → 掘り下げ → 次の話題」と続くようになる
-            self._begin_thread(spoken)
+            self._begin_thread(spoken, origin=origin)
         if spoken and topic["memory_ids"] and not reply.get("_fallback"):
             output_ref = self.broadcast.broadcast_id if self.broadcast else "dry-run"
             self.planner.record_usage(topic["memory_ids"], output_ref)
 
     # ── 掘り下げ ──────────────────────────────────────
 
-    def _begin_thread(self, theme: str) -> None:
+    def _begin_thread(self, theme: str, origin: str = "") -> None:
         """いま話しているテーマを覚える。**ここではネットワークを触らない。**
 
         RAG を実際に引くのは雑務スレッド（_start_chores）。ここで引くと、
         そのぶん次のコメントへの反応が遅れる。
+
+        origin は「そのテーマの出どころ」（persona.topic_origin）。掘り下げの
+        プロンプトには記憶ブロックが付かないので、他人の話だという手がかりは
+        ここで持ち回るしかない。
         """
         theme = (theme or "").strip()
         if not theme:
             self._thread = None
             return
-        self._thread = {"theme": theme, "depth": 0, "at": time.monotonic()}
+        self._thread = {"theme": theme, "depth": 0, "at": time.monotonic(),
+                        "origin": (origin or "").strip()}
         try:
             self.planner.set_followup_theme(theme)
         except Exception as e:
@@ -614,6 +624,7 @@ class LiveSession:
             material["hint"] if material else None,
             self._bot_for_prompt(self._bot_context()),
             recent_replies=self.conversation.recent_replies(),
+            origin=thread.get("origin", ""),
         )
         history = persona.build_history(self.conversation.recent_turns())
         reply = self._generate(prompt, history)
@@ -623,7 +634,8 @@ class LiveSession:
             self._thread = None
             return
 
-        self.conversation.add_solo_turn("掘り下げ", spoken)
+        self.conversation.add_solo_turn("掘り下げ", spoken,
+                                        origin=thread.get("origin", ""))
         thread["depth"] += 1
         if thread["depth"] >= FOLLOWUP_MAX_DEPTH:
             self._thread = None

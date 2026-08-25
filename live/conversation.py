@@ -52,10 +52,14 @@ class ConversationLog:
                     self._by_user[turn["channel_id"]] = per_user
                 per_user.append(turn)
 
-    def add_solo_turn(self, kind: str, reply: str) -> None:
+    def add_solo_turn(self, kind: str, reply: str, origin: str = "") -> None:
         """フリートーク・オープニング・クロージング。
 
         積まないと「さっき自分が何を話していたか」が場の流れから飛ぶ。
+
+        origin は「その発話の出どころ」（persona.topic_origin）。他人の投稿に
+        反応した発話は、履歴では role=assistant として残るので、札が無いと
+        次のターンから自分の体験として扱われる。自分の話なら空でよい。
         """
         if not (reply or "").strip():
             return
@@ -66,6 +70,7 @@ class ConversationLog:
                 "author": "",
                 "comment": "",
                 "reply": reply.strip(),
+                "origin": (origin or "").strip(),
             })
 
     def recent_turns(self, limit: int = None) -> list:

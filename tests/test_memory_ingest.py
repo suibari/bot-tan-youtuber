@@ -12,40 +12,57 @@ sys.path.insert(0, str(ROOT / "live"))
 
 # このテストは標準ライブラリだけで動かす。配信環境固有のYouTube/DB依存は
 # コールバック境界の外なので、import時だけ最小スタブへ差し替える。
+#
+# **差し替えたら必ず戻すこと。** sys.modules に置きっぱなしにすると、あとから
+# 読み込まれるテストまで巻き込む（common.db を残していたせいで、shorts 側の
+# core.py / pipeline.py を読む tests/test_subtitle_chunks.py と
+# tests/test_night_prompt.py が ImportError になっていた）。
+# chat / memory は import 時にスタブを束縛済みなので、戻しても動き続ける。
+_STUBS = {}
+
 config_stub = types.ModuleType("config")
 config_stub.COMMENT_USER_COOLDOWN_SEC = 60
 config_stub.COMMENT_MAX_AGE_SEC = 180
 config_stub.DRY_RUN = False
 config_stub.FAKE_COMMENTS = ""
-sys.modules["config"] = config_stub
+_STUBS["config"] = config_stub
 
 safety_stub = types.ModuleType("safety")
 safety_stub.sanitize_comment = lambda text: (bool(text), text, "")
-sys.modules["safety"] = safety_stub
+_STUBS["safety"] = safety_stub
 
 subtitle_stub = types.ModuleType("subtitle")
 subtitle_stub.write_comments = lambda comments: None
-sys.modules["subtitle"] = subtitle_stub
+_STUBS["subtitle"] = subtitle_stub
 
 youtube_auth_stub = types.ModuleType("youtube_auth")
 youtube_auth_stub.get_client = lambda: None
-sys.modules["youtube_auth"] = youtube_auth_stub
+_STUBS["youtube_auth"] = youtube_auth_stub
 
 extras_stub = types.ModuleType("psycopg2.extras")
 extras_stub.Json = lambda value: value
 extras_stub.RealDictCursor = object
 psycopg_stub = types.ModuleType("psycopg2")
 psycopg_stub.extras = extras_stub
-sys.modules["psycopg2"] = psycopg_stub
-sys.modules["psycopg2.extras"] = extras_stub
+_STUBS["psycopg2"] = psycopg_stub
+_STUBS["psycopg2.extras"] = extras_stub
 
 db_stub = types.ModuleType("common.db")
 db_stub.LIVE_SCHEMA = "bottan_live"
 db_stub.connect = lambda: None
-sys.modules["common.db"] = db_stub
+_STUBS["common.db"] = db_stub
 
-import chat  # noqa: E402
-import memory  # noqa: E402
+_previous = {key: sys.modules.get(key) for key in _STUBS}
+sys.modules.update(_STUBS)
+try:
+    import chat  # noqa: E402
+    import memory  # noqa: E402
+finally:
+    for _key, _value in _previous.items():
+        if _value is None:
+            sys.modules.pop(_key, None)
+        else:
+            sys.modules[_key] = _value
 
 
 class ChatMemoryIngestTest(unittest.TestCase):

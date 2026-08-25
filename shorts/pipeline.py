@@ -21,6 +21,7 @@ botたん YouTube Shorts 自動投稿パイプライン
 """
 
 import os
+import random
 import json
 import time
 import urllib.parse
@@ -47,6 +48,7 @@ from core import (  # noqa: F401
     get_wav_duration, _synthesize, valence_arousal_to_voicevox_params,
     synthesize_sentences, make_silence_wav, concat_wavs, generate_voice,
     _query_mora_times, split_sentences, generate_subtitle_timing, _find_subtitle_time,
+    _dedupe_subtitle_overlaps,
     _start_xvfb, record_with_unity, VRMA_MOTION_DIR,
     ardy_start, ardy_wait_ready, ardy_stop, build_vrma_motions,
     VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD,
@@ -162,7 +164,6 @@ def fetch_from_bot_db() -> dict:
     print(f"[DB] Nagiポスト: {len(interactions)}件, Mood履歴: {len(moods)}件")
     all_moods = [dict(r) for r in moods]
     # statusごとに1件ずつランダムサンプリング
-    import random
     seen_status = {}
     for m in all_moods:
         s = m.get("status")
@@ -176,15 +177,41 @@ def fetch_from_bot_db() -> dict:
         "moods":        sampled_moods,
     }
 
+
+def pick_closing_mood(moods: list[dict], corner_context: dict = None) -> dict | None:
+    """③締めで使う botたん自身のエピソードを1件だけ選ぶ。
+
+    **LLM に選ばせない。** 以前は Mood を20件並べて「この中から選んでください」と
+    書いていたが、同じプロンプトに他人の Nagi 投稿の一覧も並んでおり、どちらも
+    「一人称の日本語で書かれた具体的な出来事」の箇条書きだったので、LLM が
+    投稿のほうを botたんの体験として使ってしまった（2026-08-25 18:00 の
+    「資格取得のために警察署に行って」は、その日の Nagi 投稿そのもの）。
+    1件に確定して渡せば「選ぶ」余地が無くなり、混同そのものが起きなくなる。
+
+    直近2日で使った status（corner_context）は Python 側で避ける。避けた結果
+    候補が無くなったら、除外を無視して選ぶ（無人実行なので候補ゼロで落とさない）。
+    """
+    if not moods:
+        return None
+    excluded = set((corner_context or {}).get("excluded_first_greeting_statuses") or [])
+    candidates = [m for m in moods if m.get("status") not in excluded] or list(moods)
+    chosen = random.choice(candidates)
+    print(f"[Mood] ③締め: status={chosen.get('status')} / {str(chosen.get('mood'))[:40]}"
+          f"（候補{len(candidates)}件 / 除外status={sorted(excluded) or 'なし'}）")
+    return chosen
+
+
 # ──────────────────────────────────────────────
 # Step 2: LLMで台本生成
 # ──────────────────────────────────────────────
 
-def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None) -> str:
+def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None,
+                    closing_mood: dict = None) -> str:
     """DBデータから台本を生成する"""
     print(f"[LLM] 台本生成中...")
 
-    user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
+    user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context,
+                                    closing_mood=closing_mood)
     extra_kwargs: dict = {}
 
     if USE_LOCAL_LLM:
@@ -379,6 +406,11 @@ def main():
         except Exception as e:
             print(f"[corner_context] 取得失敗（スキップ）: {e}")
 
+        # ③締めで使う botたん自身のエピソードは Python 側で1件に確定する。
+        # LLM に一覧から選ばせると、隣に並ぶ他人の Nagi 投稿を自分の体験として
+        # 使うことがある（README「他人の投稿を自分の体験にしない」）
+        closing_mood = pick_closing_mood(data["moods"], corner_context)
+
         # ARDYサーバーを先に起動しておく。
         # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる
         ardy_proc = None
@@ -390,14 +422,20 @@ def main():
         if script_cache and Path(script_cache).exists():
             raw_script = open(script_cache).read()
             print(f"[LLM] キャッシュから台本読み込み: {script_cache}")
+            # 台本は別の Mood で書かれているので、いま選んだものは捨てる
+            closing_mood = None
         else:
-            raw_script = _timed("Step2 台本生成", generate_script, data, comments, corner_context)
+            raw_script = _timed("Step2 台本生成", generate_script, data, comments,
+                                corner_context, closing_mood)
 
         # Step 2.5: JSONパース、クリーン台本作成
         script_data = parse_script_json(raw_script)
         sections = {s["section"]: s["sentences"] for s in script_data["sections"]}
         script_meta = script_data["meta"]
-        print(f"[META] first_greeting_status={script_meta.get('first_greeting_status')}, "
+        # first_greeting_status は Python 側で確定した Mood のものを正とする。
+        # LLM の自己申告は、実際に使った Mood とズレることがある
+        closing_status = (closing_mood or {}).get("status") or script_meta.get("first_greeting_status", "")
+        print(f"[META] first_greeting_status={closing_status}, "
               f"nagi_themes={script_meta.get('nagi_themes')}")
         thumbnail_sentences = sections.get("Thumbnail", [])
         thumbnail_text = thumbnail_sentences[0]["text"][:20] if thumbnail_sentences else "今日も全肯定だよ！"
@@ -438,7 +476,12 @@ def main():
         # Step 3.5: 字幕・コーナータイミング生成
         subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration, actual_duration=actual_main_duration)
         if intro_duration > 0:
-            subtitles = [{"start": 0.0, "end": round(intro_duration, 3), "text": thumbnail_text}] + subtitles
+            # 冒頭一言も本編チャンクと同じ扱いにする（+0.05 の余韻を付け、
+            # 本編1枚目との間隔を dedupe に通す）。以前は dedupe のあとに
+            # 足していたので、冒頭字幕だけ言い終わる前に消えることがあった
+            subtitles = [{"start": 0.0, "end": round(intro_duration + 0.05, 3),
+                          "text": thumbnail_text}] + subtitles
+            _dedupe_subtitle_overlaps(subtitles)
         corners   = generate_corner_timing(clean_script, subtitles, intro_duration, section_starts, has_comments)
 
         # 感情タイムライン生成
@@ -518,7 +561,7 @@ def main():
             if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
                 corners_metadata = [
                     {"corner_name": "Thumbnail", "theme": thumbnail_text},
-                    {"corner_name": "Closing", "status": script_meta.get("first_greeting_status", "")},
+                    {"corner_name": "Closing", "status": closing_status},
                 ]
                 nagi_themes = script_meta.get("nagi_themes", [])
                 if isinstance(nagi_themes, list) and nagi_themes:

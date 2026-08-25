@@ -306,7 +306,6 @@ def build_subtitles(segments: list[dict], max_chars: int = 20) -> list[dict]:
                 time_offset=spans[0]["start"],
                 actual_duration=round(spans[-1]["end"] - spans[0]["start"], 3),
                 max_chars=max_chars,
-                merge_short=True,   # 「萩、」「桔梗、」のような細切れを防ぐ
             )
         for s in subs:
             s["part"] = seg["id"]
