@@ -962,28 +962,62 @@ def build_subtitle_filters(subtitles: list[dict]) -> list[str]:
     return parts
 
 
-def build_corner_filters(corners: list[dict]) -> list[str]:
-    """左上のコーナーテロップ（白箱 + カラー下線 + カラー文字）"""
-    parts = []
-    for corner in corners:
-        start = corner["start"]
-        end   = corner["end"]
-        label = esc_drawtext(corner["label"])
-        color = corner["color"].replace("#", "0x")
-        box_w = min(len(corner["label"]) * 38 + 40, W - 40)
+# ターゲットテロップ（夜版）。「誰に向けた動画か」を動画全体に出し続ける。
+# Shorts はスワイプで途中から入るので、冒頭だけに出しても届かない。
+TARGET_FONT_SIZE   = 72
+TARGET_LINE_H      = 92     # fontsize=72 の行送り（実測に合わせた概算）
+TARGET_MAX_CHARS   = 11     # 72px × 11文字 = 792px。W=1080 に収まる最大
+TARGET_COLOR       = "0x00A88A"
+
+
+def wrap_target_text(text: str, max_chars: int = TARGET_MAX_CHARS) -> list[str]:
+    """テロップを最大2行に折り返す。
+
+    Thumbnail の一言は20文字以内なので 11文字 × 2行 で必ず収まる。
+    句読点で切れると読みやすいので、後半に句読点があればそこを優先する。
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+    # 折り返し位置の候補: 前半すぎない位置にある句読点の直後
+    cut = max_chars
+    for i in range(min(max_chars, len(text) - 1), max_chars // 2, -1):
+        if text[i - 1] in "、。！？":
+            cut = i
+            break
+    return [text[:cut], text[cut:cut + max_chars]]
+
+
+def build_target_filters(text: str) -> list[str]:
+    """画面上部に出し続ける大テロップ（白箱 + カラー下線 + カラー文字）。
+
+    以前ここにあった左上のコーナーテロップ（「今日のNagi」等）の意匠を踏襲しつつ、
+    中央寄せ・大サイズにしたもの。
+    enable を付けないので動画全体に出る（Shorts はスワイプで途中から入るため）。
+
+    複数行は drawtext を行ごとに分けて出す。1つの drawtext に改行を入れると
+    ffmpeg はブロック全体の外接矩形を中央に置くだけなので、短いほうの行が
+    左に寄って見える（text_align は ffmpeg 7 以降にしか無い）。
+    """
+    lines = wrap_target_text(text)
+    if not lines or not lines[0]:
+        return []
+
+    box_h  = TARGET_LINE_H * len(lines) + 28
+    box_w  = min(max(len(l) for l in lines) * TARGET_FONT_SIZE + 56, W - 40)
+    box_x  = (W - box_w) // 2
+    box_y  = 40
+
+    parts = [
+        f"drawbox=x={box_x}:y={box_y}:w={box_w}:h={box_h}:color=white@0.9:t=fill",
+        f"drawbox=x={box_x}:y={box_y + box_h}:w={box_w}:h=6:color={TARGET_COLOR}@1.0:t=fill",
+    ]
+    for i, line in enumerate(lines):
         parts.append(
-            f"drawbox=x=20:y=40:w={box_w}:h=70:color=white@0.9:t=fill"
-            f":enable='between(t,{start},{end})'"
-        )
-        parts.append(
-            f"drawbox=x=20:y=108:w={box_w}:h=6:color={color}@1.0:t=fill"
-            f":enable='between(t,{start},{end})'"
-        )
-        parts.append(
-            f"drawtext=fontfile={FONT_PATH}:text='{label}'"
+            f"drawtext=fontfile={FONT_PATH}:text='{esc_drawtext(line)}'"
             f":expansion=none"
-            f":fontcolor={color}:fontsize=36:x=30:y=52"
-            f":enable='between(t,{start},{end})'"
+            f":fontcolor={TARGET_COLOR}:fontsize={TARGET_FONT_SIZE}"
+            f":x=(w-text_w)/2:y={box_y + 14 + TARGET_LINE_H * i}"
         )
     return parts
 

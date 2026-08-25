@@ -223,10 +223,11 @@ def build_answer_filters(quiz: dict, start: float, end: float) -> list[str]:
     ]
 
 
-def build_gauge_filters(start: float, duration: float = 5.0, steps: int = 50) -> list[str]:
+def build_gauge_filters(start: float, duration: float = 3.0, steps: int = 50) -> list[str]:
     """減少ゲージ。drawbox が時間式を持てないので階段状に並べる。
 
     実測: 1080x1920 / 5秒 / 50段でエンコード増分は 0.6秒程度。
+    既定値は THINK_DURATION（quiz_pipeline.py）と揃えてある。
     """
     end = start + duration
     filters = [
@@ -252,8 +253,12 @@ def build_gauge_filters(start: float, duration: float = 5.0, steps: int = 50) ->
     return filters
 
 
-def build_countdown_filters(start: float, duration: float = 5.0) -> list[str]:
-    """残り秒数の数字（1秒ごとに切り替え）。ゲージの右側、パネル内に置く。"""
+def build_countdown_filters(start: float, duration: float = 3.0) -> list[str]:
+    """残り秒数の数字（1秒ごとに切り替え）。ゲージの右側、パネル内に置く。
+
+    既定値は THINK_DURATION（quiz_pipeline.py）と揃えてある。
+    表示する数字は duration から作るので、秒数を変えても追従する。
+    """
     n = int(duration)
     return [
         _text(str(n - i), COUNT_SIZE, MINT, str(COUNT_X), COUNT_Y,

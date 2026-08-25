@@ -53,7 +53,7 @@ from core import (  # noqa: F401
     VRMA_GAIN, VRMA_HIPS_Y, VRMA_SEG_TARGET_SEC, VRMA_MAX_SEGMENTS_TOTAL,
     VRMA_BODY_TILT, VRMA_YAW_LIMIT, VRMA_HEAD_YAW, VRMA_HEAD_COUNTER,
     plan_vrma_from_sentences, vrma_unity_args, env_flag,
-    esc_drawtext, base_vf_parts, build_subtitle_filters, build_corner_filters,
+    esc_drawtext, base_vf_parts, build_subtitle_filters, build_target_filters,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
 
@@ -61,6 +61,9 @@ from core import (  # noqa: F401
 # （Assets/Animations/Blow A Kiss.fbx, firstFrame:0 lastFrame:137 @30fps）。
 # 生成モーションを被せると尻切れになるので、これが終わるまでは置かない
 HOOK_MOTION_SEC = 4.6
+# 台本が長すぎたときに警告を出す閾値[秒]。目標は30秒。
+# 無人実行なので生成は止めず、ログに実測尺と文字数を残してプロンプト調整の材料にする
+NIGHT_DURATION_WARN_SEC = 35.0
 # 引き開始以降カメラを引く量[m]
 VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.7"))
 
@@ -223,10 +226,13 @@ def generate_corner_timing(
     has_comments: bool = False,
 ) -> list[dict]:
     """セクションタグで確定したタイミングでコーナーラベルを生成する"""
-    corner_meta = [('OpeningAffirmation', "全肯定タイム", "#ff6b9d")]
-    corner_meta.append(('NagiCorner', "今日のNagi", "#00A88A"))
+    # label/color は画面に出さなくなった（左上のコーナーテロップは
+    # ターゲットテロップに置き換えた）が、corners はカメラ引き・サムネ撮影・
+    # DoThankful の探索開始位置を決めるのに使い続けるので残してある。
     if has_comments:
-        corner_meta.append(('CommentCorner', "コメントコーナー", "#ff9f43"))
+        corner_meta = [('CommentCorner', "コメントコーナー", "#ff9f43")]
+    else:
+        corner_meta = [('NagiCorner', "今日のNagi", "#00A88A")]
     corner_meta.append(('Closing', "全肯定メッセージ", "#7ec8e3"))
     total_duration = subtitles[-1]["end"] if subtitles else 90
 
@@ -242,12 +248,12 @@ def generate_corner_timing(
             print(f"[コーナー] {tag}: キーワード未検出、フォールバック使用")
         resolved_starts.append(t)
 
-    # フォールバック: 見つからないセクションは4等分で補完
+    # フォールバック: 見つからないセクションはコーナー数で等分して補完
     body_duration = total_duration - intro_duration
-    quarter = body_duration / 4
+    share = body_duration / len(corner_meta)
     corners = []
     for i, (tag, label, color) in enumerate(corner_meta):
-        start = resolved_starts[i] if resolved_starts[i] is not None else round(quarter * i + intro_duration, 3)
+        start = resolved_starts[i] if resolved_starts[i] is not None else round(share * i + intro_duration, 3)
         next_start = next((resolved_starts[j] for j in range(i + 1, len(resolved_starts)) if resolved_starts[j] is not None), None)
         end = next_start if next_start is not None else total_duration
         # tag は section 名。生成モーションの割り当てに使う（ffmpeg側は label/color しか見ない）
@@ -301,19 +307,21 @@ def build_vrma_blocks(sentences: list[dict], durations: list[float],
 
 def finalize_video(input_webm: str, output_mp4: str,
                    subtitles: list[dict] = None,
-                   corners: list[dict] = None,
-                   intro_duration: float = 0.0) -> None:
-    """FFmpegで縦型Shorts用MP4に変換・字幕合成する（夜版レイアウト）"""
-    print(f"[FFmpeg] MP4変換中...")
+                   target_text: str = "") -> None:
+    """FFmpegで縦型Shorts用MP4に変換・字幕合成する（夜版レイアウト）
 
-    if intro_duration > 0 and corners is not None:
-        corners = [{"start": 0, "end": intro_duration, "label": "今日の全肯定", "color": "#00A88A"}] + corners
+    target_text は「誰に向けた動画か」を示す一言（Thumbnail セクション＝サムネに
+    焼くのと同じ文言）。以前は左上にコーナー名（「今日のNagi」等）を出していたが、
+    Shorts はスワイプで途中から入るので、コーナー名より「自分向けの動画か」が
+    分かるほうが効く。
+    """
+    print(f"[FFmpeg] MP4変換中...")
 
     vf_parts = base_vf_parts()
     if subtitles:
         vf_parts += build_subtitle_filters(subtitles)
-    if corners:
-        vf_parts += build_corner_filters(corners)
+    if target_text:
+        vf_parts += build_target_filters(target_text)
 
     run_ffmpeg_finalize(input_webm, output_mp4, vf_parts)
 
@@ -420,6 +428,13 @@ def main():
         actual_main_duration = get_wav_duration(wav_path) - intro_duration if Path(wav_path).exists() else None
         print(f"[字幕] 本編音声長さ: {actual_main_duration:.3f}s" if actual_main_duration else "[字幕] 本編音声長さ取得失敗、フォールバック使用")
 
+        total_sec = intro_duration + (actual_main_duration or 0.0)
+        print(f"[尺] 合計 {total_sec:.1f}秒 (冒頭一言 {intro_duration:.1f}s + 本編 "
+              f"{(actual_main_duration or 0.0):.1f}s / 本文{len(clean_script)}文字)")
+        if total_sec > NIGHT_DURATION_WARN_SEC:
+            print(f"[警告] 台本が長すぎます: {total_sec:.1f}秒 "
+                  f"(目標30秒 / 警告閾値{NIGHT_DURATION_WARN_SEC}秒, 本文{len(clean_script)}文字)")
+
         # Step 3.5: 字幕・コーナータイミング生成
         subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration, actual_duration=actual_main_duration)
         if intro_duration > 0:
@@ -493,7 +508,7 @@ def main():
         generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
 
         # Step 5: MP4変換
-        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners, intro_duration)
+        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, thumbnail_text)
 
         # Step 6: YouTubeアップロード
         title = build_title(thumbnail_text)
