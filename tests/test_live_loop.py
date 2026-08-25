@@ -61,6 +61,14 @@ def load_live():
         "unity_client": _stub("unity_client", UnityError=RuntimeError),
         "unity_live": _stub("unity_live", UnityLive=object),
         "voice": _stub("voice"),
+        # live.py は `from common import grounding` で読む（live/ に同名モジュールは
+        # 無い）。実物は import しただけでは外に触らないが、needs_lookup / lookup は
+        # ollama と Gemini を叩くので、ここでも差し替えておく
+        "common.grounding": _stub(
+            "common.grounding", SKIP="skip", UNKNOWN="unknown", FACTS="facts",
+            needs_lookup=lambda _text: False,
+            lookup=lambda _q: {"status": "skip", "facts": "", "queries": []},
+            warmup=lambda: None),
     }
     previous = {key: sys.modules.get(key) for key in stubs}
     try:

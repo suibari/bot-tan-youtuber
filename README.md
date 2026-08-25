@@ -17,6 +17,7 @@
 common/           両方から呼ばれるもの。ここを直すと両方に効く
   env.py            パス解決（ROOT/DATA_DIR/LOGS_DIR）と環境変数の読み取り
   llm.py            LLM クライアント・モデルのフォールバック・JSON 取得
+  grounding.py      配信で聞かれたことを Google 検索で調べる（native REST）
   voice.py          VOICEVOX 合成・結合・無音・モーラタイミング
   ardy.py           ARDY サーバの起動/待機/停止と .vrma 生成
   motion_safety.py  モーション指示文の禁止語・主語の正規化・待機動作
@@ -50,7 +51,9 @@ logs/             pipeline_* quiz_* live_* ardy_*
                    └──────────┬──────┘
                        [live/live.py]
                               ├→ VOICEVOX      localhost:10101 (speaker=8)
-                              ├→ Gemini        OpenAI互換エンドポイント
+                              ├→ Gemini        OpenAI互換エンドポイント（返答生成）
+                              ├→ Gemini        native REST + googleSearch（調べもの）
+                              ├→ ollama        localhost:11434（調べるか否かの判定）
                               ├→ ARDY          127.0.0.1:2337（非同期）
                               ├→ PostgreSQL    192.168.1.200:5432
                               ├→ biorhythm     localhost:3002
@@ -231,6 +234,10 @@ Stream output type 'rtmp_output' failed to start!
 GPU は 8GB しかなく、ARDY・Unity・VOICEVOX（と常駐している ollama）で埋まっていて
 NVENC のぶんが残らない。**OBS はここからソフトウェアエンコーダへ落ちてくれない**
 ので、はじめから x264 を指定する。1080p30 なら CPU 側に余裕がある。
+
+調べもの機能（`common/grounding.py`）の判定モデル `gemma3:4b` も、配信のあいだ
+GPU に約3GB 常駐する（`LIVE_GROUNDING_GATE_KEEPALIVE`）。ここが苦しくなったら
+`LIVE_GROUNDING_GATE=regex` にすれば GPU を一切使わなくなる。
 
 `obsws` の `StartStream` はリクエストが通っただけで成功を返すので、
 `Obs.start_stream()` は実際に `output_active` になるまで確かめる。これを見て

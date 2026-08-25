@@ -21,7 +21,7 @@ from common.env import (  # noqa: E402
     ROOT, DATA_DIR, LOGS_DIR, AFFIRMATIVE_BOT_DIR,
     env_flag, env_float, env_int, env_float_opt,
 )
-from common import ardy as _ardy, llm as _llm, voice as _voice  # noqa: E402
+from common import ardy as _ardy, grounding as _grounding, llm as _llm, voice as _voice  # noqa: E402
 from common import vrma_style as _vrma_style  # noqa: E402
 from common.db import DB_CONFIG  # noqa: E402,F401
 
@@ -101,6 +101,20 @@ LOCAL_LLM_URL   = _llm.LOCAL_LLM_URL
 LOCAL_LLM_MODEL = _llm.LOCAL_LLM_MODEL
 # カンマ区切りで複数指定でき、左から順にフォールバックする
 GEMINI_MODELS   = _llm.GEMINI_MODELS
+
+# ── 調べもの（Google 検索グラウンディング） ────────
+# コメントで聞かれたことを検索して答えるための設定。原典は common/grounding.py で、
+# なぜ返答生成そのものに検索を載せられないかもそちらに書いてある
+LIVE_GROUNDING             = _grounding.LIVE_GROUNDING
+LIVE_GROUNDING_MODELS      = _grounding.LIVE_GROUNDING_MODELS
+LIVE_GROUNDING_THINKING    = _grounding.LIVE_GROUNDING_THINKING
+LIVE_GROUNDING_TIMEOUT_SEC = _grounding.LIVE_GROUNDING_TIMEOUT_SEC
+# 「調べる必要があるコメントか」の判定（ローカルの ollama。API は叩かない）
+LIVE_GROUNDING_GATE             = _grounding.LIVE_GROUNDING_GATE
+LIVE_GROUNDING_GATE_MODEL       = _grounding.LIVE_GROUNDING_GATE_MODEL
+LIVE_GROUNDING_GATE_TIMEOUT_SEC = _grounding.LIVE_GROUNDING_GATE_TIMEOUT_SEC
+LIVE_GROUNDING_GATE_KEEPALIVE   = _grounding.LIVE_GROUNDING_GATE_KEEPALIVE
+LIVE_GROUNDING_GATE_LOAD_SEC    = _grounding.LIVE_GROUNDING_GATE_LOAD_SEC
 
 # ── DB（botたんの記憶） ───────────────────────────
 # ── biorhythm（energy） ──────────────────────────

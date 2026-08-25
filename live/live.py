@@ -45,6 +45,11 @@ from config import (
     SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT,
     WORK_DIR, ensure_dirs,
 )
+# 調べもの（Google 検索）の原典は common/ 側にある。live/ に同名モジュールは
+# 無いので、他の live モジュールのように `import grounding` とは書けない。
+# **config より後に置くこと。** `python live/live.py` だと sys.path[0] が live/ に
+# なり、リポジトリのルートを sys.path へ足しているのは config（live/config.py:17-18）
+from common import grounding  # noqa: E402
 
 # LLM が落ちたときに使う定型。無言になるよりはよい
 FALLBACK_LINES = [
@@ -125,6 +130,11 @@ class LiveSession:
 
         print("[準備] 読み辞書を確認します")
         voice.preload_pronunciations()
+
+        # 調べるかどうかの判定モデルを先に GPU へ載せておく。冷えたまま配信を
+        # 始めると、最初の数コメントだけ判定に3秒前後かかる（common/grounding.py）
+        print("[準備] 調べもの判定モデルを温めます")
+        grounding.warmup()
         print("[準備] VOICEVOX を確認します")
         speaker = voice.health_check()
         print(f"[準備] 話者: {speaker}")
@@ -492,6 +502,17 @@ class LiveSession:
         bot = self._bot_context()
         t_ctx = time.monotonic()
 
+        # 聞かれたことを調べる。**返答生成の前に済ませる。**
+        # 何かを聞いているコメントだけを通す。あいさつや感想まで毎回 API へ
+        # 出すと、1件につき1リクエストと約1秒を捨てることになる
+        # （なぜ返答生成に検索を相乗りできないかは common/grounding.py を参照）
+        if grounding.needs_lookup(comment.text):
+            search = grounding.lookup(
+                f"視聴者「{comment.author}」のコメント：{comment.text}")
+        else:
+            search = {"status": grounding.SKIP, "facts": "", "queries": []}
+        t_search = time.monotonic()
+
         # 場の流れは messages のマルチターンで、この人とのやりとりは本文で渡す。
         # 流れに残っているターンを本文にも書くと二重になるので、id() で取り除く
         # （同じ dict を ConversationLog が両方から参照している）
@@ -507,6 +528,7 @@ class LiveSession:
             is_first_time=first, is_super_chat=comment.is_super_chat,
             user_history=user_history,
             used_terms=self.planner.used_terms(),
+            search=search,
         )
         reply = self._generate(prompt, history)
         t_llm = time.monotonic()
@@ -523,8 +545,12 @@ class LiveSession:
         started = self._speech_started_at
         print(f"[live] 反応まで {started - comment.received_at:.1f}秒 "
               f"(待ち {t_pop - comment.received_at:.1f} / "
-              f"DB {t_ctx - t_pop:.1f} / LLM {t_llm - t_ctx:.1f} / "
-              f"合成 {started - t_llm:.1f})")
+              f"DB {t_ctx - t_pop:.1f} / 調べもの {t_search - t_ctx:.1f} / "
+              f"LLM {t_llm - t_search:.1f} / 合成 {started - t_llm:.1f})")
+        # 何をどう調べたかを残す。調べたのに的外れな返事をした、を後から
+        # 切り分けられるのはここだけ（検索クエリはAPIの応答にしか出ない）
+        print(f"[live] 調べもの: {search['status']}"
+              + (f" {search['queries']}" if search.get("queries") else ""))
 
         self.replied_count += 1
         # energy はここでは足さない。下の memory.save_comment() が入れた行を
@@ -619,12 +645,22 @@ class LiveSession:
             print(f"[live] 掘り下げの資料を引けません（無視します）: {e}")
             material = None
 
+        # 掘り下げはコメントが途切れているときにしか走らないので、ここでの往復は
+        # 視聴者を待たせない。それでも判定は通す。テーマは「コメント＋自分の返答」
+        # （_begin_thread）なので、聞かれていないテーマまで毎回 Gemini へ出すと、
+        # 沈黙が続くほどリクエストだけが増える
+        theme = thread["theme"]
+        if grounding.needs_lookup(theme):
+            search = grounding.lookup(f"配信で話している話題：{theme}")
+        else:
+            search = {"status": grounding.SKIP, "facts": "", "queries": []}
         prompt = persona.build_followup_prompt(
             thread["theme"],
             material["hint"] if material else None,
             self._bot_for_prompt(self._bot_context()),
             recent_replies=self.conversation.recent_replies(),
             origin=thread.get("origin", ""),
+            search=search,
         )
         history = persona.build_history(self.conversation.recent_turns())
         reply = self._generate(prompt, history)
