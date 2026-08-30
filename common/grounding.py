@@ -62,6 +62,7 @@ import re
 import requests
 
 from common.env import env_flag, env_float
+from common.llm import LOCAL_LLM_MODEL, OLLAMA_NUM_CTX, OLLAMA_URL
 
 # 配信でコメントに聞かれたことを調べるか。**切れば即座に従来の動作へ戻る。**
 LIVE_GROUNDING = env_flag("LIVE_GROUNDING", True)
@@ -84,16 +85,28 @@ LIVE_GROUNDING_TIMEOUT_SEC = env_float("LIVE_GROUNDING_TIMEOUT_SEC", 8.0)
 #   off   … 判定せず全コメントを調べる（Gemini へのリクエストがコメント数ぶん増える）
 # llm でも ollama に届かなければ regex へ落ちるので、切り替えは緊急用
 LIVE_GROUNDING_GATE = os.getenv("LIVE_GROUNDING_GATE", "llm").strip().lower()
-# 判定用のローカルモデル。common/ardy.py:75 と同じく OLLAMA_URL は `/v1` を付けない
-# （common/llm.py の LOCAL_LLM_URL は OpenAI 互換の `/v1` 付きなので流用できない）
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-LIVE_GROUNDING_GATE_MODEL = os.getenv("LIVE_GROUNDING_GATE_MODEL", "gemma3:4b")
-# 判定に許す秒数。超えたら正規表現へ落ちる。実測は温まっていれば 0.44秒、
-# 冷えた状態からの読み込み込みで 3.0〜5.9秒（それは warmup() で先に払う）
+# 判定用のローカルモデル。**返答生成と同じモデルを使うこと。**
+#
+# 以前は専用に gemma3:4b を指していたが、返答生成が Gemma 4 26B（13.1GB）に
+# 移ったことで、4b を別に載せると 16GB の VRAM に収まらなくなった。実際 2026-08-30 の
+# 配信では 503 で載らず、判定は正規表現へ降格していた。
+# モデルを揃えれば ollama は同じ runner を使い回すので、追加の VRAM は要らない。
+LIVE_GROUNDING_GATE_MODEL = os.getenv("LIVE_GROUNDING_GATE_MODEL", LOCAL_LLM_MODEL)
+# 判定に許す秒数。超えたら正規表現へ落ちる。
+#
+# 26B に寄せたあとの実測（アイドル時）: 0.37〜0.47秒・取りこぼし 0/8。
+# 専用の gemma3:4b（中央値 0.44秒）より速い。読み込みは warmup() で先に払う（実測16秒）。
+# **CPU が飽和しているとここを超える。** 収録パイプラインの Unity は Xvfb（llvmpipe＝
+# ソフトウェア描画）で CPU を食い切るため、その最中の判定は軒並みタイムアウトした
+# （load average 9.6 のとき 4/8 が 5秒超）。配信の Unity は :99 の実GPU なので
+# 条件は違うが、OBS の x264 と CPU 版 VOICEVOX が同時に走る。配信で実測すること
 LIVE_GROUNDING_GATE_TIMEOUT_SEC = env_float("LIVE_GROUNDING_GATE_TIMEOUT_SEC", 5.0)
-# 判定モデルを GPU に載せておく時間。配信は1時間で、準備を含めると 20:40〜22:00。
-# 短いと配信の途中で降ろされ、次のコメントで読み込み直しの数秒を食う
-LIVE_GROUNDING_GATE_KEEPALIVE = os.getenv("LIVE_GROUNDING_GATE_KEEPALIVE", "90m")
+# 判定モデルを GPU に載せておく時間。**空にすると keep_alive を送らない。**
+#
+# 判定モデルが返答生成と同じ共有 runner になったので、ここで keep_alive を送ると
+# ollama.service の OLLAMA_KEEP_ALIVE=-1（常駐）を上書きしてしまい、
+# 同じ ollama を使う他のサービスまで巻き込んで降ろされる。既定は送らない。
+LIVE_GROUNDING_GATE_KEEPALIVE = os.getenv("LIVE_GROUNDING_GATE_KEEPALIVE", "")
 # warmup() だけに使う上限。モデルの読み込みぶんを待つ。配信前なので長くてよい
 LIVE_GROUNDING_GATE_LOAD_SEC = env_float("LIVE_GROUNDING_GATE_LOAD_SEC", 120.0)
 
@@ -206,18 +219,21 @@ def _gate_ask(text: str, timeout: float = None) -> bool:
     body = {
         "model": LIVE_GROUNDING_GATE_MODEL,
         "stream": False,
-        # 配信のあいだ GPU に載せたままにする。降ろされると次のコメントで
-        # 読み込み直しの数秒を食い、そのぶん反応が遅れる
-        "keep_alive": LIVE_GROUNDING_GATE_KEEPALIVE,
         "messages": [
             {"role": "system", "content": _GATE_SYSTEM},
             {"role": "user", "content": f"コメント：{text} ->"},
         ],
         # YES / NO の一語しか要らない。num_predict を絞らないと、
-        # 理由を喋り始めて判定が1秒を超える
-        "options": {"temperature": 0, "num_predict": 4, "num_ctx": 2048},
+        # 理由を喋り始めて判定が1秒を超える。
+        #
+        # **num_ctx は common/llm.py と同じ値でなければならない。** 以前ここだけ
+        # 2048 にしていた。ollama は num_ctx が違うと runner を作り直すので、
+        # 判定のたびに 26B がもう1つロードされることになる
+        "options": {"temperature": 0, "num_predict": 4, "num_ctx": OLLAMA_NUM_CTX},
         "think": False,
     }
+    if LIVE_GROUNDING_GATE_KEEPALIVE:
+        body["keep_alive"] = LIVE_GROUNDING_GATE_KEEPALIVE
     response = requests.post(
         OLLAMA_URL + _OLLAMA_CHAT, json=body,
         timeout=LIVE_GROUNDING_GATE_TIMEOUT_SEC if timeout is None else timeout)

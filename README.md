@@ -50,8 +50,8 @@ logs/             pipeline_* quiz_* live_* ardy_*
                    ↑ HTTP :2338      │
                    └──────────┬──────┘
                        [live/live.py]
-                              ├→ VOICEVOX      localhost:10101 (speaker=8)
-                              ├→ Gemini        OpenAI互換エンドポイント（返答生成）
+                              ├→ VOICEVOX      localhost:10101 (speaker=8, CPU)
+                              ├→ ollama        localhost:11434 /api/chat（返答生成）
                               ├→ Gemini        native REST + googleSearch（調べもの）
                               ├→ ollama        localhost:11434（調べるか否かの判定）
                               ├→ ARDY          127.0.0.1:2337（非同期）
@@ -231,13 +231,41 @@ Already in non_texture encoder, can't fall back further!
 Stream output type 'rtmp_output' failed to start!
 ```
 
-GPU は 8GB しかなく、ARDY・Unity・VOICEVOX（と常駐している ollama）で埋まっていて
-NVENC のぶんが残らない。**OBS はここからソフトウェアエンコーダへ落ちてくれない**
-ので、はじめから x264 を指定する。1080p30 なら CPU 側に余裕がある。
+GPU が ARDY・Unity・ollama で埋まっていて NVENC のぶんが残らない。
+**OBS はここからソフトウェアエンコーダへ落ちてくれない**ので、はじめから x264 を
+指定する。1080p30 なら CPU 側に余裕がある。
 
-調べもの機能（`common/grounding.py`）の判定モデル `gemma3:4b` も、配信のあいだ
-GPU に約3GB 常駐する（`LIVE_GROUNDING_GATE_KEEPALIVE`）。ここが苦しくなったら
-`LIVE_GROUNDING_GATE=regex` にすれば GPU を一切使わなくなる。
+VRAM の内訳（RTX 5070 Ti / 16,303 MiB）:
+
+| | VRAM |
+|---|---|
+| ollama `llama-server`（gemma-4-26B UD-IQ3_S, num_ctx 16384, KV q8_0） | 13,166 MiB |
+| ARDY engine（テキストエンコーダは CPU） | 1,102 MiB |
+| Unity（**配信のみ**。`:99` の実GPU Xorg） | 408 MiB |
+| Xorg(:0 + :99) + gnome-shell | 251 MiB |
+| **配信中の合計 / 総容量** | **15,092 / 16,303 MiB（空き 1.2GB）** |
+
+**配信構成は 16GB に収まる**（2026-08-30 実測）。ただし余裕は 1.2GB しかない。
+OBS を NVENC にすると足りなくなるので x264 のままにすること（下の「OBS」を参照）。
+別ホストの bsky-affirmative-bot が使う埋め込みモデル（snowflake-arctic-embed2, 1.2GB）は
+**配信中は載らない**。
+
+**収録パイプラインの Unity は VRAM を使わない。** `:100` の Xvfb（Mesa llvmpipe＝
+CPUソフトウェアラスタライザ）へ描くので `nvidia-smi` に出てこない。
+代わりに CPU を食い切る（実測 load average 9.6）ので、**収録中はローカルLLMの
+応答が遅くなる**。配信の Unity は `:99` の実GPU Xorg なので、そちらだけ VRAM を使う。
+
+**ollama の 26B が常駐しているぶん、余裕はほとんど無い。** 苦しくなったら上から順に:
+
+1. `LIVE_GROUNDING_GATE=regex`（判定に GPU を使わなくなる。ただし返答生成は
+   同じモデルなので、これだけでは 26B は降りない）
+2. リクエストの `options.num_gpu` を絞って MoE エキスパートを CPU へ逃がす
+   （活性 4B の MoE なので速度低下が小さい）
+3. `USE_LOCAL_LLM=false` で Gemini へ戻す（返答生成のぶん 13GB がまるごと空く）
+
+**VOICEVOX は 2026-08-30 から CPU。** 同梱の ONNX Runtime が cuDNN 8 で、
+sm_120（Blackwell）のカーネルを持っていないため GPU では推論できない。
+詳細と実測は `setup/voicevox-compose.yml` の冒頭。
 
 `obsws` の `StartStream` はリクエストが通っただけで成功を返すので、
 `Obs.start_stream()` は実際に `output_active` になるまで確かめる。これを見て

@@ -27,6 +27,10 @@ for arg in "$@"; do
     fi
 done
 
+# 録画パイプラインは配信と違って待てるので、LLM の上限を伸ばす。
+# 配信側（live/）は .env の LLM_TIMEOUT_SEC のまま短く縛る
+export LLM_TIMEOUT_SEC="${LLM_TIMEOUT_SEC:-180}"
+
 LOG_FILE="$SCRIPT_DIR/logs/pipeline_$(date +%Y%m%d_%H%M%S).log"
 
 # 朝版(run_quiz.sh)と共通のロックで直列化する。
@@ -37,6 +41,18 @@ flock -w 3600 /tmp/bottan-render.lock \
 # 保存しないと下の if 文の値がスクリプトの終了コードになり、
 # 非対話実行（systemd）では常に 0 になって失敗が握り潰される
 STATUS=${PIPESTATUS[0]}
+
+# 失敗を無人で握り潰さない。
+# 2026-08-29 の GPU 交換で VOICEVOX と Unity が同時に壊れたとき、
+# systemd の failed 状態は残るのに誰も見ておらず、丸1日ぶん取りこぼした。
+if [ "$STATUS" -ne 0 ]; then
+    "$SCRIPT_DIR/venv/bin/python" -c "
+import sys
+sys.path.insert(0, '$SCRIPT_DIR')
+from common import notify
+notify.error('夜のShorts', open('$LOG_FILE', errors='replace').read()[-1500:])
+" 2>/dev/null || true
+fi
 
 # 端末から実行された場合のみtail -f
 if [ -t 1 ]; then

@@ -21,11 +21,23 @@ import requests
 from common.env import env_flag, LOGS_DIR
 from common import motion_safety
 
+# エンジン一式（venv 7.2GB + hf-cache 17GB）の置き場。**中身は SSD にあること。**
+# ここは venv/bin/python と HF_HOME の親で、起動のたびに全部読み直される。
+#
+# 2026-08-30 に実体を SSD (/home/suibari/ardy-engine) へ移し、この既定値は
+# そこへの symlink になっている。venv には絶対パスが焼き込まれているため
+# （site-packages の __editable___ardy_0_2_0_finder.py が ardy/ を直接指す）、
+# パスを変えずに symlink で差し替えるのが一番安全。
+#
+# 実測（1.5GB を direct I/O で読む）:
+#   HDD  /mnt/data (WDC WD20EARX)  89 MB/s
+#   SSD  /         (KIOXIA SATA)  442 MB/s
+# ready までの時間は 175秒 → 101秒 になった。
 ARDY_ENGINE_ROOT = os.getenv("ARDY_ENGINE_ROOT", "/mnt/data/ardy-engine")
 # テキストエンコーダ(15GB)の置き場。ARDY_ENGINE_ROOT とは別に指定できる。
-# 実測: HDD(sda1) 41〜111MB/s に対し SSD(sdb2) 384MB/s。
 # HDD 上だと mmap のランダム読みで ready まで530秒以上かかり
-# ARDY_READY_TIMEOUT に間に合わないため、ここだけ SSD に置く
+# ARDY_READY_TIMEOUT に間に合わないため、ここだけ先に SSD へ移してあった
+# （エンジン一式が SSD へ移った今も、別指定できる状態は残しておく）
 ARDY_MERGED_BASE = os.getenv("ARDY_MERGED_BASE",
                              str(Path(ARDY_ENGINE_ROOT) / "llm2vec-base-merged"))
 ARDY_REPO = os.getenv("ARDY_REPO", "/home/suibari/work/text-to-vrma")
@@ -144,7 +156,7 @@ _available_cache: bool | None = None
 def available(fallback_msg: str = FALLBACK_MSG_SHORTS) -> bool:
     """エンジン一式が揃っているか。別ドライブ未マウント時などに False になる。
 
-    中の `import ardy` は HDD 上の venv を読むので冷えていると数十秒かかる。
+    中の `import ardy` は venv を読むので、冷えていると数秒かかる。
     結果をキャッシュして1回で済ませる。
     """
     global _available_cache

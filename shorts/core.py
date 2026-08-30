@@ -13,9 +13,9 @@ botたん動画パイプライン 共通処理
 
 環境変数:
   GEMINI_API_KEY      : Gemini APIキー (USE_LOCAL_LLM=false時)
-  USE_LOCAL_LLM       : true でOllama使用、false でGemini使用 (デフォルト: false)
+  USE_LOCAL_LLM       : true でOllama(Gemma 4 26B)、false でGemini (デフォルト: true)
+                        num_ctx は common/llm.py の定数。env では変えられない
   LOCAL_LLM_MODEL     : Ollamaで使うモデル名
-  LOCAL_LLM_CTX       : OllamaのコンテキストサイズOverride (デフォルト: 8192)
   GEMINI_MODEL        : Geminiのモデル名 (カンマ区切りで複数指定可、左から順にフォールバック)
   VOICEVOX_URL        : VOICEVOXのURL (デフォルト: http://localhost:10101)
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)
@@ -102,8 +102,9 @@ FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
 WAV_RATE     = _voice.WAV_RATE
 WAV_CHANNELS = _voice.WAV_CHANNELS
 
-# LLMクライアントは common/llm.py で初期化済み。ここは後方互換の再輸出
-llm_client = _llm.client
+# LLM の実体は common/llm.py。ここは後方互換の再輸出。
+# **client は再輸出しない。** ローカル経路では OpenAI クライアントを作らないので
+# None になり、掴んだ側が黙って壊れる（呼ぶべきは _llm.create のほう）
 LLM_MODELS = _llm.LLM_MODELS
 LLM_MODEL  = _llm.LLM_MODEL
 

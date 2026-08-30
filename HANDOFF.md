@@ -921,3 +921,222 @@ audio_query は LAN 内で数十ms、夜版で15回程度。録画パイプラ�
 import 時だけ差し替えて戻すように直した。
 
 実行は `./venv/bin/python -m unittest discover -s tests -t .`（pytest は入っていない）。
+
+---
+
+# 追記: GPU交換に伴う全滅からの復旧 + Gemma 4 26B ローカル化 + ARDY を SSD へ（2026-08-30）
+
+## 発端
+
+3つのパイプライン（夜のShorts 18:00 / 朝のクイズ 06:00 / 夜の配信 21:00）が全滅していた。
+**コードには不具合が無い。原因はすべて 8/29 の GPU 交換（RTX 3060 Ti → RTX 5070 Ti）と、
+そのあとの `apt purge *nvidia* cuda* *cublas*` → `nvidia-driver-595-open` 再インストール。**
+
+同時に3つ壊れていて、しかも**どれも直前のステップまでは正常に動く**ので、
+ログの最後だけ見ても「VOICEVOX が 500」としか分からなかった。
+
+### 1. VOICEVOX の GPU 推論（Shorts・クイズが落ちた直接原因）
+
+```
+CUDA error cudaErrorNoKernelImageForDevice: no kernel image is available for execution on the device
+voicevox_engine.core.core_wrapper.CoreError: 推論に失敗しました
+INFO: "POST /synthesis?speaker=8 HTTP/1.1" 500 Internal Server Error
+```
+
+コンテナが同梱するのは **cuDNN 8** + CUDA 12（`/opt/voicevox_engine/libcudnn.so.8`）。
+cuDNN 8 に sm_120（Blackwell）のカーネルは無いので、RTX 5070 Ti では推論が通らない。
+`audio_query` は CPU なので 200 で返り、必ずその次の `/synthesis` で落ちる。
+初回発生 08-30 01:08、以降 `/synthesis` は 35/35 が 500。
+
+`nvidia-ubuntu24.04-latest` も試したが **`nvidia-latest` と同一ダイジェスト**
+（f77258b7239b）で、中身も cuDNN 8 のままだった。**GPU には戻せない。**
+
+→ **CPU 版へ移行**した。`setup/voicevox-compose.yml` を追加し、`docker run` の手打ちを廃止。
+実測（i5-12400F / 6スレッド、speaker=8）:
+
+| 文字数 | 合成 | 音声長 |
+|---|---|---|
+| 14字 | 0.51秒 | 2.17秒 |
+| 34字 | 0.94秒 | 5.65秒 |
+| 53字 | 1.28秒 | 8.44秒 |
+| 92字 | 1.98秒 | 13.79秒 |
+
+実時間の5〜7倍速。配信の1発話（30〜50字）で約1秒なので実用上問題ない。
+おまけに VRAM が 560MiB 空く。
+
+### 2. Unity Editor のライセンス（配信が落ちた直接原因）
+
+```
+[Unity.Licensing.EntitlementResolver.ContextValidator] Legacy MachineBinding validation failed
+  Legacy.MachineBinding1: License value (8674bead…) != Current context (2d06c2dc…)
+No valid Unity Editor license found. Please activate your license.
+```
+
+GPU 交換でマシン指紋が変わり、`~/.config/unity3d/Unity/licenses/UnityEntitlementLicense.xml`
+（最終更新 8/29 20:41 = 交換前）が無効になった。Unity が起動しないので
+`[Unity] LiveController の応答を待っています（最大420秒）` でタイムアウトし、
+8/30 の配信は **返事したコメント 0件**で終わった。**Unity Hub でサインインし直して復旧。**
+
+**ハードウェアを替えたら Unity のライセンスも取り直す**、と覚えておくこと。
+Shorts・クイズも `record_with_unity` で同じ Unity を使うので、
+VOICEVOX を直しても次はここで止まる。
+
+### 3. `nvidia-container-toolkit` が purge されたまま
+
+`nvidia-ctk` も `nvidia-container-runtime` も無い。いま動いている voicevox コンテナが
+GPU を掴めていたのは purge 前に起動したものだったからで、**一度でも再起動すると
+GPU デバイスを取れなくなる**状態だった。CPU 化したので当面は要らないが、
+`/etc/docker/daemon.json` は存在しない `nvidia-container-runtime` を参照したままなので、
+GPU コンテナを使う日が来たら入れ直すこと。
+
+### 4. VRAM 逼迫（副次的だが実害が出ていた）
+
+`ollama.service` が `OLLAMA_KEEP_ALIVE=-1` で Gemma 4 26B を常駐させ、13,166 MiB を占有。
+そのせいで調べもの判定の `gemma3:4b` が **503** で載らず、配信中の判定は語句へ降格していた。
+別ホスト（192.168.1.44）の bsky-affirmative-bot からの `/v1/embeddings` も 503 だった。
+
+## Gemma 4 26B への移行
+
+`bsky-affirmative-bot` の commit `020ae31` と同じ設計。**この PC の ollama は
+あちらと共用**（あちらは 192.168.1.44 から接続）なので、runner を割らないことが最優先。
+
+### なぜ OpenAI 互換ではだめなのか
+
+`USE_LOCAL_LLM=true` は前から在ったが、**そのままでは動かなかった**。
+`/v1/chat/completions` に `extra_body={"options":{"num_ctx":…},"think":False}` を
+渡していたが、**Ollama はこれをエラーにせず黙って捨てる**。結果:
+
+- `num_ctx` が既定の 4096 に落ちる。配信のペルソナだけで 7,400字あるので**応答が空文字**
+- `think` が効かず、思考ぶんが生成上限を食う
+
+→ ローカル経路をネイティブ `/api/chat` に移した（`common/llm.py` の `_call_ollama`）。
+`num_ctx` は **16384 のコード定数**にし、env では変えられなくした。
+bsky 側の `OLLAMA_TEXT_CONTEXT_LENGTH` と同値。**ずらすと 26B の runner が2つ立ち、
+13GB × 2 で 16GB の VRAM に入らない。**
+
+呼び出し側は一切変えていない。`_call_ollama` が
+`response.choices[0].message.content` / `.finish_reason` の形に包んで返す。
+
+### 落とし穴: 構造化出力のキーは**アルファベット順**に生成される
+
+Ollama の `format` は llama.cpp の文法に変換されるが、その過程で**プロパティ名が
+ソートされる**。実測:
+
+```
+スキーマ {zebra, apple, mango} → 出力 {"apple":…, "mango":…, "zebra":…}
+```
+
+Gemini は宣言順を尊重するので、**経路で振る舞いが違う**。しかも LLM は前から書くので、
+**キーの順序がそのまま思考の順序になる。**
+
+朝のクイズがこれで壊れた。`question_intro → answer_reveal → explanation → affirmation`
+の順で書かせたいのに、先頭に来た `affirmation` に台本が丸ごと入り、他が空で返って
+テンプレートへフォールバックしていた。`_SENTENCE_M` も
+`arousal → motion → text → valence` の順になるので、**text より先に motion を書かされ**、
+`"motion": "motions.think"` のような壊れた値が入っていた。
+
+→ プロンプト側に「キーはアルファベット順に出力される」「各キーには担当ぶんだけ入れる」
+「motion より先に、その文で何を言うかを決める」と明示して解決。修正後は3問とも正常:
+
+```
+question_intro : 勘違いクイズ！ / 「情けは人の為ならず」の意味は、どっち？
+answer_reveal  : 正解は、Bだよ！
+explanation    : 情けをかけると、巡り巡って自分に良い報いが返ってくるという意味なんだよ。
+affirmation    : 優しさが自分に返ってくるって、素敵だよね。
+```
+
+**スキーマを新しく足すときは `sorted(properties)` を見て、その順で書かされても
+成立するプロンプトになっているか確かめること。**
+
+### 実測（Gemma 4 26B A4B UD-IQ3_S / num_ctx 16384）
+
+| | 所要 |
+|---|---|
+| 配信の1返答（REPLY_SCHEMA・ペルソナ7,400字） | 1.9〜4.2秒（runner が冷えた初回のみ 6.9秒） |
+| クイズ台本1本 | 3.7〜13.7秒 |
+| 夜のShorts 台本1本 | 13.6秒 |
+| 調べもの判定（アイドル時） | 0.6〜3.1秒 |
+
+`think:false` が効いていることは `message` に `thinking` が付かないことで確認済み。
+
+### 調べもの判定を 26B に寄せた
+
+`LIVE_GROUNDING_GATE_MODEL` の既定を `gemma3:4b` から `LOCAL_LLM_MODEL` に変更。
+別モデルにすると runner が増えて VRAM に入らない（これが 8/30 の 503 の正体）。
+`_gate_ask` の `num_ctx` も 2048 → 16384 に揃えた。**ここがずれるだけで 26B が
+もう1つロードされる。** `keep_alive` は送らないようにした（共有 runner の
+`OLLAMA_KEEP_ALIVE=-1` を上書きしてしまうため）。
+
+判定は **0.37〜0.47秒・8/8 正解**（アイドル時）。専用に載せていた gemma3:4b の
+中央値 0.44秒より速く、VRAM も増えない。warmup は 16秒。
+
+ただし**CPU が飽和すると 5秒のタイムアウトに引っかかる**。収録時の Unity は
+`:100`（Xvfb = llvmpipe のソフトウェア描画）で CPU を食い切るため、
+そのあいだの判定は 4/8 がタイムアウトして語句判定へ落ちた（load average 9.6）。
+配信時の Unity は `:99` の実GPU なので条件は違うが、OBS の x264 と CPU 版 VOICEVOX が
+同時に走る。**配信で要再確認。**
+
+## ARDY を SSD へ
+
+`/mnt/data`（sdb1 = WDC WD20EARX **HDD**）に 38GB 置いてあった。
+`/`（sda2 = KIOXIA SATA **SSD**）へ移した。
+
+- `common/ardy.py:26` のコメントは「HDD(sda1) … SSD(sdb2)」と**デバイス名が逆**だった。
+  実測し直して直した: HDD 89 MB/s / SSD 442 MB/s（1.5GB を direct I/O）
+- **symlink 方式**を採った。`/home/suibari/ardy-engine` へ実体を移し、
+  `/mnt/data/ardy-engine` を symlink にした。venv に絶対パスが焼き込まれている
+  （`site-packages/__editable___ardy_0_2_0_finder.py` が `/mnt/data/ardy-engine/ardy/ardy`
+  を直接指す、`venv/bin/` の32ファイル）ため、パスを変えずに差し替えるのが一番安全。
+  ちなみに `pyvenv.cfg` の `command` は `/media/suibari/6ADC35FFDC35C65B/…` のままで、
+  **この venv は既に一度引っ越している**（実害が無いのは依存が上記に限られるから）
+- `/mnt/data/ardy-engine/llm2vec-base-merged`（14GB）は移していない。
+  `.env` の `ARDY_MERGED_BASE=/home/suibari/ardy-models/llm2vec-base-merged` と
+  サイズも先頭1MBのmd5も一致する**同一物**で、起動コマンドは後者しか渡していない
+
+**効果: ready まで 175秒 → 101秒。**
+
+旧ディレクトリは `/mnt/data/ardy-engine.old`（38GB）に残してある。
+本番タイマーが一周して問題なければ削ってよい。
+
+## 失敗を握り潰さないようにした
+
+3つとも「その時刻に走って初めて気付く」状態で、systemd の failed 状態は残るのに
+誰も見ていなかった。`run.sh` / `run_quiz.sh` / `run_live.sh` に、
+異常終了時に `common/notify.error` でログ末尾 1,500字 を Discord へ流す処理を足した。
+
+## VRAM は足りた（実測）
+
+配信と同じ構成（Unity を `:99` の実GPU Xorg に出し、ARDY と ollama を載せた状態）を
+`live.py` を通さずに再現して測った。**`live.py` の DRY_RUN は使えない**：
+`live/live.py:256,562` が `broadcast_id="dry-run"` で偽コメントを本番DB
+（`bot_memory_documents` と `comments`）へ書き込み、RAG記憶と energy を汚すため。
+
+| | VRAM |
+|---|---|
+| ollama `llama-server`（26B UD-IQ3_S / num_ctx 16384 / KV q8_0） | 13,166 MiB |
+| ARDY engine | 1,102 MiB |
+| Unity（`:99`） | **408 MiB** |
+| Xorg×2 + gnome-shell | 251 MiB |
+| **合計 / 総容量** | **15,092 / 16,303 MiB（空き 1.2GB）** |
+
+Unity が 408MiB しか使わないので**収まった**。ただし余裕は 1.2GB しかないので、
+OBS は NVENC にせず x264 のままにすること。別ホストの bsky-affirmative-bot が使う
+埋め込みモデル（snowflake-arctic-embed2, 1.2GB）は配信中は載らない。
+
+## 台本が短くなる（ローカル移行の副作用）
+
+夜のShorts の目安は 195文字／30秒。Gemini は 176文字／31.4秒 だったが、
+**Gemma 4 26B は 108文字／21.0秒 しか書かなかった**（55%）。
+プロンプトが上限だけを何度も強調していて（「絶対に超えないこと」「冗長にしない」）、
+素直なモデルほど下へ振り切れる。**下限（165文字）を明示**して 137〜152文字まで戻した。
+まだ Gemini より短いので、配信数本ぶん様子を見て必要なら追い込むこと。
+
+## 残件
+
+- **配信の実地確認。** VRAM は足りたが、1返答あたりの所要（実測 1.9〜4.2秒）が
+  配信のテンポとして許容できるかは実際に回さないと分からない。
+- **夜のShorts の尺。** 上記のとおり、まだ目安の 70〜78% 程度。
+- **共有 runner の直列化。** `OLLAMA_NUM_PARALLEL=1` なので、bsky-affirmative-bot 側の
+  長い生成（実測で最大16秒）の後ろに配信の返答が並ぶ。`LLM_TIMEOUT_SEC=30` × 3試行で
+  最悪 90秒メインループが止まる計算になる。配信で詰まるようなら試行回数を減らすこと。
+- `/etc/docker/daemon.json` が存在しない `nvidia-container-runtime` を参照したまま。

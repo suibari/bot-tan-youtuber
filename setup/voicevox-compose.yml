@@ -1,0 +1,64 @@
+# VOICEVOX ENGINE。`docker compose -f setup/voicevox-compose.yml up -d` で起動する。
+#
+# ## なぜ CPU なのか（2026-08-30）
+#
+# GPU 版は使えない。同梱の ONNX Runtime が cuDNN 8 + CUDA 12 で、**cuDNN 8 には
+# sm_120（Blackwell）のカーネルが無い**。8/29 に GPU を RTX 3060 Ti から
+# RTX 5070 Ti へ替えた時点から、`/synthesis` が全件 500 を返すようになった:
+#
+#   CUDA error cudaErrorNoKernelImageForDevice:
+#   no kernel image is available for execution on the device
+#   voicevox_engine.core.core_wrapper.CoreError: 推論に失敗しました
+#
+# `audio_query` は CPU なので 200 で返る。落ちるのは必ずその次の `/synthesis` で、
+# shorts/pipeline.py と shorts/quiz_pipeline.py の Step3、配信の発話が全滅した。
+#
+# `nvidia-ubuntu24.04-latest` も試したが **`nvidia-latest` と同一ダイジェスト**
+# （f77258b7239b）で、中身も cuDNN 8 のままだった。VOICEVOX 側が Blackwell 対応を
+# 出すまで GPU には戻せない。
+#
+# ## CPU で足りるのか
+#
+# 足りる。i5-12400F / 6スレッドでの実測（speaker=8）:
+#
+#   14字  → 合成 0.41秒（音声 2.17秒）
+#   34字  → 合成 0.89秒（音声 5.65秒）
+#   53字  → 合成 1.48秒（音声 8.44秒）
+#   92字  → 合成 1.93秒（音声 13.79秒）
+#
+# 実時間の5〜7倍速で、配信の1発話（30〜50字）なら約1秒。
+# おまけに VRAM が 560MiB 空くので、ローカル LLM のぶんが増える。
+#
+# ## GPU へ戻すとき
+#
+# 1. `nvidia-container-toolkit` を入れ直す（8/29 の `apt purge *nvidia*` で消えたまま）
+# 2. 下の `deploy:` と `--use_gpu` のコメントを外す
+# 3. `POST /synthesis` が 200 で返ることを必ず確認する。`/supported_devices` は
+#    推論が壊れていても `cuda:true` を返すので、判定に使ってはいけない
+
+services:
+  voicevox:
+    container_name: voicevox
+    image: voicevox/voicevox_engine:cpu-latest
+    restart: unless-stopped
+    ports:
+      - "10101:50021"
+    volumes:
+      # 読み辞書。common/pronunciation.py が起動のたびに流し込む
+      - /home/suibari/voicevox_user_dict:/home/user/.local/share/voicevox-engine
+    command:
+      - gosu
+      - user
+      - /opt/voicevox_engine/run
+      - --host
+      - 0.0.0.0
+      # 物理6コア。上げても合成は速くならず、収録中の ffmpeg と食い合う
+      - --cpu_num_threads
+      - "6"
+      # GPU へ戻すときはここに --use_gpu を足し、image を nvidia-latest にして
+      # 下の deploy: のコメントを外す
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - capabilities: [gpu]

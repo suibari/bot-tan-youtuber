@@ -97,7 +97,10 @@ WAV_CHANNELS = _voice.WAV_CHANNELS
 USE_LOCAL_LLM   = _llm.USE_LOCAL_LLM
 GEMINI_API_KEY  = _llm.GEMINI_API_KEY
 GEMINI_BASE_URL = _llm.GEMINI_BASE_URL
-LOCAL_LLM_URL   = _llm.LOCAL_LLM_URL
+# ネイティブ /api/chat のルート（`/v1` は付かない）。OpenAI 互換では num_ctx を
+# 渡せないので、ローカル生成はすべてネイティブを使う。理由は common/llm.py
+OLLAMA_URL      = _llm.OLLAMA_URL
+OLLAMA_NUM_CTX  = _llm.OLLAMA_NUM_CTX
 LOCAL_LLM_MODEL = _llm.LOCAL_LLM_MODEL
 # カンマ区切りで複数指定でき、左から順にフォールバックする
 GEMINI_MODELS   = _llm.GEMINI_MODELS

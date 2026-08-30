@@ -32,6 +32,17 @@ QUIZ_SYSTEM_PROMPT = CHARACTER_PROMPT + """
 - 「諸説あります」のような逃げの言い回しは入れない
 
 【出力ルール】
+- **ローカルLLM（Ollama）では JSONのキーが名前のアルファベット順で出力される。**
+  その場合の書く順番は affirmation → answer_reveal → explanation → motions →
+  question_intro → thumbnail_text → title_hook になる。
+  下の①〜⑦は動画の**再生順**であって、書く順ではない。
+  **各キーには、そのキーの担当ぶんだけを入れること。**
+  いちばん最初に書く affirmation に台本を丸ごと入れてしまう事故が実際に起きた。
+  書き始める前に、頭の中で①〜⑦を全部組み立ててから、キーの順に取り出して書くこと。
+- sentence の中のフィールドも同じ理由で arousal → motion → text → valence の順に
+  なりうる。**text より先に motion を書かされる**ので、
+  「どんな文を言うか」を決めてから motion を書くこと。
+  motion は必ず英文で書く（"motions.think" のようなキー名を入れてはいけない）。
 - 日本語のみで出力する
 - textフィールドに[Happy][Sad]などの感情タグを含めないこと。感情はvalence/arousalで表現する
 - 1文は短く区切る（字幕が読みやすくなる）

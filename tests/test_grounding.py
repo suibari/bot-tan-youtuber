@@ -120,11 +120,27 @@ class LlmGateTest(unittest.TestCase):
         self.assertEqual(body["model"], grounding.LIVE_GROUNDING_GATE_MODEL)
         # 理由を喋り始めると判定が1秒を超える
         self.assertEqual(body["options"]["num_predict"], 4)
-        # 配信の途中で GPU から降ろされると、次のコメントで読み込み直しになる
-        self.assertEqual(body["keep_alive"], grounding.LIVE_GROUNDING_GATE_KEEPALIVE)
+        # keep_alive は既定では送らない。判定と返答生成が同じ runner になったので、
+        # ここで送ると ollama.service の OLLAMA_KEEP_ALIVE=-1 を上書きしてしまう
+        self.assertNotIn("keep_alive", body)
 
         with patch.object(grounding.requests, "post", return_value=gate_reply("NO")):
             self.assertFalse(grounding.needs_lookup("こんばんはー！"))
+
+    def test_gate_shares_the_runner_with_reply_generation(self):
+        """判定だけ別モデル・別 num_ctx にすると、26B の runner がもう1つ立つ。
+
+        VRAM は 16GB しかないので 13.1GB のモデルは1つしか載らない。
+        2026-08-30 の配信では判定用の gemma3:4b が 503 で載らず、
+        調べもの判定がまるごと語句へ降格していた。
+        """
+        from common import llm
+        self.assertEqual(grounding.LIVE_GROUNDING_GATE_MODEL, llm.LOCAL_LLM_MODEL)
+        with patch.object(grounding.requests, "post",
+                          return_value=gate_reply("YES")) as post:
+            grounding.needs_lookup("東京タワーの高さしってる")
+        body = post.call_args.kwargs["json"]
+        self.assertEqual(body["options"]["num_ctx"], llm.OLLAMA_NUM_CTX)
 
     def test_ollama_failure_falls_back_to_the_regex(self):
         # ollama が落ちていても配信は続ける

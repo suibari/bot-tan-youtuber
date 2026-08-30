@@ -6,9 +6,9 @@ botたん YouTube Shorts 自動投稿パイプライン
   GEMINI_API_KEY      : Gemini APIキー (USE_LOCAL_LLM=false時)
   YOUTUBE_CLIENT_ID   : YouTube OAuth2 クライアントID
   YOUTUBE_CLIENT_SECRET: YouTube OAuth2 クライアントシークレット
-  USE_LOCAL_LLM       : true でOllama使用、false でGemini使用 (デフォルト: false)
+  USE_LOCAL_LLM       : true でOllama(Gemma 4 26B)、false でGemini (デフォルト: true)
+                        num_ctx は common/llm.py の定数。env では変えられない
   LOCAL_LLM_MODEL     : Ollamaで使うモデル名 (デフォルト: hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M)
-  LOCAL_LLM_CTX       : OllamaのコンテキストサイズOverride (デフォルト: 8192)
   GEMINI_MODEL        : Geminiのモデル名 (デフォルト: gemini-2.0-flash)
   VOICEVOX_URL        : VOICEVOXのURL (デフォルト: http://localhost:10101)
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)
@@ -41,7 +41,7 @@ from thumbnail import capture_thumbnail_frame, generate_thumbnail
 # 既存の `from pipeline import ...` を壊さないよう、ここで再エクスポートする。
 from core import (  # noqa: F401
     VOICEVOX_URL, VOICEVOX_SPEAKER, UNITY_EXE, UNITY_PROJECT, BGM_PATH,
-    USE_LOCAL_LLM, llm_client, LLM_MODELS, LLM_MODEL, DB_CONFIG,
+    USE_LOCAL_LLM, LLM_MODELS, LLM_MODEL, DB_CONFIG,
     W, H, FONT_PATH,
     _timed, _retry, _llm_create, parse_script_json, llm_json,
     _rescale_va, enforce_variance, build_emotion_timeline,
@@ -212,24 +212,19 @@ def generate_script(data: dict, comments: list[dict] = None, corner_context: dic
 
     user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context,
                                     closing_mood=closing_mood)
-    extra_kwargs: dict = {}
-
-    if USE_LOCAL_LLM:
-        # Gemma(Ollama)はresponse_schema非対応のため構造化出力不可
-        extra_kwargs["extra_body"] = {
-            "options": {"num_ctx": int(os.getenv("LOCAL_LLM_CTX", "8192"))},
-            "think": False,
-        }
-    else:
-        # Gemini OpenAI互換エンドポイントの構造化出力はresponse_formatで渡す
-        # （extra_bodyにresponse_mime_type/response_schemaを渡すと400エラーになる）
-        extra_kwargs["response_format"] = {
+    # スキーマは経路によらず response_format で渡す。Gemini はそのまま
+    # OpenAI 互換で受け、Ollama は common/llm.py が native の format へ写す。
+    # （extra_body に response_mime_type/response_schema を渡すと Gemini は400になる。
+    #   逆に Ollama へ extra_body で options を渡しても黙って捨てられる）
+    extra_kwargs: dict = {
+        "response_format": {
             "type": "json_schema",
             "json_schema": {
                 "name":   "script",
                 "schema": SCRIPT_SCHEMA,
             },
         }
+    }
 
     response = _llm_create(
         messages=[
