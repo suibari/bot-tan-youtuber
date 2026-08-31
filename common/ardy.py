@@ -241,7 +241,7 @@ def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
     （そのサーバーは stop() で落とさない）。エンジンが無い場合も None を返す。
     起動できたかどうかは wait_ready() で判定すること。
 
-    low_priority=True にすると ionice/nice を噛ませて優先度を下げる。読み込みの
+    low_priority=True にすると ionice を噛ませて I/O の優先度を下げる。読み込みの
     完了を待たずに裏で走らせる録画側で使う。配信側は使わない（配信前に読み込みの
     完了を待つので発話とは競合せず、下げると配信の開始が遅れるだけ）。
     """
@@ -278,16 +278,17 @@ def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
            "--port", str(ARDY_PORT),
            "--merged-base", ARDY_MERGED_BASE]
     if low_priority:
-        # 読み込みは数分ぶんの CPU と I/O を食い切る。CPU 版 VOICEVOX と重なると
-        # 合成が数十秒に伸びて録画が落ちる（2026-08-31 の朝版はこれで全滅した。
-        # 実測で iowait 21%、読み込み 43MB/s）。裏で走らせるあいだは譲る。
-        # 効くのは主に I/O のほうなので ionice が本命。無い環境では黙って諦める
-        prefix = []
+        # 読み込みは数分ぶんの I/O を食い切る。CPU 版 VOICEVOX と重なると合成が
+        # 数十秒に伸びて録画が落ちる（2026-08-31 の朝版はこれで全滅した。実測で
+        # iowait 21%、読み込み 43MB/s）。裏で走らせるあいだは譲る。
+        #
+        # **CPU 優先度は下げてはいけない。** nice -n 10 も付けたところ、読み込み後
+        # の生成が 15〜47秒から300秒超に伸びてタイムアウトした（同日）。nice は
+        # プロセスに残り続けるので、読み込みだけでなく推論まで遅くなる。
+        # テキストエンコーダは TEXT_ENCODER_DEVICE=cpu で CPU に載るため直撃する。
+        # 落としたいのは読み込み中の I/O だけなので ionice に絞る。
         if shutil.which("ionice"):
-            prefix += ["ionice", "-c3"]
-        if shutil.which("nice"):
-            prefix += ["nice", "-n", "10"]
-        cmd = prefix + cmd
+            cmd = ["ionice", "-c3"] + cmd
     print(f"[ARDY] サーバー起動: {' '.join(cmd)}")
     # 出力を捨てると起動に失敗したとき /health の error 文字列しか手掛かりが無くなる。
     # トレースバックを残す（プロセス終了時にOSが閉じるのでfpは持ち回らない）
