@@ -407,10 +407,12 @@ def main():
         closing_mood = pick_closing_mood(data["moods"], corner_context)
 
         # ARDYサーバーを先に起動しておく。
-        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる
+        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる。
+        # 裏で走るぶん優先度は下げる。CPU 版 VOICEVOX と食い合うと合成が数十秒に
+        # 伸びて Step3 で落ちる（2026-08-31）。読み込みは遅れても待てる
         ardy_proc = None
         if VRMA_MOTION_DIR:
-            ardy_proc = ardy_start()
+            ardy_proc = ardy_start(low_priority=True)
 
         # Step 2: 台本生成
         script_cache = os.getenv("SCRIPT_CACHE", "")

@@ -14,8 +14,9 @@
 # shorts/pipeline.py と shorts/quiz_pipeline.py の Step3、配信の発話が全滅した。
 #
 # `nvidia-ubuntu24.04-latest` も試したが **`nvidia-latest` と同一ダイジェスト**
-# （f77258b7239b）で、中身も cuDNN 8 のままだった。VOICEVOX 側が Blackwell 対応を
-# 出すまで GPU には戻せない。
+# （f77258b7239b）で、中身も cuDNN 8 のままだった。ただしこれは **`latest` 系のタグが
+# 2026-04-30 で更新を止めているから**であって、VOICEVOX が未対応だからではなかった
+# （8/31 に判明）。GPU を試すときは下の「GPU へ戻すとき」を読むこと。
 #
 # ## CPU で足りるのか
 #
@@ -29,12 +30,31 @@
 # 実時間の5〜7倍速で、配信の1発話（30〜50字）なら約1秒。
 # おまけに VRAM が 560MiB 空くので、ローカル LLM のぶんが増える。
 #
-# ## GPU へ戻すとき
+# ## GPU へ戻すとき（2026-08-31 時点）
 #
-# 1. `nvidia-container-toolkit` を入れ直す（8/29 の `apt purge *nvidia*` で消えたまま）
-# 2. 下の `deploy:` と `--use_gpu` のコメントを外す
+# 上流は動いている。`voicevox_engine#1871`（ONNX Runtime を 1.17.3 → 1.23.2）が
+# 8/20 にマージ済みで、`nvidia-*-0.26.0-dev` は 8/29 ビルドなのでこれを含む。
+# **`latest` は 4/30 で止まっているので見ても無駄。**
+#
+# ただし **sm_120 のカーネルが入っているかは未確認**。それを入れる
+# `onnxruntime-builder#122`（`CMAKE_CUDA_ARCHITECTURES` に `100a-real;120a-real;
+# 120-virtual` を足す）はまだ Open で、`voicevox_engine#1870`（推論に失敗する）も
+# Open のまま。叩いて確かめるしかない。VRAM は 12GB 空いているので同居はできる。
+#
+# 1. `nvidia-container-toolkit` の入れ直しは要らない。dpkg には無いが `docker info`
+#    に `Runtimes: nvidia` と `cdi: nvidia.com/gpu=all` があり CDI 経由で渡せる
+# 2. 本番(10101)は触らず、別ポートで試す:
+#      docker run --rm --name voicevox-gputest -p 10102:50021 --gpus all \
+#        voicevox/voicevox_engine:nvidia-ubuntu24.04-0.26.0-dev \
+#        gosu user /opt/voicevox_engine/run --host 0.0.0.0 --use_gpu
 # 3. `POST /synthesis` が 200 で返ることを必ず確認する。`/supported_devices` は
 #    推論が壊れていても `cuda:true` を返すので、判定に使ってはいけない
+# 4. 通ったら image を差し替え、下の `deploy:` と `--use_gpu` のコメントを外す。
+#    `0.26.0-dev` は開発版なので、本番に据えるかは別途判断すること
+#
+# なお 1.23.2 の CUDA 版は 1.17.3 より遅いという報告がある（音声合成 +76.6%、
+# cuDNN Frontend の FALLBACK モードが原因説 / `voicevox_core#1391`）。
+# それでも CPU 比では十数倍速い。
 
 services:
   voicevox:

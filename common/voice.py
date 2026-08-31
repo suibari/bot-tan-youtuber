@@ -11,12 +11,13 @@ Shorts の収録とライブ配信で共有する。以前は shorts/core.py と
 import json
 import os
 import tempfile
+import time
 import wave
 from pathlib import Path
 
 import requests
 
-from common.env import env_int
+from common.env import env_float, env_int
 from common.pronunciation import apply_pronunciations, preload_pronunciations  # noqa: F401
 
 VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
@@ -36,14 +37,62 @@ HOOK_VOICE_PARAMS = {
     "pitchScale":      0.05,
 }
 
-# (接続, 読み取り) 秒。統合前の Shorts 側は無制限だったが、エンジンが固まったときに
-# パイプラインごと止まるのを避けるため、ライブ配信側の値に揃えた。
-# 1文あたりの合成は実測1秒前後なので 30秒は十分に余裕がある。
-_TIMEOUT = (5, 30)
+# (接続, 読み取り) 秒と、追加で何回まで試すか。用途によって欲しい値が逆になる。
+#
+# 既定は**配信向けの短い値**にしてある。配信は live/live.py が合成の例外を握って
+# その発話だけ打ち切る（配信自体は続く）ので、待たされた分そのまま放送が沈黙する。
+# 早く諦めて次の発話へ行くほうがましなので、待たない・再試行は1回だけ。
+#
+# 録画（Shorts）は逆で、待てる。例外が上がるとパイプラインごと落ちて動画が出ない
+# ため、run.sh / run_quiz.sh が VOICEVOX_READ_TIMEOUT_SEC と VOICEVOX_RETRY を
+# 伸ばす。LLM_TIMEOUT_SEC を録画側だけ伸ばしているのと同じ切り分け。
+#
+# 以前は固定の (5, 30) で「1文あたりの合成は実測1秒前後なので30秒は十分に余裕が
+# ある」と書いていたが、これは VOICEVOX が GPU だった頃の前提だった。8/29 の GPU
+# 交換で CPU 版へ移ったあと、ARDY のモデルロードと重なった1文が30秒を超え、朝版が
+# 全滅した（2026-08-31）。CPU 版は同居する負荷次第で1文に数十秒かかりうる。
+_TIMEOUT = (env_float("VOICEVOX_CONNECT_TIMEOUT_SEC", 5),
+            env_float("VOICEVOX_READ_TIMEOUT_SEC", 15))
+_RETRY = env_int("VOICEVOX_RETRY", 1)
 
 
 class VoicevoxError(RuntimeError):
     pass
+
+
+def _post_with_retry(url: str, what: str, **kwargs):
+    """VOICEVOX へ POST する。一時的な不調のときだけ再試行する。
+
+    再試行するのはタイムアウト・接続断・5xx だけ。4xx は渡したテキストや話者IDが
+    原因で、投げ直しても通らないので即座に諦める。
+
+    5xx を拾うのは、GPU 版が推論に失敗して /synthesis が全件 500 を返した実績が
+    あるため（2026-08-30）。エンジンの再起動中に当たった場合もここで回復する。
+
+    なお話者IDが存在しない場合もエンジンは 4xx ではなく 500 を返すので、その手の
+    設定ミスは再試行を使い切ってから落ちる。話者は固定なので実害はない。
+    """
+    reason = None
+    delay = 1.0
+    for attempt in range(_RETRY + 1):
+        try:
+            res = requests.post(url, timeout=_TIMEOUT, **kwargs)
+            if res.status_code < 500:
+                res.raise_for_status()      # 4xx はここで上げて終わり
+                return res
+            reason = f"HTTP {res.status_code}"
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError) as e:
+            reason = type(e).__name__
+        if attempt == _RETRY:
+            break
+        # 後からログで追えるように必ず残す。今回の朝版の全滅は、何回試して駄目
+        # だったのかがログから分からず切り分けに時間がかかった
+        print(f"[VOICEVOX] {what} が返りません（{reason}）。"
+              f"{delay:.0f}秒待って再試行します（{attempt + 1}/{_RETRY}）")
+        time.sleep(delay)
+        delay *= 2
+    raise VoicevoxError(f"{what} が{_RETRY + 1}回とも失敗しました（{reason}）")
 
 
 def health_check() -> str:
@@ -73,12 +122,10 @@ def get_wav_duration(wav_path) -> float:
 
 def audio_query(text: str) -> dict:
     spoken_text = apply_pronunciations(text)
-    res = requests.post(
-        f"{VOICEVOX_URL}/audio_query",
+    res = _post_with_retry(
+        f"{VOICEVOX_URL}/audio_query", "audio_query",
         params={"text": spoken_text, "speaker": VOICEVOX_SPEAKER},
-        timeout=_TIMEOUT,
     )
-    res.raise_for_status()
     return res.json()
 
 
@@ -88,14 +135,12 @@ def synthesize(text: str, output_path, extra_params: dict = None) -> None:
     if extra_params:
         query.update(extra_params)
 
-    synth_res = requests.post(
-        f"{VOICEVOX_URL}/synthesis",
+    synth_res = _post_with_retry(
+        f"{VOICEVOX_URL}/synthesis", "synthesis",
         params={"speaker": VOICEVOX_SPEAKER},
         headers={"Content-Type": "application/json"},
         data=json.dumps(query),
-        timeout=_TIMEOUT,
     )
-    synth_res.raise_for_status()
     Path(output_path).write_bytes(synth_res.content)
 
 

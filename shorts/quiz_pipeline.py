@@ -533,10 +533,12 @@ def main(argv=None):
         print(f"[クイズ] id={quiz['id']} 「{quiz['問題']}」 正解={quiz['正解']}")
 
         # ── ARDYサーバーを先に起動しておく。
-        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる
+        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる。
+        # 裏で走るぶん優先度は下げる。CPU 版 VOICEVOX と食い合うと合成が数十秒に
+        # 伸びて Step3 で落ちる（2026-08-31）。読み込みは遅れても待てる
         ardy_proc = None
         if core.VRMA_MOTION_DIR and not args.preview:
-            ardy_proc = core.ardy_start()
+            ardy_proc = core.ardy_start(low_priority=True)
 
         # ── Step 2: 台本生成
         script = core._timed("Step2 台本生成", generate_quiz_script, quiz)

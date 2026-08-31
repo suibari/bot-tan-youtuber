@@ -33,6 +33,13 @@ done
 # 配信側（live/）は .env の LLM_TIMEOUT_SEC のまま短く縛る
 export LLM_TIMEOUT_SEC="${LLM_TIMEOUT_SEC:-180}"
 
+# VOICEVOX も同じ理由で伸ばす。CPU 版は ARDY のモデルロードと重なると1文に
+# 数十秒かかり、既定の15秒では落ちる（2026-08-31 の朝版はこれで全滅した）。
+# 録画は1文の失敗がパイプラインごと落として動画が出ないので、待ってでも通す。
+# 配信側（live/）は .env の短い既定のまま。待たされた分そのまま放送が沈黙する
+export VOICEVOX_READ_TIMEOUT_SEC="${VOICEVOX_READ_TIMEOUT_SEC:-120}"
+export VOICEVOX_RETRY="${VOICEVOX_RETRY:-3}"
+
 LOG_FILE="$SCRIPT_DIR/logs/quiz_$(date +%Y%m%d_%H%M%S).log"
 
 # 夜版と共通のロックで直列化する。
