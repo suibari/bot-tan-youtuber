@@ -39,6 +39,8 @@ def load_live():
         BOT_MOOD_SERVE_LIMIT=1, FPS_LOG_SEC=60.0,
         LIVE_HISTORY_TURNS=6, LIVE_HISTORY_USER_TURNS=3, SKIP_ARDY=True,
         SUBTITLE_LEAD_SEC=0.0, UNITY_PROJECT="/tmp/unity",
+        UNITY_RESTART_MAX=2, UNITY_RESTART_TIMEOUT_SEC=120.0,
+        UNITY_RESTART_COOLDOWN_SEC=30.0,
         WORK_DIR=Path("/tmp/bottan-live-test"), ensure_dirs=lambda: None,
     )
     stubs = {
@@ -229,6 +231,59 @@ class FollowupDueTest(unittest.TestCase):
         逆だと、掘り下げられるテーマがあるのに FILLER_IDLE_SEC だけ黙る。
         """
         self.assertLess(live.FOLLOWUP_IDLE_SEC, live.FILLER_IDLE_SEC)
+
+
+class UnityRecoveryTest(unittest.TestCase):
+    class FakeUnity:
+        def __init__(self, start_error=None):
+            self.alive = False
+            self.started = []
+            self.start_error = start_error
+
+        def is_alive(self):
+            return self.alive
+
+        def start(self, ready_timeout):
+            self.started.append(ready_timeout)
+            if self.start_error:
+                raise self.start_error
+            self.alive = True
+
+    class FakeObs:
+        def __init__(self):
+            self.bound = []
+
+        def bind_window_capture(self, project):
+            self.bound.append(project)
+
+    def make_session(self, unity=None):
+        session = bare_session()
+        session.unity = unity or self.FakeUnity()
+        session.obs = self.FakeObs()
+        session._unity_restart_count = 0
+        session._unity_restart_after = 0.0
+        return session
+
+    def test_restart_rebinds_obs_to_the_new_window(self):
+        session = self.make_session()
+        self.assertTrue(session._recover_unity())
+        self.assertEqual(session.unity.started, [live.UNITY_RESTART_TIMEOUT_SEC])
+        self.assertEqual(session.obs.bound, [live.UNITY_PROJECT])
+        self.assertEqual(session._unity_restart_count, 1)
+
+    def test_a_live_process_is_not_restarted(self):
+        session = self.make_session()
+        session.unity.alive = True
+        self.assertTrue(session._recover_unity(force=True))
+        self.assertEqual(session.unity.started, [])
+
+    def test_restart_budget_prevents_an_endless_crash_loop(self):
+        session = self.make_session(self.FakeUnity(RuntimeError("crashed")))
+        for _ in range(live.UNITY_RESTART_MAX):
+            session._unity_restart_after = 0.0
+            self.assertFalse(session._recover_unity(force=True))
+        self.assertFalse(session._recover_unity(force=True))
+        self.assertEqual(len(session.unity.started), live.UNITY_RESTART_MAX)
 
 
 if __name__ == "__main__":

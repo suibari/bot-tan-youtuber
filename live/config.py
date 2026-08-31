@@ -67,6 +67,10 @@ LIVE_MOUTH_CLOSE = env_float("LIVE_MOUTH_CLOSE", 1.0)
 LIVE_CHARACTER_YAW = env_float_opt("LIVE_CHARACTER_YAW")
 LIVE_PORT     = env_int("LIVE_PORT", 2338)
 UNITY_URL     = f"http://127.0.0.1:{LIVE_PORT}"
+# Editor が配信中に落ちても YouTube/OBS まで終了させず、同じ配信の中で起こし直す。
+UNITY_RESTART_MAX = env_int("UNITY_RESTART_MAX", 2)
+UNITY_RESTART_TIMEOUT_SEC = env_float("UNITY_RESTART_TIMEOUT_SEC", 120.0)
+UNITY_RESTART_COOLDOWN_SEC = env_float("UNITY_RESTART_COOLDOWN_SEC", 30.0)
 
 # ── 音声の経路 ────────────────────────────────────
 # Unity の音を OBS へ渡す専用の null シンク。詳細は audio.py の冒頭を参照

@@ -42,7 +42,8 @@ from config import (
     LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
     BOT_CONTEXT_TTL_SEC, BOT_MOOD_SERVE_LIMIT, FPS_LOG_SEC,
     LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
-    SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT,
+    SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT, UNITY_RESTART_MAX,
+    UNITY_RESTART_TIMEOUT_SEC, UNITY_RESTART_COOLDOWN_SEC,
     WORK_DIR, ensure_dirs,
 )
 # 調べもの（Google 検索）の原典は common/ 側にある。live/ に同名モジュールは
@@ -111,6 +112,8 @@ class LiveSession:
         self._queue_log_at = 0.0
         # メインループを止めない雑務スレッド（_start_chores 参照）
         self._chores = None
+        self._unity_restart_count = 0
+        self._unity_restart_after = 0.0
 
     # ── 準備 ──────────────────────────────────────────
 
@@ -420,9 +423,20 @@ class LiveSession:
                 unity_client.speak(wav, valence, arousal)
             except Exception as e:
                 print(f"[live] Unity へ発話を送れません: {e}")
-                if spoken == 0:
-                    notify.warn(f"Unity へ発話を送れません: {e}")
-                break
+                # プロセスが落ちた場合は同じ配信内で起こし直し、この文を一度だけ
+                # 再送する。単なる HTTP タイムアウトなら二重再生を避ける。
+                if not self.unity.is_alive() and self._recover_unity():
+                    try:
+                        unity_client.speak(wav, valence, arousal)
+                    except Exception as retry_error:
+                        print(f"[live] Unity 復旧後も発話を送れません: {retry_error}")
+                        if spoken == 0:
+                            notify.warn(f"Unity 復旧後も発話を送れません: {retry_error}")
+                        break
+                else:
+                    if spoken == 0:
+                        notify.warn(f"Unity へ発話を送れません: {e}")
+                    break
 
             pushed = False
             if spoken == 0:
@@ -847,8 +861,36 @@ class LiveSession:
 
         if not self.unity.is_alive():
             print("[live] Unity が落ちています")
-            notify.error("Unity", "プロセスが終了しました")
-            self._stopping = True
+            if not self._recover_unity() and self._unity_restart_count >= UNITY_RESTART_MAX:
+                notify.error("Unity", "自動復旧回数を使い切ったため配信を終了します")
+                self._stopping = True
+
+    def _recover_unity(self, force: bool = False) -> bool:
+        """落ちた Unity を再起動し、OBS のキャプチャ先も新しい窓へ張り直す。"""
+        if self.unity.is_alive():
+            return True
+        now = time.monotonic()
+        if self._unity_restart_count >= UNITY_RESTART_MAX:
+            return False
+        if not force and now < self._unity_restart_after:
+            return False
+
+        self._unity_restart_count += 1
+        attempt = self._unity_restart_count
+        print(f"[Unity] 自動復旧を試します ({attempt}/{UNITY_RESTART_MAX})")
+        notify.warn(f"Unity が終了したため自動復旧します ({attempt}/{UNITY_RESTART_MAX})")
+        try:
+            self.unity.start(ready_timeout=UNITY_RESTART_TIMEOUT_SEC)
+            if self.obs is not None:
+                self.obs.bind_window_capture(UNITY_PROJECT)
+            print("[Unity] 自動復旧しました。配信を続けます")
+            notify.warn("Unity を自動復旧しました。配信を続けます")
+            return True
+        except Exception as e:
+            self._unity_restart_after = time.monotonic() + UNITY_RESTART_COOLDOWN_SEC
+            print(f"[Unity] 自動復旧に失敗しました: {e}")
+            notify.warn(f"Unity の自動復旧に失敗しました ({attempt}/{UNITY_RESTART_MAX}): {e}")
+            return False
 
     # ── 片付け ────────────────────────────────────────
 
@@ -915,8 +957,14 @@ def main() -> int:
         start_at = _today_at(LIVE_START_HHMM)
         _sleep_until(start_at - timedelta(seconds=LIVE_TESTING_LEAD_SEC),
                      "testing へ入るまで")
+        # 準備完了から開始までの待機中にも Unity は落ち得る。
+        if not session._recover_unity(force=True):
+            raise RuntimeError("配信開始前に Unity を復旧できません")
         session.start_testing()
         _sleep_until(start_at, "配信開始まで")
+
+        if not session._recover_unity(force=True):
+            raise RuntimeError("live 遷移直前に Unity を復旧できません")
 
         session.go_live()
         session.run_loop()
