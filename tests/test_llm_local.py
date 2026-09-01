@@ -108,8 +108,8 @@ class OllamaRequestTest(unittest.TestCase):
         self.assertEqual(sent["body"]["options"]["num_ctx"], self.llm.OLLAMA_NUM_CTX)
 
     def test_num_ctx_matches_the_shared_runner(self):
-        """bsky-affirmative-bot と同じ値。ずれると 26B の runner が2つ立つ。"""
-        self.assertEqual(self.llm.OLLAMA_NUM_CTX, 16384)
+        """bsky-affirmative-bot と同じ値。ずれると 26B runner が再ロードされる。"""
+        self.assertEqual(self.llm.OLLAMA_NUM_CTX, 32768)
 
     def test_thinking_is_always_off(self):
         """切らないと reasoning が生成上限を食って content が空になる。"""

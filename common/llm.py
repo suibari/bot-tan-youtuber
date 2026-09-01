@@ -65,13 +65,15 @@ GEMINI_MODELS = [
 # ローカル生成の全リクエストで使う num_ctx。**env で可変にしない。**
 #
 # 1. この PC の ollama は bsky-affirmative-bot（別ホストから接続）と共用で、
-#    あちらは 16384 を送る（packages/shared-configs/src/config/aiRoutes.ts）。
-#    **Ollama は num_ctx が違うと runner を作り直す。** 値がずれた瞬間に 26B の
-#    runner がもう1つ立ち、13GB × 2 で 16GB の VRAM に収まらなくなる。
+#    あちらは画像入力に必要な 32768 を送る。
+#    **Ollama は num_ctx が違うと同じモデルでも runner を作り直す。** 2026-09-01 の
+#    配信では live の 16384 と別ホストの 32768 が交互に来て、11GB のモデルを
+#    数秒おきに SSD から再ロードした。結果、I/O wait が約30%まで上がり、ARDY・
+#    VOICEVOX・Unity のローカル HTTP がすべてタイムアウトした。
 # 2. 既定の 4096 ではペルソナだけで溢れて応答が空文字になる（上のモジュール docstring）。
 #
 # ホスト差を吸収するより、全経路で揃っていることのほうが重要。
-OLLAMA_NUM_CTX = 16384
+OLLAMA_NUM_CTX = 32768
 
 # 1リクエストの上限[秒]。指定しないと OpenAI SDK の既定 600秒 が効き、
 # さらに SDK 内部で2回リトライするので、下の create() の 3回 × モデル数 と

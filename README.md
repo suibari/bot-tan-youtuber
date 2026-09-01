@@ -239,13 +239,14 @@ VRAM の内訳（RTX 5070 Ti / 16,303 MiB）:
 
 | | VRAM |
 |---|---|
-| ollama `llama-server`（gemma-4-26B UD-IQ3_S, num_ctx 16384, KV q8_0） | 13,166 MiB |
+| ollama `llama-server`（gemma-4-26B UD-IQ3_S, num_ctx 32768, KV q8_0） | 約11,470 MiB（2026-09-01実測） |
 | ARDY engine（テキストエンコーダは CPU） | 1,102 MiB |
 | Unity（**配信のみ**。`:99` の実GPU Xorg） | 408 MiB |
 | Xorg(:0 + :99) + gnome-shell | 251 MiB |
-| **配信中の合計 / 総容量** | **15,092 / 16,303 MiB（空き 1.2GB）** |
+| **配信中の単純合計 / 総容量** | **約13,231 / 16,303 MiB** |
 
-**配信構成は 16GB に収まる**（2026-08-30 実測）。ただし余裕は 1.2GB しかない。
+**配信構成は 16GB に収まる**。32768 + 画像対応 runner、ARDY、Unity の同居でも
+2026-09-01 の起動ログでも、Ollamaを載せた後に約2.2GBの余裕が残った。
 OBS を NVENC にすると足りなくなるので x264 のままにすること（下の「OBS」を参照）。
 別ホストの bsky-affirmative-bot が使う埋め込みモデル（snowflake-arctic-embed2, 1.2GB）は
 **配信中は載らない**。
