@@ -585,6 +585,13 @@ def main(argv=None):
             finally:
                 core.ardy_stop(ardy_proc)
                 ardy_proc = None
+            if not vrma_motions:
+                # 動画は完成するのでパイプラインは成功のまま（notify.error ではない）。
+                # 黙らせておくと「動画は出ているが棒立ち」に何日も気づけない。
+                # 2026-09-02 の朝は exit 0 で公開まで通り、誰も気づかなかった
+                from common import notify
+                notify.warn("朝のクイズ: ARDY のモーション生成に失敗しました。"
+                            "モーション無しで公開します（logs/quiz_*.log を確認）")
 
         # ── Step 4: 表情タイムライン
         import random

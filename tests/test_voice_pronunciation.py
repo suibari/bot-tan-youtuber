@@ -166,6 +166,10 @@ class VoiceAudioQueryTest(unittest.TestCase):
     def test_audio_query_sends_rewritten_text_without_changing_caller_value(self):
         original = "攻殻機動隊の人形遣い"
         response = Mock()
+        # _post_with_retry が 5xx を再試行の判定に使うので、Mock でも必ず立てること。
+        # 立て忘れると `Mock < int` の TypeError になり、このテストが検証したい
+        # 「送信テキスト」まで到達しない（2026-08-31 の _post_with_retry 追加以降そうなっていた）
+        response.status_code = 200
         response.raise_for_status.return_value = None
         response.json.return_value = {"accent_phrases": []}
         with patch.object(voice, "apply_pronunciations",

@@ -1140,3 +1140,111 @@ OBS は NVENC にせず x264 のままにすること。別ホストの bsky-aff
   長い生成（実測で最大16秒）の後ろに配信の返答が並ぶ。`LLM_TIMEOUT_SEC=30` × 3試行で
   最悪 90秒メインループが止まる計算になる。配信で詰まるようなら試行回数を減らすこと。
 - `/etc/docker/daemon.json` が存在しない `nvidia-container-runtime` を参照したまま。
+
+# 追記: ARDY のモーションが消えていた件（2026-09-02）
+
+## 症状
+
+朝の Shorts からモーションが消えていた。ログは `[ARDY] 生成に失敗: ...
+Read timed out. (read timeout=300.0)`。**ただし朝だけの問題ではない。**
+
+| 実行 | LLM | ARDY 生成 | 結果 |
+|---|---|---|---|
+| 8/20〜8/29 朝夜すべて | **Gemini（クラウド）** | 18〜54s | ✓ 全成功 |
+| — 8/29〜8/30 GPU 交換 + ローカル Gemma 4 26B へ移行 — |
+| 8/31 18:00 夜 | ローカル26B | >315s | ✗ |
+| 9/01 06:00 朝 | ローカル26B | 17.3s | ✓ |
+| 9/01 18:00 夜 | ローカル26B | 128.7s | ✓（7.4倍遅い） |
+| 9/02 06:00 朝 | ローカル26B | >300s | ✗ |
+
+朝が先に落ちたのは `shorts/core.py` の `timeout = max(300, 尺×20)` のため。
+朝クイズはモーション窓が 13.2秒 しかなく下限 300秒 に張り付く。夜は 315秒 まで伸びる。
+**同じ遅さでも朝のほうが予算が小さいだけ。**
+
+## なぜ 3060 Ti / 8GB では安定していたのか
+
+**GPU の同居人がいなかったから。** 8/20〜8/29 の全ログの先頭行は
+`[LLM] Gemini (gemini-2.5-flash, ...) を使用します` で、収録中にローカル LLM は
+一切動いていなかった。ARDY が GPU を独占していたので、**HDD 上（SSD 移設前）でも
+18〜54秒で安定して通っていた**。
+
+つまり 8GB が優秀だったのではなく、**8GB では 26B(11GB) が載らないので同居が
+起こりようがなかった**。16GB にしたことで同居できるようになり、
+同居できてしまったがゆえに競合が始まった。
+
+## 原因は VRAM 不足ではない
+
+VRAM は足りている（README の内訳表のとおり収録時 12.8/16.3GB）。**全ログを通して
+CUDA OOM も `[ARDY] 空きメモリが足りません` も一度も出ていない。**
+
+起きていたのは **11GB のモデルが ARDY の生成中に何度も読み直されていた**こと。
+`num_ctx` が呼び出しごとに食い違うと Ollama は同じモデルでも runner を作り直す。
+
+```
+$ journalctl -u ollama --since "1 hour ago" | grep -oE "n_ctx_slot = [0-9]+" | sort | uniq -c
+    175 n_ctx_slot = 32768      ← このリポジトリ
+     20 n_ctx_slot = 4096       ← num_ctx を送らないクライアント
+$ journalctl -u ollama --since "1 hour ago" | grep -c load_tensors
+    114                          ← 1時間に114回、11GB を読み直していた
+```
+
+`sar` の裏付け（9/02 朝 06:00-06:10）: `%iowait 36.4%` に対し `%user 17.7%`。
+計算が進まず待っている状態で、ARDY・VOICEVOX・Unity のローカル HTTP が道連れになる。
+
+4096 の出どころは **OpenAI互換の `/v1/chat/completions`**。あの経路は `options` を
+黙って捨てるので、呼び元は自覚なく既定値を要求する（`common/llm.py` の docstring に
+同じ罠が書いてあるが、それは*このリポジトリ*を直しただけで、他の呼び元は残っていた）。
+`0fa241a` が num_ctx を 32768 に統一したのもこのリポジトリの中だけ。
+
+## 直したこと
+
+**サーバ側の既定値を揃えた。**これが本丸で、呼び元が誰であれ同じ runner に乗る:
+
+```
+# /etc/systemd/system/ollama.service.d/override.conf → setup/ollama-override.conf
+Environment="OLLAMA_CONTEXT_LENGTH=32768"
+```
+
+適用後の実測（OpenAI互換と native の両方を叩いて確認）:
+
+| | 修正前（1時間） | 修正後 |
+|---|---|---|
+| `load_tensors` | 114回 | 初回ロードの1回のみ |
+| `n_ctx_slot` | 32768×175 / 4096×20 | 32768のみ、4096は0 |
+
+**`ARDY_FREE_OLLAMA` は使わないこと（既定 false のまま）。** 「生成前に ollama を
+降ろす」フラグだが、今まさに起きていたのが「降ろして読み直す」の連打であり、
+外部クライアント（192.168.1.200 から 20分に100本）が即座に載せ直す。
+降ろすこと自体が 11GB の読み直しを1回増やすだけで逆効果になる。
+
+そのほか:
+
+- **`common/ardy.py` に `vram_free_gb()` / `ollama_loaded()` / `log_gpu_state()`。**
+  `wait_memory()` はシステム RAM しか見ておらず（該当時刻の空き RAM は 26.7GB あって
+  素通りする）、GPU の情報がログに一切残っていなかった。生成の直前に1行出す:
+  `[ARDY] 生成前の GPU: VRAM 空き 1.3GB / ollama 常駐 ...(11.8GB, ctx=32768)`
+- **生成のリトライ（`ARDY_GEN_RETRIES=1`, 30秒待ち）。** 今まで1回投げて終わりだった。
+  予算は Step3.8 全体で1回。ブロックごとに回すと朝の投稿（06:00 開始で16分）が押す。
+  **`ARDY_GEN_TIMEOUT`(300) は上げていない。**GPU が空いていれば実測 17〜54秒で、
+  伸ばすのは症状を隠すだけ。
+- **`notify.warn` を追加（朝夜とも）。** モーションが空でも動画は完成するので
+  `generate_spec` が例外を握って exit 0 で完走し、**Discord に何も飛ばなかった**。
+  9/02 朝はモーション無しのまま公開まで通っている
+  （`youtube.com/watch?v=p449x3_4MpY`、ARDY の 300秒待ちが足されて総所要 976秒）。
+  `notify.error` ではない — パイプライン自体は成功のままにする。
+- **`setup/install_units.sh`** は override.conf がずれていたら差分を出す。
+  ollama は bsky-affirmative-bot と共用なので**上書きはしない**。
+
+## 残件
+
+- **192.168.1.200 の常時負荷**（20分で `/api/chat` 100本、`/v1/models` 40本、500 が2本）。
+  runner の作り直しは止まったが、SM の食い合いは残る。9/01 夜が 128.7秒 だったのは
+  作り直しだけでは説明しきれないので、収録の10分間だけ外部を止められるかは
+  1回ぶんの実測を見てから判断する。
+- **127.0.0.1 の `/v1/chat/completions`**（4本/20分、各9〜11秒）の発生元が未特定。
+  `ollama-health.timer` は `/api/version` と `/api/ps` しか叩かないので別物。
+  `OLLAMA_CONTEXT_LENGTH` で ctx は揃ったが、発生元は突き止めておくこと。
+- **`tests/test_voice_pronunciation.py` が1件失敗している。** `642362f` で
+  `_post_with_retry` が入ったとき、モックが `status_code` を返さないまま残った
+  （`TypeError: '<' not supported between instances of 'Mock' and 'int'`）。
+  なお `tests/` の実行には `PYTHONPATH=.:shorts` が要る。

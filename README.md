@@ -256,6 +256,31 @@ CPUソフトウェアラスタライザ）へ描くので `nvidia-smi` に出て
 代わりに CPU を食い切る（実測 load average 9.6）ので、**収録中はローカルLLMの
 応答が遅くなる**。配信の Unity は `:99` の実GPU Xorg なので、そちらだけ VRAM を使う。
 
+**実害が出るのは容量ではなく runner の作り直しのほう。** 容量は上表のとおり足りていて、
+CUDA OOM は一度も出ていない。壊れるのは **`num_ctx` が呼び出しごとに食い違ったとき**で、
+Ollama は同じモデルでも runner を作り直すため 11GB を読み直しにいく。
+2026-09-02 の実測では 32768 と 4096 が交互に来て `load_tensors` が **1時間に114回**、
+`%iowait 36%` に対し `%user 17%`（計算が進まず待っている状態）になり、ARDY の生成が
+17秒 → 129秒 → 300秒超（タイムアウト）と崩れて朝夜の Shorts からモーションが消えた。
+
+揃える場所は2つあり、**両方**要る。片方だけでは `num_ctx` を送らない呼び元が既定値で
+作り直しを起こす（OpenAI互換の `/v1/chat/completions` は `options` を黙って捨てるので、
+そういう呼び元は自覚なく既定値を要求する）:
+
+| | |
+|---|---|
+| `common/llm.py` の `OLLAMA_NUM_CTX` | このリポジトリが送る値 |
+| `setup/ollama-override.conf` の `OLLAMA_CONTEXT_LENGTH` | ollama のサーバ側の既定値 |
+
+疑ったときに見るコマンド:
+
+```bash
+journalctl -u ollama --since "1 hour ago" | grep -c load_tensors            # 0 が正常
+journalctl -u ollama --since "1 hour ago" | grep -oE "n_ctx_slot = [0-9]+" | sort | uniq -c
+```
+
+収録ログにも `[ARDY] 生成前の GPU: VRAM 空き ... / ollama 常駐 ...(ctx=...)` が出る。
+
 **ollama の 26B が常駐しているぶん、余裕はほとんど無い。** 苦しくなったら上から順に:
 
 1. `LIVE_GROUNDING_GATE=regex`（判定に GPU を使わなくなる。ただし返答生成は

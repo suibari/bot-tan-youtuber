@@ -73,6 +73,13 @@ GEMINI_MODELS = [
 # 2. 既定の 4096 ではペルソナだけで溢れて応答が空文字になる（上のモジュール docstring）。
 #
 # ホスト差を吸収するより、全経路で揃っていることのほうが重要。
+#
+# **サーバ側の OLLAMA_CONTEXT_LENGTH（setup/ollama-override.conf）とも同値にすること。**
+# ここを揃えても、num_ctx を送らないクライアントが1つでも居ると ollama の既定値で
+# runner を作り直しにいく。OpenAI互換の /v1/chat/completions は options を黙って
+# 捨てるので、そういう呼び元は自覚なく既定値を要求する。2026-09-02 の実測では
+# 32768 と 4096 が交互に来て load_tensors が1時間に114回起き、ARDY の生成が
+# 300秒でタイムアウトして朝夜の Shorts からモーションが消えた。
 OLLAMA_NUM_CTX = 32768
 
 # 1リクエストの上限[秒]。指定しないと OpenAI SDK の既定 600秒 が効き、

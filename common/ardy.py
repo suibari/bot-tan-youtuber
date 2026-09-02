@@ -78,12 +78,20 @@ ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "8"))
 # Shorts の長尺ブロックと、配信の1本ぶん（数セグメント連結）で同じ値を使う
 ARDY_BLEND_SEC = float(os.getenv("ARDY_BLEND_SEC", "0.7"))
 
-# 空きメモリが足りないとき、ここまで待つ[秒]。
-# ollama は既定5分のkeep_aliveでモデルを自動解放するので、待てば空くことが多い
+# 空きメモリが足りないとき、ここまで待つ[秒]。ここで見ているのは
+# **システム RAM だけ**で、VRAM も GPU の混み具合も判定していない（vram_free_gb 参照）。
+#
+# NOTE: 「ollama は既定5分の keep_alive で解放するので待てば空く」と書いてあったが、
+# 2026-08-30 以降このホストの ollama は OLLAMA_KEEP_ALIVE=-1 で常駐しており成り立たない。
+# 待っても空かないので、これは「起動が重なった瞬間をやり過ごす」以上の意味を持たない
 ARDY_MEM_WAIT_SEC = float(os.getenv("ARDY_MEM_WAIT_SEC", "360"))
 # true にすると生成前に ollama のモデルをアンロードさせる。
-# ollama は次のリクエストで自動的に読み直すので停止はしないが、
-# そちらのサービスの次回応答が数秒遅くなる。既定は無効（他サービスに触らない）
+#
+# **既定の false から動かさないこと。** 2026-09-02 に実測したところ、ARDY が遅いのは
+# VRAM 不足ではなく ollama の runner が作り直され続けていること（num_ctx の食い違いで
+# 1時間に114回）だった。ここで降ろしても外部クライアントが即座に載せ直すので、
+# 11GB の読み直しを1回増やすだけで逆効果になる。直すべきはサーバ側の
+# OLLAMA_CONTEXT_LENGTH（setup/ollama-override.conf）。
 ARDY_FREE_OLLAMA = env_flag("ARDY_FREE_OLLAMA")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
@@ -106,6 +114,53 @@ def mem_available_gb() -> float:
     except Exception:
         pass
     return float("inf")   # 読めないなら判定しない
+
+
+def vram_free_gb() -> float:
+    """GPU の空き VRAM[GB]。読めなければ inf（＝判定しない）。
+
+    wait_memory() が見ているのはシステム RAM だけで、GPU 側は誰も見ていなかった。
+    2026-09-02 の調査では ARDY が落ちてもログに GPU の情報が一切残っておらず、
+    journalctl -u ollama を突き合わせるまで原因が分からなかった。
+    """
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return int(r.stdout.split()[0]) / 1024
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        pass
+    return float("inf")
+
+
+def ollama_loaded() -> list[dict]:
+    """ollama が今 GPU に載せているモデル。読めなければ空リスト。
+
+    ARDY と同居している相手を名指しするためのもの。context_length まで見るのは、
+    これが呼び出しごとにずれると runner が作り直されて 11GB が読み直されるため
+    （setup/ollama-override.conf の OLLAMA_CONTEXT_LENGTH を参照）。
+    """
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
+        return [{"name": m.get("name", "?"),
+                 "size_gb": m.get("size", 0) / 1e9,
+                 "ctx": m.get("context_length")}
+                for m in r.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def log_gpu_state(prefix: str = "[ARDY]") -> None:
+    """生成の直前に GPU の状況を1行残す。失敗しても黙って諦める。"""
+    free = vram_free_gb()
+    free_s = "不明" if free == float("inf") else f"{free:.1f}GB"
+    loaded = ollama_loaded()
+    if loaded:
+        who = " / ".join(f"{m['name']}({m['size_gb']:.1f}GB, ctx={m['ctx']})" for m in loaded)
+    else:
+        who = "なし"
+    print(f"{prefix} 生成前の GPU: VRAM 空き {free_s} / ollama 常駐 {who}")
 
 
 def _free_ollama() -> None:

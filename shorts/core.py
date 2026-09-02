@@ -800,6 +800,16 @@ ARDY_MAX_SEGMENTS = 12
 # ARDY_GEN_TIMEOUT の既定300秒では長いブロックの1本目が溢れるので、尺から動的に伸ばす
 ARDY_GEN_SEC_PER_SEC = float(os.getenv("ARDY_GEN_SEC_PER_SEC", "10"))
 
+# 生成が溢れたときのやり直し回数と、その前に空ける時間[秒]。
+# **予算は Step3.8 全体で、ブロックごとではない。** 朝版は 06:00 開始で投稿まで16分しか
+# 無く、ブロック単位で再試行すると Unity 録画が押す（2026-09-02 の朝は ARDY の
+# 300秒待ちが丸ごと足されて総所要 976秒だった）。
+# 同居する ollama の負荷はバースト的なので、間を置けば1回目が溢れても2回目は通る。
+# タイムアウトそのもの（ARDY_GEN_TIMEOUT=300）は伸ばさない。GPU が空いていれば
+# 実測 17〜54秒で、300秒は十分すぎる。伸ばすのは症状を隠すだけ
+ARDY_GEN_RETRIES = int(os.getenv("ARDY_GEN_RETRIES", "1"))
+ARDY_RETRY_DELAY_SEC = float(os.getenv("ARDY_RETRY_DELAY_SEC", "30"))
+
 # 1セグメントの目安の長さ[秒]。big は明確なジェスチャー、small は待機動作。
 # この比で実尺を按分するだけなので、合計が尺に合わなくても構わない。
 #
@@ -862,6 +872,8 @@ OLLAMA_URL        = _ardy.OLLAMA_URL
 _free_ollama       = _ardy._free_ollama
 ardy_wait_memory   = _ardy.wait_memory
 _mem_available_gb  = _ardy.mem_available_gb
+ardy_vram_free_gb  = _ardy.vram_free_gb
+ardy_log_gpu_state = _ardy.log_gpu_state
 ardy_available     = _ardy.available
 ardy_health        = _ardy.health
 _kill_stray_server = _ardy.kill_stray_server
@@ -1104,6 +1116,12 @@ def build_vrma_motions(blocks: list[dict], out_dir: str, seed_base: str) -> list
     if not blocks:
         return []
 
+    # 同居相手を1行残す。ARDY が遅いときの原因はほぼ GPU の相手側にあるが、
+    # 2026-09-02 まで GPU の情報がログに一切残っておらず、journalctl -u ollama と
+    # 突き合わせるまで切り分けられなかった
+    ardy_log_gpu_state()
+    retries_left = ARDY_GEN_RETRIES
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     # 消さないと emotions.json に載らない過去の .vrma が溜まり続ける
@@ -1128,6 +1146,15 @@ def build_vrma_motions(blocks: list[dict], out_dir: str, seed_base: str) -> list
 
             t0 = time.time()
             length = ardy_generate_segments(segs, seed, spec_json)
+            if length is None and retries_left > 0:
+                # 溢れる原因は同居する ollama の負荷で、それはバースト的。
+                # サーバーは読み込み済みのまま使い回すので、かかるのは生成のぶんだけ
+                retries_left -= 1
+                print(f"[ARDY] {part} の生成をやり直します "
+                      f"（{ARDY_RETRY_DELAY_SEC:.0f}秒待つ / 残り{retries_left}回）")
+                time.sleep(ARDY_RETRY_DELAY_SEC)
+                ardy_log_gpu_state()
+                length = ardy_generate_segments(segs, seed, spec_json)
             if length is None or not ardy_to_vrma(spec_json, str(vrma_path)):
                 # 続きを繋げる位置が決まらないので、このブロックはここで打ち切る
                 break
