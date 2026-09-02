@@ -622,12 +622,48 @@ LAN 内 API `POST /memory/search` を叩き、埋め込みと `pg_trgm` のハ�
 `bot_memory_documents`（`source_type='youtube_live_comment'`）へ非同期で upsert する。
 本文が変わったら `embedding` を NULL に落として、サーバに埋め直させる。
 
+**コメントへの返事もここから引く**（`live/recall.py`）。以前は決め打ちの SQL
+スナップショットしか載っておらず、質問の内容では何も引いていなかった。だから
+biorhythm にゲームの記録があるのに「最近やったゲームなに？」に答えられなかった。
+
+引くときは `source_type` を2つに分ける。
+
+- **`youtube_live_comment` は引かない。** いま届いた質問とほぼ同じ文の「前に誰かが
+  同じことを聞いたコメント」が上位を埋めるだけになる。返り値にそれへの返答は
+  入らない（サーバの `serializeBotMemorySearchResult`）ので、枠を食って答えにならない。
+- **`web_research` は別枠で引く。** 件数が桁違い（15件 対 9020件）で、まとめて引くと
+  知識カードが押し出される。実測: 「eu4ってどんなゲーム？」で5位、
+  「ワルプルギスの廻天って知ってる？」では20位までに出てこなかった。
+  2本を**同時に**投げて、遅いほうに待ち時間を合わせる（実測 約1.4秒）。
+  保管しているのが十数件しかないので必ず何かが返る。**質問がその語
+  （`metadata.term`）を含むものだけ**通す。
+
 検索はクエリが長いほど遅い（実測: 100文字 1.9秒 / 300文字 3.2秒 / 1000文字 9.1秒）。
 サーバがクエリ全文を埋め込んだうえ、`similarity` と `ilike` をクエリ全文で全行に
 当てるため。`BOT_MEMORY_QUERY_MAX_CHARS`（既定500）で頭を打たせている。
 
 **メインループから叩かないこと。** 先読みは `_start_chores()` の雑務スレッドが行い、
 ホットパスはキャッシュを読むだけにする。
+
+### 知らないことは、その場では調べない
+
+配信のホットパスから **Gemini を外した**（`LIVE_GROUNDING` の既定は `false`）。
+外の世界のことを聞かれたら、`common/grounding.classify()` が返した語を
+`affirmative_bot.bot_memory_research_jobs` へ積むだけにする（`live/recall.py`）。
+あとは biorhythm_server の `botMemoryResearchWorker` が60秒ごとに拾い、**SearXNG**
+で調べて `source_type='web_research'` として記憶へ入れる。次に同じ話題が来たときには
+上の思い出しで引ける（**同じ配信の数分後に間に合う**）。
+
+その場では「知らない」と正直に答える。これは Bluesky / Nagi のリプライ経路が前から
+やっていることで、配信だけが輪から外れて同期で Gemini を叩いていた。
+
+`subject_hash` は隣接リポジトリの `researchSubjectHash`（空白正規化 → trim → lower →
+sha256）と**同じ値でなければならない**。ずれると主キーが噛み合わず、同じ語が
+二重に積まれる。上限（60字 / 2字 / pending 200件）も `researchJobs.ts` に合わせる。
+
+コメントの仕分け（`common/grounding.classify()`）は WEB / SELF / NONE の3値で、
+調べる語も同じ1回の呼び出しで返させる。ここはローカルの ollama なので、
+何回呼んでもリクエスト数も課金も増えない。`LIVE_GROUNDING` を切っても走る。
 
 ### 同じ話題を二度出さない
 
@@ -655,6 +691,12 @@ LAN 内 API `POST /memory/search` を叩き、埋め込みと `pg_trgm` のハ�
 ペルソナにも「Blueskyだけがあなたの居場所であるかのように話さないこと」と書いてある。
 `nagi` にだけ固定枠があると逆の偏りが出るので、`bsky`（`affirmative_bot.posts`）も
 同じ形で置いてある。
+
+**スコアの下限も揃える**（`LIVE_POST_MIN_SCORE`、既定80）。以前は両方 88 を直書き
+していたが、`affirmative_bot.posts` は15行しか残らない巻き取りウィンドウで、実測の
+スコアは 65〜88 と**最大値が閾値と同値**だった。88 で切ると Bluesky 枠だけが頻繁に
+空になり、「Nagiの話はするのに Blueskyの話はしない」という偏りになる。
+nagi 側は 70〜92 と分布に余裕があるので同じ閾値でも枯れない。
 
 ### mood に引きずられない（`live/topics.py`）
 

@@ -28,6 +28,7 @@ import gauge
 import motion as motion_mod
 import notify
 import persona
+import recall
 import safety
 import schedule as live_schedule
 import subtitle
@@ -87,6 +88,8 @@ class LiveSession:
         self.obs = None
         self.poller = None
         self.memory_writer = memory.BotMemoryWriter()
+        # 聞かれたことを思い出す係。知らない語は調査キューへ積む（live/recall.py）
+        self.recall = recall.CommentRecall()
 
         self.system_prompt = persona.build_system_prompt()
         # 配信中の会話。以前は自分の発話テキストを8件持つだけで、視聴者が何を
@@ -516,15 +519,39 @@ class LiveSession:
         bot = self._bot_context()
         t_ctx = time.monotonic()
 
-        # 聞かれたことを調べる。**返答生成の前に済ませる。**
-        # 何かを聞いているコメントだけを通す。あいさつや感想まで毎回 API へ
-        # 出すと、1件につき1リクエストと約1秒を捨てることになる
-        # （なぜ返答生成に検索を相乗りできないかは common/grounding.py を参照）
-        if grounding.needs_lookup(comment.text):
-            search = grounding.lookup(
-                f"視聴者「{comment.author}」のコメント：{comment.text}")
-        else:
-            search = {"status": grounding.SKIP, "facts": "", "queries": []}
+        # 聞かれたことに答える材料を用意する。**返答生成の前に済ませる。**
+        #
+        #   SELF … 自分の過去のこと。記憶を質問文で引く（ここだけ待つ）
+        #   WEB  … 外の世界のこと。**まず前に調べた知識カードを見る。**
+        #          無ければ調査キューへ積むだけで、その場では調べない。
+        #          SearXNG が60秒以内に拾うので、同じ配信の数分後には答えられる
+        #   NONE … あいさつ・感想。何もしない
+        #
+        # 仕分けはローカルの ollama なので、何回呼んでも課金は増えない。
+        # search は LIVE_GROUNDING を立てたときだけ埋まる（既定は空）
+        kind, subject = grounding.classify(comment.text)
+        search = {"status": grounding.SKIP, "facts": "", "queries": []}
+        remembered = []
+        if kind == grounding.SELF:
+            remembered = self.recall.lookup(comment.text)
+        elif kind == grounding.WEB:
+            subject = subject or recall.subject_of(comment.text)
+            # **カードを見ずに積むと、調べた知識を読まないまま当て推量で答える。**
+            # 実測: 調べ終わった直後の「ペルセウス座流星群って知ってる？」に
+            # カードを見ずに「知ってるよ！」と答えていた
+            remembered = self.recall.knowledge(subject or comment.text, comment.text)
+            if not remembered:
+                if subject:
+                    subject = self.recall.enqueue_research(subject)
+                # 材料が無いことを黙って渡さない。**知ったかぶりを止めるのは
+                # このブロックだけ**（persona.search_block の unknown）。
+                # Gemini を外したぶん、ここが唯一の歯止めになる
+                search = {"status": grounding.UNKNOWN, "facts": "", "queries": []}
+                # LIVE_GROUNDING を立てたときだけ、その場でも調べる。
+                # **カードがあるときは呼ばない**（もう答えは手元にある）
+                if grounding.needs_lookup(comment.text):
+                    search = grounding.lookup(
+                        f"視聴者「{comment.author}」のコメント：{comment.text}")
         t_search = time.monotonic()
 
         # 場の流れは messages のマルチターンで、この人とのやりとりは本文で渡す。
@@ -543,6 +570,7 @@ class LiveSession:
             user_history=user_history,
             used_terms=self.planner.used_terms(),
             search=search,
+            recall=remembered,
         )
         reply = self._generate(prompt, history)
         t_llm = time.monotonic()
@@ -559,12 +587,19 @@ class LiveSession:
         started = self._speech_started_at
         print(f"[live] 反応まで {started - comment.received_at:.1f}秒 "
               f"(待ち {t_pop - comment.received_at:.1f} / "
-              f"DB {t_ctx - t_pop:.1f} / 調べもの {t_search - t_ctx:.1f} / "
+              f"DB {t_ctx - t_pop:.1f} / 思い出し {t_search - t_ctx:.1f} / "
               f"LLM {t_llm - t_search:.1f} / 合成 {started - t_llm:.1f})")
-        # 何をどう調べたかを残す。調べたのに的外れな返事をした、を後から
-        # 切り分けられるのはここだけ（検索クエリはAPIの応答にしか出ない）
-        print(f"[live] 調べもの: {search['status']}"
-              + (f" {search['queries']}" if search.get("queries") else ""))
+        # どう仕分けてどう答えたかを残す。**これが無いと、答えられなかったのが
+        # 仕分けの誤りなのか記憶に無かったのかを配信後に切り分けられない。**
+        detail = f"記憶{len(remembered)}件" if kind == grounding.SELF else ""
+        if kind == grounding.WEB:
+            detail = ("知識カードあり" if remembered
+                      else (f"積んだ語「{subject}」" if subject else "積む語なし"))
+        # 調べものは既定で走らない。走ったときだけ、何をどう調べたかを足す
+        # （検索クエリは API の応答にしか出ない）
+        if search.get("queries"):
+            detail += f" / 調べもの {search['status']} {search['queries']}"
+        print(f"[live] 振り分け: {kind}" + (f" / {detail}" if detail else ""))
 
         self.replied_count += 1
         # energy はここでは足さない。下の memory.save_comment() が入れた行を
@@ -659,10 +694,9 @@ class LiveSession:
             print(f"[live] 掘り下げの資料を引けません（無視します）: {e}")
             material = None
 
-        # 掘り下げはコメントが途切れているときにしか走らないので、ここでの往復は
-        # 視聴者を待たせない。それでも判定は通す。テーマは「コメント＋自分の返答」
-        # （_begin_thread）なので、聞かれていないテーマまで毎回 Gemini へ出すと、
-        # 沈黙が続くほどリクエストだけが増える
+        # 掘り下げの資料は planner.next_followup() が RAG から引いている（＝もう
+        # 記憶に繋がっている）ので、ここで思い出し直さない。調べものは
+        # LIVE_GROUNDING を立てたときだけ走る（既定は空のまま）
         theme = thread["theme"]
         if grounding.needs_lookup(theme):
             search = grounding.lookup(f"配信で話している話題：{theme}")
@@ -906,6 +940,9 @@ class LiveSession:
             self.poller.stop()
         subtitle.clear_comments()
         self.memory_writer.stop()
+        # 積み残した語を捨てない。配信の終わり際に聞かれたことも、次の配信までに
+        # 調べておけば答えられるようになる
+        self.recall.stop()
 
         if self.broadcast is not None:
             self.broadcast.finish()

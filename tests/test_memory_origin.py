@@ -105,6 +105,11 @@ class RagSourceLabelTest(unittest.TestCase):
                 self.assertIn("あなた自身", label)
             elif source == "youtube_live_comment":
                 self.assertIn("視聴者", label)
+            elif source == "web_research":
+                # 誰かとのやりとりではなく、自分で調べて覚えた知識。
+                # 「他の人の…」にすると、調べた事実まで他人の話として濁す
+                self.assertIn("調べ", label)
+                self.assertNotIn("思い出", label)
             else:
                 self.assertIn("他の人", label)
 

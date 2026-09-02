@@ -87,19 +87,26 @@ class RegexGateTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_questions_are_looked_up(self):
+    def test_questions_about_the_world_go_to_the_web(self):
         for text in ("今日の東京の天気どうだった？", "いま話題のアニメ教えて",
                      "ノーベル賞誰がとったの", "ラーメンって何が好き"):
-            self.assertTrue(grounding.needs_lookup(text), text)
+            self.assertEqual(grounding.classify(text)[0], grounding.WEB, text)
 
-    def test_chatter_is_not_looked_up(self):
-        # ここが落ちるとコメント1件につき Gemini のリクエストが無駄に増える
+    def test_questions_about_herself_go_to_the_memory(self):
+        # 「今日」だけで自分のことにしないこと。上の「今日の東京の天気」が
+        # SELF に落ちると、外のことを聞かれても記憶しか見なくなる
+        for text in ("最近やったゲームなに？", "きのうは何してたの",
+                     "Blueskyで今日なんかあった？", "botたんの日記どうだった？"):
+            self.assertEqual(grounding.classify(text)[0], grounding.SELF, text)
+
+    def test_chatter_is_left_alone(self):
+        # ここが落ちるとコメント1件につき LAN の往復が無駄に増える
         for text in ("こんばんはー！", "かわいい", "おつかれさま", "8888", "", "   "):
-            self.assertFalse(grounding.needs_lookup(text), text)
+            self.assertEqual(grounding.classify(text)[0], grounding.NONE, text)
 
     def test_no_ollama_request_is_made(self):
         with patch.object(grounding.requests, "post") as post:
-            grounding.needs_lookup("いま話題のアニメ教えて")
+            grounding.classify("いま話題のアニメ教えて")
         post.assert_not_called()
 
 
@@ -112,20 +119,36 @@ class LlmGateTest(unittest.TestCase):
         grounding._gate_warned = False
         self.addCleanup(setattr, grounding, "_gate_warned", False)
 
-    def test_yes_and_no_are_honoured(self):
+    def test_the_three_labels_are_honoured(self):
         with patch.object(grounding.requests, "post",
-                          return_value=gate_reply("YES")) as post:
-            self.assertTrue(grounding.needs_lookup("最近のおすすめ映画知りたい"))
+                          return_value=gate_reply("WEB ブルアカ")) as post:
+            self.assertEqual(grounding.classify("ブルアカやったことある？"),
+                             (grounding.WEB, "ブルアカ"))
         body = post.call_args.kwargs["json"]
         self.assertEqual(body["model"], grounding.LIVE_GROUNDING_GATE_MODEL)
-        # 理由を喋り始めると判定が1秒を超える
-        self.assertEqual(body["options"]["num_predict"], 4)
+        # 理由を喋り始めると判定が1秒を超える。語を返させるぶんだけ広げてある
+        self.assertEqual(body["options"]["num_predict"], 24)
         # keep_alive は既定では送らない。判定と返答生成が同じ runner になったので、
         # ここで送ると ollama.service の OLLAMA_KEEP_ALIVE=-1 を上書きしてしまう
         self.assertNotIn("keep_alive", body)
 
+        with patch.object(grounding.requests, "post", return_value=gate_reply("SELF")):
+            self.assertEqual(grounding.classify("最近やったゲームなに？"),
+                             (grounding.SELF, ""))
+        with patch.object(grounding.requests, "post", return_value=gate_reply("NONE")):
+            self.assertEqual(grounding.classify("こんばんはー！"), (grounding.NONE, ""))
+
+    def test_the_old_yes_no_answers_still_work(self):
+        """モデルが古い言い方に戻っても落ちない。
+
+        few-shot を書き換えても YES / NO と答えることはある。**読めない答えは
+        正規表現へ降格する**ので、そこで拾えないコメントが取りこぼしになる。
+        """
+        with patch.object(grounding.requests, "post", return_value=gate_reply("YES")):
+            self.assertEqual(grounding.classify("最近のおすすめ映画知りたい")[0],
+                             grounding.WEB)
         with patch.object(grounding.requests, "post", return_value=gate_reply("NO")):
-            self.assertFalse(grounding.needs_lookup("こんばんはー！"))
+            self.assertEqual(grounding.classify("こんばんはー！")[0], grounding.NONE)
 
     def test_gate_shares_the_runner_with_reply_generation(self):
         """判定だけ別モデル・別 num_ctx にすると、26B の runner がもう1つ立つ。
@@ -138,42 +161,52 @@ class LlmGateTest(unittest.TestCase):
         self.assertEqual(grounding.LIVE_GROUNDING_GATE_MODEL, llm.LOCAL_LLM_MODEL)
         with patch.object(grounding.requests, "post",
                           return_value=gate_reply("YES")) as post:
-            grounding.needs_lookup("東京タワーの高さしってる")
+            grounding.classify("東京タワーの高さしってる")
         body = post.call_args.kwargs["json"]
         self.assertEqual(body["options"]["num_ctx"], llm.OLLAMA_NUM_CTX)
 
     def test_ollama_failure_falls_back_to_the_regex(self):
         # ollama が落ちていても配信は続ける
         with patch.object(grounding.requests, "post", side_effect=RuntimeError("down")):
-            self.assertTrue(grounding.needs_lookup("いま話題のアニメ教えて"))
-            self.assertFalse(grounding.needs_lookup("こんばんはー！"))
+            self.assertEqual(grounding.classify("いま話題のアニメ教えて")[0],
+                             grounding.WEB)
+            self.assertEqual(grounding.classify("こんばんはー！")[0], grounding.NONE)
 
     def test_unparsable_answer_falls_back_to_the_regex(self):
         with patch.object(grounding.requests, "post",
                           return_value=gate_reply("たぶん調べたほうがいいと思うよ")):
-            self.assertTrue(grounding.needs_lookup("いま話題のアニメ教えて"))
-            self.assertFalse(grounding.needs_lookup("こんばんはー！"))
+            self.assertEqual(grounding.classify("いま話題のアニメ教えて")[0],
+                             grounding.WEB)
+            self.assertEqual(grounding.classify("こんばんはー！")[0], grounding.NONE)
 
-    def test_gate_off_looks_everything_up(self):
+    def test_gate_off_sends_everything_to_the_web(self):
         with patch.object(grounding, "LIVE_GROUNDING_GATE", "off"), \
              patch.object(grounding.requests, "post") as post:
-            self.assertTrue(grounding.needs_lookup("こんばんはー！"))
+            self.assertEqual(grounding.classify("こんばんはー！")[0], grounding.WEB)
             # 空だけは、切っていても叩かない
-            self.assertFalse(grounding.needs_lookup(""))
+            self.assertEqual(grounding.classify("")[0], grounding.NONE)
         post.assert_not_called()
 
     def test_empty_comment_never_reaches_ollama(self):
         with patch.object(grounding.requests, "post") as post:
-            self.assertFalse(grounding.needs_lookup("   "))
+            self.assertEqual(grounding.classify("   ")[0], grounding.NONE)
         post.assert_not_called()
 
-    def test_kill_switch_stops_the_gate_too(self):
-        # LIVE_GROUNDING=false は「調べもの機能ごと止める」スイッチ。
-        # 判定だけ走らせても lookup が SKIP を返すので、ollama を叩くだけ無駄
+    def test_the_kill_switch_only_stops_gemini(self):
+        """LIVE_GROUNDING=false は Gemini を止めるだけ。**仕分けは走り続ける。**
+
+        調べものを非同期（SearXNG）へ移したあとも、コメントを WEB / SELF / NONE に
+        分けるのは配信に要る。ここで仕分けごと止めると、記憶を引く導線まで消える。
+        """
         with patch.object(grounding, "LIVE_GROUNDING", False), \
              patch.object(grounding.requests, "post") as post:
             self.assertFalse(grounding.needs_lookup("いま話題のアニメ教えて"))
         post.assert_not_called()
+
+        with patch.object(grounding, "LIVE_GROUNDING", False), \
+             patch.object(grounding, "LIVE_GROUNDING_GATE", "regex"):
+            self.assertEqual(grounding.classify("いま話題のアニメ教えて")[0],
+                             grounding.WEB)
 
 
 class WarmupTest(unittest.TestCase):
@@ -199,14 +232,23 @@ class WarmupTest(unittest.TestCase):
                  patch.object(grounding.requests, "post") as post:
                 grounding.warmup()
             post.assert_not_called()
+        # LIVE_GROUNDING を切っても warmup は走る。Gemini を使わなくなっても
+        # 仕分けは走り続けるので、冷えた初回の3秒は配信前に払っておく
         with patch.object(grounding, "LIVE_GROUNDING", False), \
-             patch.object(grounding.requests, "post") as post:
+             patch.object(grounding, "LIVE_GROUNDING_GATE", "llm"), \
+             patch.object(grounding.requests, "post",
+                          return_value=gate_reply("NONE")) as post:
             grounding.warmup()
-        post.assert_not_called()
+        self.assertEqual(post.call_count, 2)
 
 
 class LookupTest(unittest.TestCase):
     def setUp(self):
+        # **調べものは既定で切ってある**（配信のホットパスから Gemini を外した）。
+        # ここは lookup() そのものを見るテストなので、明示的に立てる
+        switch = patch.object(grounding, "LIVE_GROUNDING", True)
+        switch.start()
+        self.addCleanup(switch.stop)
         patcher = patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"})
         patcher.start()
         self.addCleanup(patcher.stop)

@@ -36,12 +36,29 @@
 
 つまり **調べものを別の呼び出しに分けるのは最適化ではなく、成立させる唯一の形**。
 
+## いまは配信から呼んでいない（LIVE_GROUNDING の既定は False）
+
+**配信のホットパスから Gemini を外した。** 外の世界のことを聞かれたら、その場で
+調べるのをやめて `bot_memory_research_jobs` へ積み、biorhythm_server の
+botMemoryResearchWorker に **SearXNG（自前）** で調べさせる。次に同じ話題が来た
+ときには `source_type='web_research'` として記憶から引ける（`live/recall.py`）。
+
+その場では「知らない」と正直に答える。これは Bluesky / Nagi のリプライ経路が
+前からやっていることで（bsky-affirmative-bot の botMemoryResearchWorker.ts の
+docstring を参照）、配信だけが輪から外れて同期で Gemini を叩いていた。
+
+このファイルを残してあるのは、**ゲート（`classify`）を使い続けるから**と、
+下に書いた実測（構造化出力と検索は同居できない）を失わないため。
+`LIVE_GROUNDING=true` を置けば `lookup()` はそのまま動く。
+
 ## リクエスト数
 
-コメント1件につき1回増える。ただし増えるのは短いテキスト呼び出しで、検索が
-実際に走る（＝グラウンディングとして課金される）のは調べる必要があったときだけ。
-さらに `needs_lookup()` が明らかな雑談を呼ぶ前に落とすので、実際の増加は
+`lookup()` はコメント1件につき1回増える。ただし増えるのは短いテキスト呼び出しで、
+検索が実際に走る（＝グラウンディングとして課金される）のは調べる必要があった
+ときだけ。さらに `classify()` が明らかな雑談を呼ぶ前に落とすので、実際の増加は
 コメント全件ではなく「何かを聞いているコメント」の数になる。
+
+`classify()` はローカルの ollama なので、何回呼んでも課金は増えない。
 
 ## 速さ
 
@@ -64,8 +81,10 @@ import requests
 from common.env import env_flag, env_float
 from common.llm import LOCAL_LLM_MODEL, OLLAMA_NUM_CTX, OLLAMA_URL
 
-# 配信でコメントに聞かれたことを調べるか。**切れば即座に従来の動作へ戻る。**
-LIVE_GROUNDING = env_flag("LIVE_GROUNDING", True)
+# 配信でコメントに聞かれたことを Gemini で調べるか。**既定は False。**
+# 外のことは非同期の調査キューへ回す（モジュール冒頭の説明を参照）。
+# true を置けば従来どおり同期で調べる動作に戻る。
+LIVE_GROUNDING = env_flag("LIVE_GROUNDING", False)
 # 調べもの専用のモデル。カンマ区切りで左から順にフォールバックする。
 # **GEMINI_MODEL とは分ける。** あちらは Shorts と共用で、こちらは
 # 検索が使える Gemini 3 系でなければならない
@@ -124,27 +143,51 @@ _ASKING = re.compile(
     r"|とは|って(?:な|何)|ですか|ますか|かな|かしら|good|what|who|when|where|why|how"
 )
 
+# 「botたん自身のことを聞いている」の保険。**_ASKING と同時に立ったときだけ効く。**
+# これ単体では「今日」「最近」のような語で雑談まで拾ってしまう。
+# ollama が落ちているときしか通らない道なので、精度より落ちないことを優先する。
+_SELF_ASKING = re.compile(
+    # botたん自身か、botたんのものを名指ししている
+    r"あなた|きみ|君|botたん|ボットたん|ぼっとたん"
+    r"|Nagi|nagi|なぎ|Bluesky|bluesky|ブルースカイ|ブルスカ|日記|カード|配信"
+    # 「いつ」＋「何かをしていた」。**時を表す語だけでは効かせない。**
+    # 「今日の東京の天気どうだった？」まで自分のことになってしまう
+    r"|(?:最近|今日|きょう|昨日|きのう|一昨日|おととい|この前|前に)"
+    r"[^。！？!?]{0,12}(?:して|やって|やった|読ん|見て|聴い|遊ん|食べ)"
+)
+
 # 判定係のプロンプト。**few-shot が要る。**
 # 例を付けないと 15/20 まで落ち、しかも外れがすべて「質問なのに NO」だった
 # （＝聞かれたのに調べない）。例を4つ足しただけで 19/20・取りこぼし 0 になる。
+#
+# **調べる語もこの1回で出させる。** 語だけ別に取ろうとすると、形態素解析器を
+# 入れるか LLM をもう1回呼ぶかになる。bsky-affirmative-bot のリプライ経路も
+# 「生成と同じ1回のリクエストで unknownTerms を申告」で済ませており、それに揃える。
 _GATE_SYSTEM = """あなたは配信のコメントを仕分ける係です。
-そのコメントに答えるためにWeb検索が要るかを、YES か NO の一語だけで答えます。
+コメントを WEB / SELF / NONE のどれかに分けて、一行だけで答えます。
 
-YES … 世の中の事実・最新の情報・固有名詞・数値について知りたがっている。
-       疑問符が無くても、知りたがっていれば YES。
-NO  … あいさつ、褒め言葉、感想、気持ちの話、雑談、
-       VTuber本人やそのSNSの不具合報告（検索しても分からない）。
+WEB  … 世の中の事実・最新の情報・作品名・固有名詞・数値について知りたがっている。
+        `WEB ` のあとに、調べるべき語をひとつだけ書く（語だけ。文にしない）。
+SELF … VTuber本人の過去の出来事について聞いている。
+        やったゲーム、読んだ本、昨日していたこと、自分のSNS（NagiやBluesky）で
+        見た投稿やもらった反応、前の配信の話。
+NONE … あいさつ、褒め言葉、感想、気持ちの話、雑談、
+        VTuber本人やそのSNSの不具合報告（調べても分からない）。
 
 例:
-コメント：こんばんはー！ -> NO
-コメント：今日もかわいいね -> NO
-コメント：今日仕事つらかった… -> NO
-コメント：botたんの日記が出ないんだけど -> NO
-コメント：今日の東京の天気どうだった？ -> YES
-コメント：ノーベル賞誰がとったの -> YES
-コメント：東京タワーの高さしってる -> YES
-コメント：今年の夏コミっていつ -> YES
-コメント：最近のおすすめアニメ知りたい -> YES"""
+コメント：こんばんはー！ -> NONE
+コメント：今日もかわいいね -> NONE
+コメント：今日仕事つらかった… -> NONE
+コメント：botたんの日記が出ないんだけど -> NONE
+コメント：最近やったゲームなに？ -> SELF
+コメント：Blueskyで今日なんかあった？ -> SELF
+コメント：きのうは何してたの -> SELF
+コメント：この前の配信で話してたやつなんだっけ -> SELF
+コメント：今日の東京の天気どうだった？ -> WEB 東京の天気
+コメント：ノーベル賞誰がとったの -> WEB ノーベル賞
+コメント：東京タワーの高さしってる -> WEB 東京タワー
+コメント：今年の夏コミっていつ -> WEB 夏コミ
+コメント：ブルアカやったことある？ -> WEB ブルアカ"""
 
 # 調べもの係のシステムプロンプト。**botたんの人格は入れない。**
 # ここは事実だけを取ってくる係で、口調を作るのは live/persona.py の仕事。
@@ -166,6 +209,14 @@ _LOOKUP_SYSTEM = """あなたは配信中のVTuberの調べもの係です。視
 SKIP = "skip"
 UNKNOWN = "unknown"
 FACTS = "facts"
+
+# コメントの仕分け（classify）。**status とは別物なので値を重ねない。**
+#   WEB  … 外の世界のこと。調べる語を調査キューへ積む（live/recall.py）
+#   SELF … botたん自身の過去のこと。記憶を引く（live/recall.py）
+#   NONE … 調べることも思い出すことも要らない
+WEB = "web"
+SELF = "self"
+NONE = "none"
 
 
 def _api_key() -> str:
@@ -214,8 +265,12 @@ def _read(data: dict) -> tuple:
 _gate_warned = False
 
 
-def _gate_ask(text: str, timeout: float = None) -> bool:
-    """ローカルの ollama に「調べる必要があるか」を聞く。判定できなければ None。"""
+def _gate_ask(text: str, timeout: float = None):
+    """ローカルの ollama にコメントを仕分けさせる。
+
+    返すのは `(kind, subject)`。判定できなければ None。
+    kind は WEB / SELF / NONE、subject は WEB のときだけ入る（調べる語）。
+    """
     body = {
         "model": LIVE_GROUNDING_GATE_MODEL,
         "stream": False,
@@ -223,13 +278,14 @@ def _gate_ask(text: str, timeout: float = None) -> bool:
             {"role": "system", "content": _GATE_SYSTEM},
             {"role": "user", "content": f"コメント：{text} ->"},
         ],
-        # YES / NO の一語しか要らない。num_predict を絞らないと、
-        # 理由を喋り始めて判定が1秒を超える。
+        # 「WEB 東京タワー」の一行しか要らない。num_predict を絞らないと、
+        # 理由を喋り始めて判定が1秒を超える。**語を返させるぶんだけ広げてある**
+        # （YES/NO だけだった頃は 4）。
         #
         # **num_ctx は common/llm.py と同じ値でなければならない。** 以前ここだけ
         # 2048 にしていた。ollama は num_ctx が違うと runner を作り直すので、
         # 判定のたびに 26B がもう1つロードされることになる
-        "options": {"temperature": 0, "num_predict": 4, "num_ctx": OLLAMA_NUM_CTX},
+        "options": {"temperature": 0, "num_predict": 24, "num_ctx": OLLAMA_NUM_CTX},
         "think": False,
     }
     if LIVE_GROUNDING_GATE_KEEPALIVE:
@@ -238,32 +294,52 @@ def _gate_ask(text: str, timeout: float = None) -> bool:
         OLLAMA_URL + _OLLAMA_CHAT, json=body,
         timeout=LIVE_GROUNDING_GATE_TIMEOUT_SEC if timeout is None else timeout)
     response.raise_for_status()
-    answer = ((response.json().get("message") or {}).get("content") or "").strip().upper()
-    if answer.startswith("YES"):
-        return True
-    if answer.startswith("NO"):
-        return False
+    answer = ((response.json().get("message") or {}).get("content") or "").strip()
+    return _read_gate(answer)
+
+
+def _read_gate(answer: str):
+    """判定係の一行を `(kind, subject)` に。読めなければ None。
+
+    YES / NO も受ける。**モデルが古い言い方に戻ることがある**うえ、
+    tests/test_grounding.py の既存ケースがこの形で書かれている。
+    """
+    head = (answer or "").strip()
+    if not head:
+        return None
+    label, _, rest = head.partition(" ")
+    label = label.strip().upper().rstrip(":：")
+    subject = rest.strip().strip("「」『』\"'").split("\n")[0].strip()
+    if label.startswith("WEB") or label.startswith("YES"):
+        return (WEB, subject)
+    if label.startswith("SELF"):
+        return (SELF, "")
+    if label.startswith("NONE") or label.startswith("NO"):
+        return (NONE, "")
     return None
 
 
-def needs_lookup(comment_text: str) -> bool:
-    """このコメントは何かを聞いているか。**Gemini を叩く前に、ここで落とす。**
+def classify(comment_text: str) -> tuple:
+    """コメントを仕分ける。返すのは `(kind, subject)`。
 
-    配信のコメントは「こんばんはー」「かわいい」のような、調べようのないものが
-    多数を占める。それを毎回 Gemini に見せて SKIP と言わせるのは、1件につき
-    1リクエストと約1秒を捨てているのと同じ。ここはローカルの ollama なので、
-    何回呼んでも API のリクエスト数も課金も増えない。
+    配信のコメントは「こんばんはー」「かわいい」のような、調べようも思い出しようも
+    ないものが多数を占める。それを毎回 LAN の外へ出すのは往復を1回捨てているのと
+    同じ。ここはローカルの ollama なので、何回呼んでも API のリクエスト数も課金も
+    増えない。
+
+    subject（調べる語）が空で返ることはある。**呼ぶ側で補うこと**（`live/recall.py`
+    の `subject_of`）。ここは common なので live/topics.py に依存させない。
 
     判定できなければ正規表現へ落ちる。**ollama が落ちていても配信は続ける。**
+    LIVE_GROUNDING は見ない。あれは Gemini を叩くかどうかの旗で、仕分け自体は
+    Gemini を使わなくなったいまも要る。
     """
     global _gate_warned
     text = (comment_text or "").strip()
-    # LIVE_GROUNDING を切ったら判定ごと止める。lookup() が SKIP を返すので
-    # ここで調べると答えても、ollama を1回叩くだけ無駄になる
-    if not text or not LIVE_GROUNDING:
-        return False
+    if not text:
+        return (NONE, "")
     if LIVE_GROUNDING_GATE == "off":
-        return True
+        return (WEB, "")
     if LIVE_GROUNDING_GATE == "llm":
         try:
             answer = _gate_ask(text)
@@ -275,7 +351,21 @@ def needs_lookup(comment_text: str) -> bool:
                       f"以降は語句で判定します: {e}")
         if answer is not None:
             return answer
-    return bool(_ASKING.search(text))
+    if not _ASKING.search(text):
+        return (NONE, "")
+    # 何かを聞いてはいる。自分のことを聞いていそうなら記憶へ回す
+    return (SELF, "") if _SELF_ASKING.search(text) else (WEB, "")
+
+
+def needs_lookup(comment_text: str) -> bool:
+    """このコメントを Gemini で調べるか。**既定では常に False。**
+
+    `LIVE_GROUNDING` を立てたときだけ、従来どおり WEB 判定で True を返す。
+    配信は `classify()` を直に呼ぶので、これは後方互換のための薄い包みでしかない。
+    """
+    if not LIVE_GROUNDING:
+        return False
+    return classify(comment_text)[0] == WEB
 
 
 def warmup() -> None:
@@ -291,7 +381,9 @@ def warmup() -> None:
     **ここだけ待ち時間を長く取る。** LIVE_GROUNDING_GATE_TIMEOUT_SEC は
     温まったあとの1件ぶんの上限で、読み込みには足りない。配信前なので待ってよい。
     """
-    if not LIVE_GROUNDING or LIVE_GROUNDING_GATE != "llm":
+    # LIVE_GROUNDING は見ない。Gemini を使わなくなっても仕分けは走り続けるので、
+    # 冷えた初回の3秒は配信前に払っておく必要がある
+    if LIVE_GROUNDING_GATE != "llm":
         return
     try:
         for _ in range(2):

@@ -20,6 +20,16 @@ from psycopg2.extras import Json, RealDictCursor
 
 # 接続とスキーマ名は common/db.py が原典（Shorts の DB アクセスと共通）
 from common.db import LIVE_SCHEMA, connect  # noqa: F401
+from common.env import env_int
+
+# SNS の投稿を「フリートークに出してよい」とみなすスコアの下限。
+#
+# **Nagi と Bluesky で同じ値を使うこと。** 以前は両方 88 を直書きしていたが、
+# `affirmative_bot.posts` は15行しか残らない巻き取りウィンドウで、実測のスコアは
+# 65〜88（最大値が閾値と同値）。88 で切ると Bluesky 枠だけが頻繁に空になり、
+# 「Nagiの話はするのに Blueskyの話はしない」という偏りになる。nagi 側は
+# 70〜92 と分布に余裕があるので同じ閾値でも枯れない。
+LIVE_POST_MIN_SCORE = env_int("LIVE_POST_MIN_SCORE", 80)
 
 
 class BotMemoryWriter:
@@ -225,13 +235,14 @@ def get_today_activities(limit: int = 8) -> list:
 # botたんのホームは Nagi、Bluesky は毎日通う出張先。フリートークの枠も
 # 両方に用意する（片方しか無いと、そちらだけが居場所であるかのように喋る）。
 
-def get_bsky_posts(limit: int = 5, min_score: int = 88) -> list:
+def get_bsky_posts(limit: int = 5, min_score: int = None) -> list:
     """Bluesky の高得点ポスト。get_nagi_posts の Bluesky 版。
 
     `affirmative_bot.posts` は巻き取りウィンドウで、botたんが反応した投稿が
     本文とスコアつきで入っている。nagi 側と違い deleted_at / kossori に
     相当する列は無いので、条件はスコアと日付だけ。
     """
+    min_score = LIVE_POST_MIN_SCORE if min_score is None else min_score
     with connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
@@ -245,8 +256,9 @@ def get_bsky_posts(limit: int = 5, min_score: int = 88) -> list:
             return [dict(r) for r in cur.fetchall()]
 
 
-def get_nagi_posts(limit: int = 5, min_score: int = 88) -> list:
+def get_nagi_posts(limit: int = 5, min_score: int = None) -> list:
     """Nagi の高得点ポスト。pipeline.py:125-138 の SQL と同じ条件。"""
+    min_score = LIVE_POST_MIN_SCORE if min_score is None else min_score
     with connect() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""

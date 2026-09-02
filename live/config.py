@@ -136,6 +136,14 @@ BIORHYTHM_INTERNAL_SECRET = os.getenv("BIORHYTHM_INTERNAL_SECRET", "")
 BIORHYTHM_MEMORY_API_TIMEOUT_SEC = env_float("BIORHYTHM_MEMORY_API_TIMEOUT_SEC", 15.0)
 # 検索クエリの上限。長くしても当たりが良くなるわけではなく、遅くなるだけ
 BOT_MEMORY_QUERY_MAX_CHARS = env_int("BOT_MEMORY_QUERY_MAX_CHARS", 500)
+
+# ── 思い出し（コメントに聞かれたことを記憶から引く。live/recall.py） ──
+# プロンプトに載せる記憶の件数。多すぎると返事が資料の朗読になる
+LIVE_RECALL_LIMIT = env_int("LIVE_RECALL_LIMIT", 4)
+# **BIORHYTHM_MEMORY_API_TIMEOUT_SEC とは別にする。** あちらの既定15秒は
+# 先読み（雑務スレッド）の値で、そのままコメントへの反応の遅れになる場所には長すぎる。
+# 実測でコメント長のクエリなら2秒前後で返る
+LIVE_RECALL_TIMEOUT_SEC = env_float("LIVE_RECALL_TIMEOUT_SEC", 5.0)
 # ── ARDY（モーション生成） ────────────────────────
 ARDY_PORT          = _ardy.ARDY_PORT
 ARDY_URL           = _ardy.ARDY_URL

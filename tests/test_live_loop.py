@@ -56,6 +56,9 @@ def load_live():
         "motion": _stub("motion", MotionPool=object, ArdyWorker=object),
         "notify": _stub("notify", warn=lambda *a: None, error=lambda *a: None),
         "persona": _stub("persona", build_system_prompt=lambda: ""),
+        # recall は BotMemoryClient と DB を掴むので差し替える
+        "recall": _stub("recall", CommentRecall=object,
+                        subject_of=lambda _text: ""),
         "safety": _stub("safety"),
         "schedule": _stub("schedule"),
         "subtitle": _stub("subtitle", SubtitleScheduler=object),
@@ -68,6 +71,8 @@ def load_live():
         # ollama と Gemini を叩くので、ここでも差し替えておく
         "common.grounding": _stub(
             "common.grounding", SKIP="skip", UNKNOWN="unknown", FACTS="facts",
+            WEB="web", SELF="self", NONE="none",
+            classify=lambda _text: ("none", ""),
             needs_lookup=lambda _text: False,
             lookup=lambda _q: {"status": "skip", "facts": "", "queries": []},
             warmup=lambda: None),

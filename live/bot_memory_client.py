@@ -53,7 +53,13 @@ class BotMemoryClient:
             self.timeout,
         )
 
-    def search(self, query: str, exclude_document_ids=None, limit: int = 10) -> list:
+    def search(self, query: str, exclude_document_ids=None, limit: int = 10,
+               sources=None) -> list:
+        """記憶を引く。**sources を渡すとその source_type だけに絞れる。**
+
+        サーバ側が検証するので、綴りを間違えると 400 で何も返らない
+        （BOT_MEMORY_SOURCE_TYPES / botMemoryRouter.ts:29-33）。
+        """
         if not self.enabled or not query.strip():
             return []
         payload = {
@@ -61,6 +67,8 @@ class BotMemoryClient:
             "purpose": "live_filler",
             "limit": max(1, min(20, int(limit))),
         }
+        if sources:
+            payload["sources"] = list(sources)
         if exclude_document_ids:
             payload["excludeDocumentIds"] = [
                 value for value in exclude_document_ids
