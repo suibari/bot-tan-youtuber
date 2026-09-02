@@ -16,7 +16,15 @@ import socket
 import subprocess
 import time
 
+import logging
 import obsws_python as obs
+from obsws_python.error import OBSSDKRequestError
+
+# obsws_python は失敗のたびに logger.exception でトレースバックを吐く。
+# ハンドラを1つ足しておかないと logging の lastResort が stderr へ流し、
+# connect() のリトライ中に同じトレースがログを埋めて肝心の原因が見えなくなる。
+# 失敗の中身はこちらの ObsError のメッセージに載せている。
+logging.getLogger("obsws_python").addHandler(logging.NullHandler())
 
 from config import (OBS_HOST, OBS_PORT, OBS_PASSWORD, OBS_LAUNCH, OBS_COMMAND,
                     OBS_COLLECTION, OBS_PROFILE, LIVE_DISPLAY,
@@ -192,21 +200,46 @@ def _clear_crash_sentinel() -> None:
             print(f"[OBS] 前回の異常終了の痕跡を {len(stale)} 件消しました（{sentinel}）")
 
 
-def _stop_running(timeout: float = 30.0) -> None:
-    """動いている OBS を行儀よく止める（シーンを保存させるため）。"""
+def _signal_running(sig: int) -> None:
     r = subprocess.run(["pgrep", "-x", "obs"], capture_output=True, text=True)
-    pids = [int(p) for p in r.stdout.split()]
-    for pid in pids:
+    for pid in (int(p) for p in r.stdout.split()):
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, sig)
         except OSError:
             pass
+
+
+def _wait_port_closed(timeout: float) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not _port_open(OBS_HOST, OBS_PORT):
-            return
+            return True
         time.sleep(0.5)
+    return False
+
+
+def _stop_running(timeout: float = 30.0) -> bool:
+    """動いている OBS を行儀よく止める（シーンを保存させるため）。
+
+    止めきれたら True。時間内に消えなければ False。ポートが開いたままだと
+    launch() が「もう起動している」と誤認して、これから死ぬ OBS に繋ぎにいく。
+    """
+    _signal_running(signal.SIGTERM)
+    if _wait_port_closed(timeout):
+        return True
     print("[OBS] 終了を待てませんでした")
+    return False
+
+
+def _kill_running(timeout: float = 10.0) -> None:
+    """SIGTERM で消えなかった OBS を落とす。シーンの保存は諦める。"""
+    print("[OBS] 応答しないので強制終了します")
+    _signal_running(signal.SIGKILL)
+    if not _wait_port_closed(timeout):
+        raise ObsError(
+            f"動いている OBS を止められませんでした（{OBS_HOST}:{OBS_PORT} が開いたまま）。"
+            f"手で終了させてください"
+        )
 
 
 def _port_open(host: str, port: int, timeout: float = 1.0) -> bool:
@@ -234,7 +267,8 @@ def launch(timeout: float = 90.0) -> bool:
             # エンコーダの選択はプロファイル読み込み時に一度だけ決まるので、
             # 書き換えたなら起動し直さないと反映されない
             print("[OBS] 設定を反映するため起動し直します")
-            _stop_running()
+            if not _stop_running():
+                _kill_running()
         else:
             print(f"[OBS] すでに起動しています（{OBS_HOST}:{OBS_PORT}）")
             return False
@@ -291,17 +325,49 @@ class Obs:
         self._lock = threading.Lock()
         self._text_fails = 0
 
-    def connect(self, timeout: float = 10.0) -> "Obs":
-        try:
-            self.client = obs.ReqClient(
-                host=OBS_HOST, port=OBS_PORT, password=OBS_PASSWORD, timeout=timeout
-            )
-        except Exception as e:
-            raise ObsError(
-                f"OBS に接続できません（{OBS_HOST}:{OBS_PORT}）: {e}。"
-                f"OBS の[ツール]→[WebSocket サーバー設定]で有効化してください"
-            ) from e
-        version = self.client.get_version()
+    def connect(self, timeout: float = 10.0, ready_timeout: float = 60.0) -> "Obs":
+        """OBS がリクエストを受けられるようになるまで待ってから繋ぐ。
+
+        obs-websocket のポートは OBS 本体の初期化が終わる前から開いていて、
+        Hello/Identify のハンドシェイクまでは通ってしまう。その状態でリクエストを
+        投げると 207（NotReady, "OBS is not ready to perform the request"）が返る。
+        launch() はポートが開いた時点で戻ってくるので、ready はここで待つ。
+        シーンコレクションの読み込みが重い日は数十秒かかる。
+        """
+        deadline = time.time() + ready_timeout
+        waited = False
+        last = None
+        while True:
+            try:
+                self.client = obs.ReqClient(
+                    host=OBS_HOST, port=OBS_PORT, password=OBS_PASSWORD, timeout=timeout
+                )
+                version = self.client.get_version()
+                break
+            except OBSSDKRequestError as e:
+                if e.code != 207:
+                    # 待っても直らない類い（パスワード違い・未知のリクエスト等）
+                    raise ObsError(f"OBS がリクエストを拒否しました: {e}") from e
+                last = e
+            except Exception as e:
+                last = e
+            # 張りかけの接続を捨てる。捨てないとリトライのたびにソケットが残る
+            self.disconnect()
+            if time.time() >= deadline:
+                if isinstance(last, OBSSDKRequestError):
+                    raise ObsError(
+                        f"OBS の初期化が {ready_timeout:.0f} 秒で終わりませんでした: {last}。"
+                        f"シーンコレクション {OBS_COLLECTION} の読み込みが重い可能性があります"
+                    ) from last
+                raise ObsError(
+                    f"OBS に接続できません（{OBS_HOST}:{OBS_PORT}）: {last}。"
+                    f"OBS の[ツール]→[WebSocket サーバー設定]で有効化してください"
+                ) from last
+            if not waited:
+                # 207 とは限らない（起動直後は接続拒否のこともある）ので理由を添える
+                print(f"[OBS] まだ受け付けません。待ちます: {last}")
+                waited = True
+            time.sleep(1.0)
         print(f"[OBS] 接続しました: OBS {version.obs_version} / "
               f"websocket {version.obs_web_socket_version}")
         self.check_encoder()
