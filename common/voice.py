@@ -55,6 +55,35 @@ _TIMEOUT = (env_float("VOICEVOX_CONNECT_TIMEOUT_SEC", 5),
             env_float("VOICEVOX_READ_TIMEOUT_SEC", 15))
 _RETRY = env_int("VOICEVOX_RETRY", 1)
 
+# 合成が「遅い」とみなす秒数。読み取りタイムアウトの 1/3（既定5秒、録画時は40秒）。
+# 落ちる手前の状態を拾いたいだけなので、これを下回るときは何も出さない。
+_SLOW_SEC = _TIMEOUT[1] / 3
+
+
+def _host_pressure() -> str:
+    """そのときのホストの詰まり具合を1行で返す。読めなければ空文字。
+
+    VOICEVOX 自体は速い（99字で約2秒、CPU を6コア占有されても3.2秒）。それが
+    15秒返らないのは ollama がモデル（11GB, mmap）を読み直して I/O を飽和させ、
+    同居プロセスが道連れになるとき（2026-09-01 の配信で iowait 39%、
+    load_tensors 128回、ARDY も 300秒タイムアウト）。PSI の io/some avg10 が
+    その状態を直接示す——平常時は 1 前後、あの日なら数十——ので、遅かったとき
+    と落ちたときのログに必ず添える。エンジンが遅いのかホストが詰まったのかは
+    これが無いと切り分けられない。
+    """
+    parts = []
+    try:
+        with open("/proc/pressure/io") as f:
+            # "some avg10=39.21 avg60=... avg300=... total=..."
+            parts.append("io " + f.readline().split()[1])
+    except (OSError, IndexError):
+        pass          # PSI の無い環境。診断が欠けるだけで合成は止めない
+    try:
+        parts.append(f"load {os.getloadavg()[0]:.1f}")
+    except OSError:
+        pass
+    return " ".join(parts)
+
 
 class VoicevoxError(RuntimeError):
     pass
@@ -72,27 +101,42 @@ def _post_with_retry(url: str, what: str, **kwargs):
     なお話者IDが存在しない場合もエンジンは 4xx ではなく 500 を返すので、その手の
     設定ミスは再試行を使い切ってから落ちる。話者は固定なので実害はない。
     """
-    reason = None
+    detail = None
     delay = 1.0
     for attempt in range(_RETRY + 1):
+        started = time.monotonic()
         try:
             res = requests.post(url, timeout=_TIMEOUT, **kwargs)
             if res.status_code < 500:
                 res.raise_for_status()      # 4xx はここで上げて終わり
+                elapsed = time.monotonic() - started
+                if elapsed >= _SLOW_SEC:
+                    # 落ちてはいないが落ちる手前。次に全滅するときの前触れなので
+                    # 拾っておく。閾値未満は無言（毎回出すと配信ログが埋まる）
+                    pressure = _host_pressure()
+                    print(f"[VOICEVOX] {what} に {elapsed:.1f}秒かかりました"
+                          + (f"（{pressure}）" if pressure else ""))
                 return res
             reason = f"HTTP {res.status_code}"
         except (requests.exceptions.Timeout,
                 requests.exceptions.ConnectionError) as e:
             reason = type(e).__name__
+        # 後からログで追えるように必ず残す。8/31 の朝版の全滅は何回試して駄目
+        # だったのかが分からず切り分けに時間がかかり、9/1 の配信では待った秒数と
+        # そのときのホストの状態が分からず、エンジンが遅いのか I/O が詰まった
+        # のかを journal と sar を突き合わせて後から推定する羽目になった
+        elapsed = time.monotonic() - started
+        pressure = _host_pressure()
+        detail = f"{reason} / {elapsed:.1f}秒" + (f" / {pressure}" if pressure else "")
         if attempt == _RETRY:
             break
-        # 後からログで追えるように必ず残す。今回の朝版の全滅は、何回試して駄目
-        # だったのかがログから分からず切り分けに時間がかかった
-        print(f"[VOICEVOX] {what} が返りません（{reason}）。"
+        print(f"[VOICEVOX] {what} が返りません（{detail}）。"
               f"{delay:.0f}秒待って再試行します（{attempt + 1}/{_RETRY}）")
         time.sleep(delay)
         delay *= 2
-    raise VoicevoxError(f"{what} が{_RETRY + 1}回とも失敗しました（{reason}）")
+    # このメッセージは live/live.py がそのまま Discord へ流す。配信中に通知を
+    # 見た時点で I/O 起因かどうかが分かるように、詳細ごと載せる
+    raise VoicevoxError(f"{what} が{_RETRY + 1}回とも失敗しました（{detail}）")
 
 
 def health_check() -> str:
