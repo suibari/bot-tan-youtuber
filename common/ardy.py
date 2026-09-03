@@ -11,6 +11,7 @@ live/motion.py に別々の実装があり、片方にしか無い防御が複�
 
 import os
 import json
+import shutil
 import signal
 import subprocess
 import time
@@ -21,11 +22,23 @@ import requests
 from common.env import env_flag, LOGS_DIR
 from common import motion_safety
 
+# エンジン一式（venv 7.2GB + hf-cache 17GB）の置き場。**中身は SSD にあること。**
+# ここは venv/bin/python と HF_HOME の親で、起動のたびに全部読み直される。
+#
+# 2026-08-30 に実体を SSD (/home/suibari/ardy-engine) へ移し、この既定値は
+# そこへの symlink になっている。venv には絶対パスが焼き込まれているため
+# （site-packages の __editable___ardy_0_2_0_finder.py が ardy/ を直接指す）、
+# パスを変えずに symlink で差し替えるのが一番安全。
+#
+# 実測（1.5GB を direct I/O で読む）:
+#   HDD  /mnt/data (WDC WD20EARX)  89 MB/s
+#   SSD  /         (KIOXIA SATA)  442 MB/s
+# ready までの時間は 175秒 → 101秒 になった。
 ARDY_ENGINE_ROOT = os.getenv("ARDY_ENGINE_ROOT", "/mnt/data/ardy-engine")
 # テキストエンコーダ(15GB)の置き場。ARDY_ENGINE_ROOT とは別に指定できる。
-# 実測: HDD(sda1) 41〜111MB/s に対し SSD(sdb2) 384MB/s。
 # HDD 上だと mmap のランダム読みで ready まで530秒以上かかり
-# ARDY_READY_TIMEOUT に間に合わないため、ここだけ SSD に置く
+# ARDY_READY_TIMEOUT に間に合わないため、ここだけ先に SSD へ移してあった
+# （エンジン一式が SSD へ移った今も、別指定できる状態は残しておく）
 ARDY_MERGED_BASE = os.getenv("ARDY_MERGED_BASE",
                              str(Path(ARDY_ENGINE_ROOT) / "llm2vec-base-merged"))
 ARDY_REPO = os.getenv("ARDY_REPO", "/home/suibari/work/text-to-vrma")
@@ -65,12 +78,20 @@ ARDY_ARM_SPREAD = float(os.getenv("ARDY_ARM_SPREAD", "8"))
 # Shorts の長尺ブロックと、配信の1本ぶん（数セグメント連結）で同じ値を使う
 ARDY_BLEND_SEC = float(os.getenv("ARDY_BLEND_SEC", "0.7"))
 
-# 空きメモリが足りないとき、ここまで待つ[秒]。
-# ollama は既定5分のkeep_aliveでモデルを自動解放するので、待てば空くことが多い
+# 空きメモリが足りないとき、ここまで待つ[秒]。ここで見ているのは
+# **システム RAM だけ**で、VRAM も GPU の混み具合も判定していない（vram_free_gb 参照）。
+#
+# NOTE: 「ollama は既定5分の keep_alive で解放するので待てば空く」と書いてあったが、
+# 2026-08-30 以降このホストの ollama は OLLAMA_KEEP_ALIVE=-1 で常駐しており成り立たない。
+# 待っても空かないので、これは「起動が重なった瞬間をやり過ごす」以上の意味を持たない
 ARDY_MEM_WAIT_SEC = float(os.getenv("ARDY_MEM_WAIT_SEC", "360"))
 # true にすると生成前に ollama のモデルをアンロードさせる。
-# ollama は次のリクエストで自動的に読み直すので停止はしないが、
-# そちらのサービスの次回応答が数秒遅くなる。既定は無効（他サービスに触らない）
+#
+# **既定の false から動かさないこと。** 2026-09-02 に実測したところ、ARDY が遅いのは
+# VRAM 不足ではなく ollama の runner が作り直され続けていること（num_ctx の食い違いで
+# 1時間に114回）だった。ここで降ろしても外部クライアントが即座に載せ直すので、
+# 11GB の読み直しを1回増やすだけで逆効果になる。直すべきはサーバ側の
+# OLLAMA_CONTEXT_LENGTH（setup/ollama-override.conf）。
 ARDY_FREE_OLLAMA = env_flag("ARDY_FREE_OLLAMA")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
@@ -93,6 +114,53 @@ def mem_available_gb() -> float:
     except Exception:
         pass
     return float("inf")   # 読めないなら判定しない
+
+
+def vram_free_gb() -> float:
+    """GPU の空き VRAM[GB]。読めなければ inf（＝判定しない）。
+
+    wait_memory() が見ているのはシステム RAM だけで、GPU 側は誰も見ていなかった。
+    2026-09-02 の調査では ARDY が落ちてもログに GPU の情報が一切残っておらず、
+    journalctl -u ollama を突き合わせるまで原因が分からなかった。
+    """
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return int(r.stdout.split()[0]) / 1024
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
+        pass
+    return float("inf")
+
+
+def ollama_loaded() -> list[dict]:
+    """ollama が今 GPU に載せているモデル。読めなければ空リスト。
+
+    ARDY と同居している相手を名指しするためのもの。context_length まで見るのは、
+    これが呼び出しごとにずれると runner が作り直されて 11GB が読み直されるため
+    （setup/ollama-override.conf の OLLAMA_CONTEXT_LENGTH を参照）。
+    """
+    try:
+        r = requests.get(f"{OLLAMA_URL}/api/ps", timeout=5)
+        return [{"name": m.get("name", "?"),
+                 "size_gb": m.get("size", 0) / 1e9,
+                 "ctx": m.get("context_length")}
+                for m in r.json().get("models", [])]
+    except Exception:
+        return []
+
+
+def log_gpu_state(prefix: str = "[ARDY]") -> None:
+    """生成の直前に GPU の状況を1行残す。失敗しても黙って諦める。"""
+    free = vram_free_gb()
+    free_s = "不明" if free == float("inf") else f"{free:.1f}GB"
+    loaded = ollama_loaded()
+    if loaded:
+        who = " / ".join(f"{m['name']}({m['size_gb']:.1f}GB, ctx={m['ctx']})" for m in loaded)
+    else:
+        who = "なし"
+    print(f"{prefix} 生成前の GPU: VRAM 空き {free_s} / ollama 常駐 {who}")
 
 
 def _free_ollama() -> None:
@@ -144,7 +212,7 @@ _available_cache: bool | None = None
 def available(fallback_msg: str = FALLBACK_MSG_SHORTS) -> bool:
     """エンジン一式が揃っているか。別ドライブ未マウント時などに False になる。
 
-    中の `import ardy` は HDD 上の venv を読むので冷えていると数十秒かかる。
+    中の `import ardy` は venv を読むので、冷えていると数秒かかる。
     結果をキャッシュして1回で済ませる。
     """
     global _available_cache
@@ -221,12 +289,16 @@ def kill_stray_server() -> None:
 
 
 def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
-          fallback_msg: str = FALLBACK_MSG_SHORTS):
+          fallback_msg: str = FALLBACK_MSG_SHORTS, low_priority: bool = False):
     """ARDYサーバーを起動する。
 
     既に起動済みで reuse=True ならそれを再利用し None を返す
     （そのサーバーは stop() で落とさない）。エンジンが無い場合も None を返す。
     起動できたかどうかは wait_ready() で判定すること。
+
+    low_priority=True にすると ionice を噛ませて I/O の優先度を下げる。読み込みの
+    完了を待たずに裏で走らせる録画側で使う。配信側は使わない（配信前に読み込みの
+    完了を待つので発話とは競合せず、下げると配信の開始が遅れるだけ）。
     """
     if not available(fallback_msg):
         return None
@@ -260,6 +332,18 @@ def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
            str(Path(ARDY_REPO) / "tools/ardy-engine/server.py"),
            "--port", str(ARDY_PORT),
            "--merged-base", ARDY_MERGED_BASE]
+    if low_priority:
+        # 読み込みは数分ぶんの I/O を食い切る。CPU 版 VOICEVOX と重なると合成が
+        # 数十秒に伸びて録画が落ちる（2026-08-31 の朝版はこれで全滅した。実測で
+        # iowait 21%、読み込み 43MB/s）。裏で走らせるあいだは譲る。
+        #
+        # **CPU 優先度は下げてはいけない。** nice -n 10 も付けたところ、読み込み後
+        # の生成が 15〜47秒から300秒超に伸びてタイムアウトした（同日）。nice は
+        # プロセスに残り続けるので、読み込みだけでなく推論まで遅くなる。
+        # テキストエンコーダは TEXT_ENCODER_DEVICE=cpu で CPU に載るため直撃する。
+        # 落としたいのは読み込み中の I/O だけなので ionice に絞る。
+        if shutil.which("ionice"):
+            cmd = ["ionice", "-c3"] + cmd
     print(f"[ARDY] サーバー起動: {' '.join(cmd)}")
     # 出力を捨てると起動に失敗したとき /health の error 文字列しか手掛かりが無くなる。
     # トレースバックを残す（プロセス終了時にOSが閉じるのでfpは持ち回らない）

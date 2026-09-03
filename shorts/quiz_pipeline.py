@@ -2,11 +2,11 @@
 """
 botたん 朝の勘違いクイズ Shorts 自動投稿パイプライン
 
-JST 6:00 に起動し、約55秒のクイズ動画を生成して YouTube に投稿する。
+JST 6:00 に起動し、約30秒のクイズ動画を生成して YouTube に投稿する。
 
-構成（尺は区間ごとに発話長で決まる。シンキングタイムだけ5秒固定）:
+構成（尺は区間ごとに発話長で決まる。シンキングタイムだけ3秒固定）:
   Q      問題提示       問題文と選択肢A/Bの表示
-  THINK  シンキング     カウントダウン音声 + ゲージ（5.000秒固定）
+  THINK  シンキング     カウントダウン音声 + ゲージ（3.000秒固定）
   A      正解発表       正解のハイライト
   EXPL   解説           解説テキスト
   AFF    全肯定コメント 豆知識について全肯定する
@@ -46,11 +46,16 @@ from quiz_prompts import (
     build_quiz_user_prompt, build_fallback_script, validate_script,
 )
 
-# シンキングタイムは仕様上ここだけ固定
-THINK_DURATION = 5.0
+# シンキングタイムは仕様上ここだけ固定。
+# COUNTDOWN_WORDS は1秒間隔に置かれるので、語数 = 秒数にすること
+THINK_DURATION = 3.0
 
 # カウントダウンの読み。数字表記だと読み違いが出るので仮名で指定する
-COUNTDOWN_WORDS = ["ご", "よん", "さん", "にー", "いち"]
+COUNTDOWN_WORDS = ["さん", "にー", "いち"]
+
+# 尺が長すぎたときに警告を出す閾値[秒]。目標は30秒。
+# 無人実行なので生成は止めず、ログに残してプロンプト調整の材料にする
+QUIZ_DURATION_WARN_SEC = 35.0
 
 # パート間に入れる無音（秒）。THINK後の溜めを長めにして「正解は……」を引き立てる
 PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "END": 0.0}
@@ -252,6 +257,9 @@ def build_audio(script: dict, ending_sentences: list[dict],
 
     actual_total = core.get_wav_duration(wav_path)
     print(f"[音声] 合計 {actual_total:.3f}秒 (計算値 {t:.3f}秒)")
+    if actual_total > QUIZ_DURATION_WARN_SEC:
+        print(f"[警告] 尺が長すぎます: {actual_total:.1f}秒 "
+              f"(目標30秒 / 警告閾値{QUIZ_DURATION_WARN_SEC}秒)")
     for s in segments:
         print(f"  {s['id']:6s} {s['start']:6.2f}s 〜 {s['end']:6.2f}s ({s['duration']:5.2f}s)")
 
@@ -298,7 +306,6 @@ def build_subtitles(segments: list[dict], max_chars: int = 20) -> list[dict]:
                 time_offset=spans[0]["start"],
                 actual_duration=round(spans[-1]["end"] - spans[0]["start"], 3),
                 max_chars=max_chars,
-                merge_short=True,   # 「萩、」「桔梗、」のような細切れを防ぐ
             )
         for s in subs:
             s["part"] = seg["id"]
@@ -526,10 +533,12 @@ def main(argv=None):
         print(f"[クイズ] id={quiz['id']} 「{quiz['問題']}」 正解={quiz['正解']}")
 
         # ── ARDYサーバーを先に起動しておく。
-        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる
+        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる。
+        # 裏で走るぶん優先度は下げる。CPU 版 VOICEVOX と食い合うと合成が数十秒に
+        # 伸びて Step3 で落ちる（2026-08-31）。読み込みは遅れても待てる
         ardy_proc = None
         if core.VRMA_MOTION_DIR and not args.preview:
-            ardy_proc = core.ardy_start()
+            ardy_proc = core.ardy_start(low_priority=True)
 
         # ── Step 2: 台本生成
         script = core._timed("Step2 台本生成", generate_quiz_script, quiz)
@@ -576,6 +585,13 @@ def main(argv=None):
             finally:
                 core.ardy_stop(ardy_proc)
                 ardy_proc = None
+            if not vrma_motions:
+                # 動画は完成するのでパイプラインは成功のまま（notify.error ではない）。
+                # 黙らせておくと「動画は出ているが棒立ち」に何日も気づけない。
+                # 2026-09-02 の朝は exit 0 で公開まで通り、誰も気づかなかった
+                from common import notify
+                notify.warn("朝のクイズ: ARDY のモーション生成に失敗しました。"
+                            "モーション無しで公開します（logs/quiz_*.log を確認）")
 
         # ── Step 4: 表情タイムライン
         import random

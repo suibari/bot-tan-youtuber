@@ -17,7 +17,6 @@
 """
 
 import subprocess
-import unicodedata
 
 import core
 
@@ -76,45 +75,12 @@ CORNER_LABEL = "朝の勘違いクイズ"
 # テキスト折り返し
 # ──────────────────────────────────────────────
 
-# 行頭に来てほしくない文字（小書き仮名・長音符・約物）
-_NO_LINE_START = set("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮーぐんゝゞ、。，．・？！」』）】〕〉》")
-_NO_LINE_END   = set("「『（【〔〈《")
-
-
-def _char_width(ch: str) -> int:
-    return 2 if unicodedata.east_asian_width(ch) in "WFA" else 1
-
-
-def wrap_cjk(text: str, max_units: int) -> list[str]:
-    """全角=2 / 半角=1 で数えて折り返す。textwrap は CJK の幅を扱えないため自前。
-
-    行頭に小書き仮名や句読点が来ないよう、1文字ぶん前の行に送る。
-    """
-    lines: list[str] = []
-    cur = ""
-    width = 0
-    for ch in text:
-        cw = _char_width(ch)
-        if width + cw > max_units and cur:
-            # 次の文字が行頭に来られないなら、この文字は今の行に残す
-            if ch in _NO_LINE_START:
-                cur += ch
-                lines.append(cur)
-                cur, width = "", 0
-                continue
-            # 行末に来られない文字で終わるなら1文字繰り越す
-            if cur[-1] in _NO_LINE_END:
-                carry = cur[-1]
-                lines.append(cur[:-1])
-                cur, width = carry, _char_width(carry)
-            else:
-                lines.append(cur)
-                cur, width = "", 0
-        cur += ch
-        width += cw
-    if cur:
-        lines.append(cur)
-    return lines
+# 折り返しは夜版と共有する（core）。禁則処理を2箇所に持つと片方だけ直る。
+wrap_cjk            = core.wrap_cjk
+wrap_subtitle_lines = core.wrap_subtitle_lines
+_NO_LINE_START      = core._NO_LINE_START
+_NO_LINE_END        = core._NO_LINE_END
+_char_width         = core._char_width
 
 
 def _enable(start: float, end: float) -> str:
@@ -223,10 +189,11 @@ def build_answer_filters(quiz: dict, start: float, end: float) -> list[str]:
     ]
 
 
-def build_gauge_filters(start: float, duration: float = 5.0, steps: int = 50) -> list[str]:
+def build_gauge_filters(start: float, duration: float = 3.0, steps: int = 50) -> list[str]:
     """減少ゲージ。drawbox が時間式を持てないので階段状に並べる。
 
     実測: 1080x1920 / 5秒 / 50段でエンコード増分は 0.6秒程度。
+    既定値は THINK_DURATION（quiz_pipeline.py）と揃えてある。
     """
     end = start + duration
     filters = [
@@ -252,8 +219,12 @@ def build_gauge_filters(start: float, duration: float = 5.0, steps: int = 50) ->
     return filters
 
 
-def build_countdown_filters(start: float, duration: float = 5.0) -> list[str]:
-    """残り秒数の数字（1秒ごとに切り替え）。ゲージの右側、パネル内に置く。"""
+def build_countdown_filters(start: float, duration: float = 3.0) -> list[str]:
+    """残り秒数の数字（1秒ごとに切り替え）。ゲージの右側、パネル内に置く。
+
+    既定値は THINK_DURATION（quiz_pipeline.py）と揃えてある。
+    表示する数字は duration から作るので、秒数を変えても追従する。
+    """
     n = int(duration)
     return [
         _text(str(n - i), COUNT_SIZE, MINT, str(COUNT_X), COUNT_Y,
@@ -272,8 +243,8 @@ def build_caption_filters(subtitles: list[dict], parts: set[str],
     for s in subtitles:
         if s.get("part") not in parts:
             continue
-        lines = wrap_cjk(s["text"], max_units)
-        for i, line in enumerate(lines[:2]):
+        lines = wrap_subtitle_lines(s["text"], max_units)
+        for i, line in enumerate(lines):
             filters.append(
                 _text(line, size, color, "(w-text_w)/2", y + i * line_h,
                       s["start"], s["end"]))

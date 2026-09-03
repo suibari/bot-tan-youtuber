@@ -33,6 +33,29 @@ if [ ! -f /usr/lib/x86_64-linux-gnu/nvidia/xorg/nvidia_drv.so ]; then
     exit 1
 fi
 
+# NoScanout (UseDisplayDevice=None) では NVIDIA 595.84 + RTX 5070 Ti の
+# Unity Editor が約1fpsになり、OpenGL present 中に abort した。接続中の実モニタから
+# EDIDを保存し、xorg-bottan-live.conf が未使用端子 DFP-1 のダミー表示として読む。
+# /sys の card番号は起動ごとに変わり得るので決め打ちしない。
+EDID_SOURCE=""
+for STATUS_FILE in /sys/class/drm/card*-*/status; do
+    [ -r "$STATUS_FILE" ] || continue
+    [ "$(tr -d '\n' < "$STATUS_FILE")" = "connected" ] || continue
+    CANDIDATE="$(dirname "$STATUS_FILE")/edid"
+    [ -r "$CANDIDATE" ] || continue
+    EDID_SIZE="$(wc -c < "$CANDIDATE")"
+    if [ "$EDID_SIZE" -ge 128 ]; then
+        EDID_SOURCE="$CANDIDATE"
+        break
+    fi
+done
+if [ -z "$EDID_SOURCE" ]; then
+    echo "接続中モニターのEDIDを取得できません。モニターを接続して再実行してください。" >&2
+    exit 1
+fi
+install -m 0644 "$EDID_SOURCE" /etc/X11/bottan-live.edid
+echo "EDIDを保存しました: $EDID_SOURCE -> /etc/X11/bottan-live.edid"
+
 install -m 0644 "$HERE/xorg-bottan-live.conf" /etc/X11/xorg-bottan-live.conf
 install -m 0644 "$HERE/bottan-live-xorg.service" /etc/systemd/system/bottan-live-xorg.service
 systemctl daemon-reload
@@ -47,6 +70,15 @@ for i in $(seq 1 20); do
     if [ -e /tmp/.X11-unix/X99 ]; then
         echo "OK: DISPLAY=:99 が使えます"
         DISPLAY=:99 glxinfo -B 2>/dev/null | grep -i "renderer" || true
+
+        # ソケットがあっても CurrentMetaMode=NULL の NoScanout では表示クロックがなく、
+        # Unity Editor は約1fpsになる。実際に現在モードへ * が付いていることを確認する。
+        if ! DISPLAY=:99 xrandr --current | grep -Eq '[0-9]+\.[0-9]+\*'; then
+            echo "DISPLAY=:99 に有効なリフレッシュレートがありません。" >&2
+            echo "Xorgログで CustomEDID / MetaModes を確認してください。" >&2
+            exit 1
+        fi
+        DISPLAY=:99 xrandr --current | grep -E '[0-9]+x[0-9]+.*\*' | head -1
 
         # ウィンドウマネージャ。OBS の XComposite ウィンドウキャプチャは
         # EWMH 準拠の WM が居ないとプラグインごと無効化される（ソース追加の

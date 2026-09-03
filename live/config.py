@@ -21,7 +21,7 @@ from common.env import (  # noqa: E402
     ROOT, DATA_DIR, LOGS_DIR, AFFIRMATIVE_BOT_DIR,
     env_flag, env_float, env_int, env_float_opt,
 )
-from common import ardy as _ardy, llm as _llm, voice as _voice  # noqa: E402
+from common import ardy as _ardy, grounding as _grounding, llm as _llm, voice as _voice  # noqa: E402
 from common import vrma_style as _vrma_style  # noqa: E402
 from common.db import DB_CONFIG  # noqa: E402,F401
 
@@ -67,6 +67,10 @@ LIVE_MOUTH_CLOSE = env_float("LIVE_MOUTH_CLOSE", 1.0)
 LIVE_CHARACTER_YAW = env_float_opt("LIVE_CHARACTER_YAW")
 LIVE_PORT     = env_int("LIVE_PORT", 2338)
 UNITY_URL     = f"http://127.0.0.1:{LIVE_PORT}"
+# Editor が配信中に落ちても YouTube/OBS まで終了させず、同じ配信の中で起こし直す。
+UNITY_RESTART_MAX = env_int("UNITY_RESTART_MAX", 2)
+UNITY_RESTART_TIMEOUT_SEC = env_float("UNITY_RESTART_TIMEOUT_SEC", 120.0)
+UNITY_RESTART_COOLDOWN_SEC = env_float("UNITY_RESTART_COOLDOWN_SEC", 30.0)
 
 # ── 音声の経路 ────────────────────────────────────
 # Unity の音を OBS へ渡す専用の null シンク。詳細は audio.py の冒頭を参照
@@ -75,10 +79,14 @@ LIVE_AUDIO_SINK = os.getenv("LIVE_AUDIO_SINK", "bottan_live")
 # ── 待機中の演出 ──────────────────────────────────
 # 喋っていない間もモーションと表情を動かす。止まっていると人形に見える
 IDLE_ENABLED       = env_flag("IDLE_ENABLED", True)
-IDLE_MOTION_MIN_SEC = env_float("IDLE_MOTION_MIN_SEC", 9.0)
+# しぐさの間隔。1本が約9秒なので、9〜20秒だと待機時間の4割は棒立ちになる
+IDLE_MOTION_MIN_SEC = env_float("IDLE_MOTION_MIN_SEC", 6.0)
 IDLE_MOTION_MAX_SEC = env_float("IDLE_MOTION_MAX_SEC", 20.0)
-IDLE_EMOTION_MIN_SEC = env_float("IDLE_EMOTION_MIN_SEC", 6.0)
-IDLE_EMOTION_MAX_SEC = env_float("IDLE_EMOTION_MAX_SEC", 14.0)
+# 表情を動かす間隔。Unity 側が Lerp で繋ぐので、短くしても百面相にはならない
+IDLE_EMOTION_MIN_SEC = env_float("IDLE_EMOTION_MIN_SEC", 3.0)
+IDLE_EMOTION_MAX_SEC = env_float("IDLE_EMOTION_MAX_SEC", 8.0)
+# ほほえみパルスを保つ長さ[秒]。黙っている間にときどき笑顔を作る
+IDLE_SMILE_HOLD_SEC = env_float("IDLE_SMILE_HOLD_SEC", 1.5)
 
 # ── VOICEVOX ─────────────────────────────────────
 # 10101 は AivisSpeech Engine の既定ポートでもある。起動時に /speakers で実体を確認する
@@ -93,10 +101,27 @@ WAV_CHANNELS = _voice.WAV_CHANNELS
 USE_LOCAL_LLM   = _llm.USE_LOCAL_LLM
 GEMINI_API_KEY  = _llm.GEMINI_API_KEY
 GEMINI_BASE_URL = _llm.GEMINI_BASE_URL
-LOCAL_LLM_URL   = _llm.LOCAL_LLM_URL
+# ネイティブ /api/chat のルート（`/v1` は付かない）。OpenAI 互換では num_ctx を
+# 渡せないので、ローカル生成はすべてネイティブを使う。理由は common/llm.py
+OLLAMA_URL      = _llm.OLLAMA_URL
+OLLAMA_NUM_CTX  = _llm.OLLAMA_NUM_CTX
 LOCAL_LLM_MODEL = _llm.LOCAL_LLM_MODEL
 # カンマ区切りで複数指定でき、左から順にフォールバックする
 GEMINI_MODELS   = _llm.GEMINI_MODELS
+
+# ── 調べもの（Google 検索グラウンディング） ────────
+# コメントで聞かれたことを検索して答えるための設定。原典は common/grounding.py で、
+# なぜ返答生成そのものに検索を載せられないかもそちらに書いてある
+LIVE_GROUNDING             = _grounding.LIVE_GROUNDING
+LIVE_GROUNDING_MODELS      = _grounding.LIVE_GROUNDING_MODELS
+LIVE_GROUNDING_THINKING    = _grounding.LIVE_GROUNDING_THINKING
+LIVE_GROUNDING_TIMEOUT_SEC = _grounding.LIVE_GROUNDING_TIMEOUT_SEC
+# 「調べる必要があるコメントか」の判定（ローカルの ollama。API は叩かない）
+LIVE_GROUNDING_GATE             = _grounding.LIVE_GROUNDING_GATE
+LIVE_GROUNDING_GATE_MODEL       = _grounding.LIVE_GROUNDING_GATE_MODEL
+LIVE_GROUNDING_GATE_TIMEOUT_SEC = _grounding.LIVE_GROUNDING_GATE_TIMEOUT_SEC
+LIVE_GROUNDING_GATE_KEEPALIVE   = _grounding.LIVE_GROUNDING_GATE_KEEPALIVE
+LIVE_GROUNDING_GATE_LOAD_SEC    = _grounding.LIVE_GROUNDING_GATE_LOAD_SEC
 
 # ── DB（botたんの記憶） ───────────────────────────
 # ── biorhythm（energy） ──────────────────────────
@@ -111,6 +136,14 @@ BIORHYTHM_INTERNAL_SECRET = os.getenv("BIORHYTHM_INTERNAL_SECRET", "")
 BIORHYTHM_MEMORY_API_TIMEOUT_SEC = env_float("BIORHYTHM_MEMORY_API_TIMEOUT_SEC", 15.0)
 # 検索クエリの上限。長くしても当たりが良くなるわけではなく、遅くなるだけ
 BOT_MEMORY_QUERY_MAX_CHARS = env_int("BOT_MEMORY_QUERY_MAX_CHARS", 500)
+
+# ── 思い出し（コメントに聞かれたことを記憶から引く。live/recall.py） ──
+# プロンプトに載せる記憶の件数。多すぎると返事が資料の朗読になる
+LIVE_RECALL_LIMIT = env_int("LIVE_RECALL_LIMIT", 4)
+# **BIORHYTHM_MEMORY_API_TIMEOUT_SEC とは別にする。** あちらの既定15秒は
+# 先読み（雑務スレッド）の値で、そのままコメントへの反応の遅れになる場所には長すぎる。
+# 実測でコメント長のクエリなら2秒前後で返る
+LIVE_RECALL_TIMEOUT_SEC = env_float("LIVE_RECALL_TIMEOUT_SEC", 5.0)
 # ── ARDY（モーション生成） ────────────────────────
 ARDY_PORT          = _ardy.ARDY_PORT
 ARDY_URL           = _ardy.ARDY_URL
@@ -184,13 +217,45 @@ FPS_LOG_SEC = env_float("FPS_LOG_SEC", 60.0)
 # energy は分単位でしか動かないので、数秒のキャッシュで実害はない
 BOT_CONTEXT_TTL_SEC = env_float("BOT_CONTEXT_TTL_SEC", 20.0)
 
+# mood（さっきまでしてたこと）を1つあたり何回プロンプトに載せてよいか。
+# mood は 20〜90分ごとにしか変わらないので、素で入れ続けると1時間の配信の
+# 全発話（60回前後）に同じ文が乗る。2026-08-24 の配信で「FLASHBULB」の話が
+# 14回出たのはこれが主因。1回載せれば高い確率でその話をするので、既定は1。
+BOT_MOOD_SERVE_LIMIT = env_int("BOT_MOOD_SERVE_LIMIT", 1)
+
 # ── 配信の振る舞い ────────────────────────────────
-# コメントがこの秒数途切れたらフリートークを挟む
-FILLER_IDLE_SEC = env_float("FILLER_IDLE_SEC", 90.0)
-# 同一ユーザーの連投をこの秒数だけ間引く
+# コメントがこの秒数途切れたらフリートークを挟む。
+# 90秒だと「黙っている時間」が長すぎて放送事故に見える。短くすると LLM と
+# VOICEVOX の呼び出し回数が増えるので、詰めるならレート制限に注意すること
+FILLER_IDLE_SEC = env_float("FILLER_IDLE_SEC", 25.0)
+# クロージングの何秒前からフリートークと掘り下げをやめるか。
+# ここから先はコメントの消化に専念する（run_loop は LIVE_CLOSING_HHMM で
+# 抜けてしまい、それ以降のコメントには一切反応できないため）
+FILLER_STOP_LEAD_SEC = env_float("FILLER_STOP_LEAD_SEC", 120.0)
+# 直近の発話からこの秒数空いたら、いま話しているテーマを掘り下げる。
+# 「答えて終わり」にせず、別の角度をもう一言足して間を埋める
+FOLLOWUP_IDLE_SEC = env_float("FOLLOWUP_IDLE_SEC", 8.0)
+# 1つのテーマを何回まで掘るか。深追いすると話が一人歩きする
+FOLLOWUP_MAX_DEPTH = env_int("FOLLOWUP_MAX_DEPTH", 2)
+# テーマの寿命[秒]。これを過ぎたら掘り下げず、新しい話題へ移る
+FOLLOWUP_TTL_SEC = env_float("FOLLOWUP_TTL_SEC", 120.0)
+# 同一ユーザーの連投をこの秒数だけ間引く。
+# **他に返事できるコメントが無いときは無視される**（chat.CommentQueue._next_index）。
+# 1人しか居ないのに黙ってフリートークへ流れると、会話が続かないため
 COMMENT_USER_COOLDOWN_SEC = env_float("COMMENT_USER_COOLDOWN_SEC", 60.0)
+# LLM へ会話履歴として渡す「場の流れ」のターン数（コメント返答もフリートークも1ターン）。
+# 増やすほど話はつながるが、そのぶん入力トークンが増えて返事が遅くなる。
+# 1ターンは日本語で 100〜150字ほど。system prompt が約7000字あるので、6ターンで1割弱
+LIVE_HISTORY_TURNS = env_int("LIVE_HISTORY_TURNS", 6)
+# 上の流れから押し出されても、いま返す相手とのやりとりだけは覚えておく件数
+LIVE_HISTORY_USER_TURNS = env_int("LIVE_HISTORY_USER_TURNS", 3)
 # 視聴者コメントの文字数上限。これを超える分は切り捨てる
 COMMENT_MAX_CHARS = env_int("COMMENT_MAX_CHARS", 200)
+# 一般視聴者のコメントをこの秒数まで待たせたら、返事せずに捨てる。
+# 取り出しは同じ優先度なら古い順なので、滞留を放っておくと「5分前のコメントに
+# いま返事する」状態になり、視聴者から見た遅れが配信の後半ほど伸びていく。
+# 0 以下で無効。スパチャ・メンバー・オーナーは古くても捨てない
+COMMENT_MAX_AGE_SEC = env_float("COMMENT_MAX_AGE_SEC", 180.0)
 
 # ── 運用 ─────────────────────────────────────────
 DRY_RUN         = env_flag("DRY_RUN")          # YouTube に触らずローカルだけで回す

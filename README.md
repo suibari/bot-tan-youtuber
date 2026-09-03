@@ -17,6 +17,7 @@
 common/           両方から呼ばれるもの。ここを直すと両方に効く
   env.py            パス解決（ROOT/DATA_DIR/LOGS_DIR）と環境変数の読み取り
   llm.py            LLM クライアント・モデルのフォールバック・JSON 取得
+  grounding.py      配信で聞かれたことを Google 検索で調べる（native REST）
   voice.py          VOICEVOX 合成・結合・無音・モーラタイミング
   ardy.py           ARDY サーバの起動/待機/停止と .vrma 生成
   motion_safety.py  モーション指示文の禁止語・主語の正規化・待機動作
@@ -49,8 +50,10 @@ logs/             pipeline_* quiz_* live_* ardy_*
                    ↑ HTTP :2338      │
                    └──────────┬──────┘
                        [live/live.py]
-                              ├→ VOICEVOX      localhost:10101 (speaker=8)
-                              ├→ Gemini        OpenAI互換エンドポイント
+                              ├→ VOICEVOX      localhost:10101 (speaker=8, CPU)
+                              ├→ ollama        localhost:11434 /api/chat（返答生成）
+                              ├→ Gemini        native REST + googleSearch（調べもの）
+                              ├→ ollama        localhost:11434（調べるか否かの判定）
                               ├→ ARDY          127.0.0.1:2337（非同期）
                               ├→ PostgreSQL    192.168.1.200:5432
                               ├→ biorhythm     localhost:3002
@@ -228,9 +231,67 @@ Already in non_texture encoder, can't fall back further!
 Stream output type 'rtmp_output' failed to start!
 ```
 
-GPU は 8GB しかなく、ARDY・Unity・VOICEVOX（と常駐している ollama）で埋まっていて
-NVENC のぶんが残らない。**OBS はここからソフトウェアエンコーダへ落ちてくれない**
-ので、はじめから x264 を指定する。1080p30 なら CPU 側に余裕がある。
+GPU が ARDY・Unity・ollama で埋まっていて NVENC のぶんが残らない。
+**OBS はここからソフトウェアエンコーダへ落ちてくれない**ので、はじめから x264 を
+指定する。1080p30 なら CPU 側に余裕がある。
+
+VRAM の内訳（RTX 5070 Ti / 16,303 MiB）:
+
+| | VRAM |
+|---|---|
+| ollama `llama-server`（gemma-4-26B UD-IQ3_S, num_ctx 32768, KV q8_0） | 約11,470 MiB（2026-09-01実測） |
+| ARDY engine（テキストエンコーダは CPU） | 1,102 MiB |
+| Unity（**配信のみ**。`:99` の実GPU Xorg） | 408 MiB |
+| Xorg(:0 + :99) + gnome-shell | 251 MiB |
+| **配信中の単純合計 / 総容量** | **約13,231 / 16,303 MiB** |
+
+**配信構成は 16GB に収まる**。32768 + 画像対応 runner、ARDY、Unity の同居でも
+2026-09-01 の起動ログでも、Ollamaを載せた後に約2.2GBの余裕が残った。
+OBS を NVENC にすると足りなくなるので x264 のままにすること（下の「OBS」を参照）。
+別ホストの bsky-affirmative-bot が使う埋め込みモデル（snowflake-arctic-embed2, 1.2GB）は
+**配信中は載らない**。
+
+**収録パイプラインの Unity は VRAM を使わない。** `:100` の Xvfb（Mesa llvmpipe＝
+CPUソフトウェアラスタライザ）へ描くので `nvidia-smi` に出てこない。
+代わりに CPU を食い切る（実測 load average 9.6）ので、**収録中はローカルLLMの
+応答が遅くなる**。配信の Unity は `:99` の実GPU Xorg なので、そちらだけ VRAM を使う。
+
+**実害が出るのは容量ではなく runner の作り直しのほう。** 容量は上表のとおり足りていて、
+CUDA OOM は一度も出ていない。壊れるのは **`num_ctx` が呼び出しごとに食い違ったとき**で、
+Ollama は同じモデルでも runner を作り直すため 11GB を読み直しにいく。
+2026-09-02 の実測では 32768 と 4096 が交互に来て `load_tensors` が **1時間に114回**、
+`%iowait 36%` に対し `%user 17%`（計算が進まず待っている状態）になり、ARDY の生成が
+17秒 → 129秒 → 300秒超（タイムアウト）と崩れて朝夜の Shorts からモーションが消えた。
+
+揃える場所は2つあり、**両方**要る。片方だけでは `num_ctx` を送らない呼び元が既定値で
+作り直しを起こす（OpenAI互換の `/v1/chat/completions` は `options` を黙って捨てるので、
+そういう呼び元は自覚なく既定値を要求する）:
+
+| | |
+|---|---|
+| `common/llm.py` の `OLLAMA_NUM_CTX` | このリポジトリが送る値 |
+| `setup/ollama-override.conf` の `OLLAMA_CONTEXT_LENGTH` | ollama のサーバ側の既定値 |
+
+疑ったときに見るコマンド:
+
+```bash
+journalctl -u ollama --since "1 hour ago" | grep -c load_tensors            # 0 が正常
+journalctl -u ollama --since "1 hour ago" | grep -oE "n_ctx_slot = [0-9]+" | sort | uniq -c
+```
+
+収録ログにも `[ARDY] 生成前の GPU: VRAM 空き ... / ollama 常駐 ...(ctx=...)` が出る。
+
+**ollama の 26B が常駐しているぶん、余裕はほとんど無い。** 苦しくなったら上から順に:
+
+1. `LIVE_GROUNDING_GATE=regex`（判定に GPU を使わなくなる。ただし返答生成は
+   同じモデルなので、これだけでは 26B は降りない）
+2. リクエストの `options.num_gpu` を絞って MoE エキスパートを CPU へ逃がす
+   （活性 4B の MoE なので速度低下が小さい）
+3. `USE_LOCAL_LLM=false` で Gemini へ戻す（返答生成のぶん 13GB がまるごと空く）
+
+**VOICEVOX は 2026-08-30 から CPU。** 同梱の ONNX Runtime が cuDNN 8 で、
+sm_120（Blackwell）のカーネルを持っていないため GPU では推論できない。
+詳細と実測は `setup/voicevox-compose.yml` の冒頭。
 
 `obsws` の `StartStream` はリクエストが通っただけで成功を返すので、
 `Obs.start_stream()` は実際に `output_active` になるまで確かめる。これを見て
@@ -329,6 +390,11 @@ sudo bash setup/install_units.sh
 # 一気通貫（YouTube・OBS・ARDY 抜き、偽コメントを流し込む）
 ./run_live.sh DRY_RUN=true SKIP_ARDY=true FAKE_COMMENTS=data/fake_comments.json
 
+# 会話が続くか（同じ人が話しかけ続ける偽コメント）。前のやりとりを受けた返事に
+# なっているか、同じ人の2件目が60秒待たずに返っているかをログで見る
+./run_live.sh DRY_RUN=true SKIP_ARDY=true \
+              FAKE_COMMENTS=data/fake_comments_conversation.json
+
 # 同上を「いま」から数分で一周させる。LIVE_START_HHMM の既定は 21:00 で、
 # 未来だとその時刻まで sleep するので、3つとも近い時刻に上書きすること
 S=$(date -d '+5 min' +%H:%M); C=$(date -d '+11 min' +%H:%M); E=$(date -d '+13 min' +%H:%M)
@@ -373,7 +439,7 @@ curl localhost:2338/status
 | コメント欄への反映 | 最大10秒 | `ChatPoller._accept` が受信と同時に `comments.txt` を書く。以前は10秒ごとの雑務に任せていた |
 | 直前の発話が終わるのを待つ | 5〜15秒 | **ここがいちばん効いている。** フリートークは `interruptible=True` で、文と文の切れ目でコメントの有無を見て切り上げる。コメントへの返信は途中で切らない方針なので、ここは残る |
 | DB（気分・energy） | 0〜数秒 | `_bot_context()` は `BOT_CONTEXT_TTL_SEC`（既定20秒）キャッシュし、DB は1往復だけ。以前は同じ行を2回引いて接続を2本張っていた |
-| LLM | 約2秒 | 実測（gemini-2.5-flash、2〜3文の構造化出力）。`LLM_TIMEOUT_SEC`（既定20秒）で頭を打たせる |
+| LLM | 約2秒 | 実測（gemini-2.5-flash、2〜3文の構造化出力）。`LLM_TIMEOUT_SEC`（既定20秒）で頭を打たせる。会話履歴（`LIVE_HISTORY_TURNS` ぶん）は入力トークンだけを増やす。1ターン100〜150字で、system prompt の約8500字に対して6ターンでも1割ほど |
 | VOICEVOX + 送信 | 0.1〜0.7秒 | 全文まとめてではなく**1文ずつ**合成して Unity のキューへ流し込む。喋り出しまで実測 0.12秒 |
 | ARDY のモーション生成 | 4.6〜12.8秒 | **待たない。** プールから即座に1本引いて再生し、生成は別スレッドで走らせて次回以降に回す（`live/motion.py`） |
 
@@ -412,6 +478,59 @@ OBS の `text_ft2_source_v2` を `from_file` で使うと、**約1秒に1回し�
 文と文の間の 0.25秒 の無音は `voice.synthesize_lines(tail_gap=...)` が作る。
 1文ずつ別々に送るので、こちらで作らないと詰まって聞こえる。
 
+**コメント欄は配信の始めに空にすること**（`subtitle.clear_comments()`、`prepare()` で呼ぶ）。
+`comments.txt` はファイルに残り続けるので、消さないと配信開始から最初のコメントが
+来るまで前回配信のコメントが並んだままになる。`clear()` は字幕（ja/en）だけを消す
+（発話のたびに呼ばれるので、ここでコメント欄まで消してはいけない）。
+
+### 会話をつなぐ
+
+**コメント1件＝独立したLLM呼び出し、ではない。** 配信中のやりとりは
+`live/conversation.py` の `ConversationLog` に1本の時系列として積み、
+`common/llm.py:generate_json(history=...)` が `messages` のマルチターン
+（`user` / `assistant` の交互）に展開して渡す。Gemini は OpenAI 互換
+エンドポイント越しなので chat セッションは無く、毎回 messages を組み立て直す形になる。
+
+- **フリートークとオープニング・クロージングも同じ時系列に積む。**
+  積まないと「さっき自分が何を話していたか」が飛ぶ
+- `assistant` に入れるのは読み上げた日本語だけ。返答のJSON全体を積むと
+  `en` / `motion_en` / valence / arousal のぶんトークンが数倍になる。出力形式は
+  毎回 `response_format` で強制されるので、履歴が平文でも崩れない
+- `user` に入れるのも「送り主：/ 内容：」の短い形。プロンプト本文まるごとを積むと、
+  botの状態ブロックと記憶ブロックがターン数ぶん重複する
+- 場の流れから押し出されたぶんも含めて、**いま返す相手とのやりとり**だけは
+  本文に「## この人とさっきまで話していたこと」として添える。
+  流れに残っているターンは二重にならないよう取り除く（`live.py:reply_to_comment`）
+- 履歴は**当日の配信内だけ**のメモリ。DB へは書かない（`memory.save_comment()` が
+  既に `bottan_live.comments` へ書いている）
+
+統合前は botたん自身の発話を8件持つだけで、**視聴者が何を言ったかはどこにも
+残っていなかった**。しかもそれを「## 直前に自分が話したこと（同じ言い回しを
+繰り返さないこと）」という*逆向き*の制約で渡していたので、話を続けるどころか
+話題を逸らす方向に効いていた。「一つ前の会話を忘れている」の正体がこれ。
+いまはコメント返信からこのブロックを外し、フリートーク（同じネタの繰り返し防止が
+主目的）にだけ残している。
+
+### 同一ユーザーのクールダウンは条件付き
+
+`COMMENT_USER_COOLDOWN_SEC`（既定60秒）は「1人が喋り続けて他の視聴者のコメントが
+読まれなくなる」のを防ぐためのもので、**他に返事できるコメントが無いときは無視する**
+（`chat.CommentQueue._next_index`）。待っているのがその人だけなのに60秒黙って
+フリートークへ流れると、1対1で話しかけられている状況で会話が続かない。
+
+`has_pending()` も同じ判定を通るので、フリートークはその人のコメントで切り上がる。
+
+### ペルソナは原典のコピーで、放っておくとドリフトする
+
+`live/persona.py` の `_CHARACTER_TEMPLATE` は
+`bsky-affirmative-bot/packages/shared-configs/src/config/index.ts` の
+`SYSTEM_INSTRUCTION` のコピー（語彙リストだけ実行時に読む）。原典は活発に更新されるので、
+**触るときは必ず原典と差分を取ること。** docstring に同期時点のコミットを書いてある。
+
+実際、統合時のコピーには「# 住んでいる場所（Nagi と Bluesky）」が無く、
+Nagi が SNS の名前だと書いていないのに、プロンプト側は「Nagiで見かけた投稿」を
+渡していた。結果、配信で「Nagiさん」と人名のように呼んでいた。
+
 ### モーションを途切れさせない
 
 `/motion` を投げるのは **`idle.IdleAnimator` だけ**。送出者を1つにしておかないと、
@@ -423,8 +542,18 @@ OBS の `text_ft2_source_v2` を `from_file` で使うと、**約1秒に1回し�
   ごとに次を投げ、常に2本が重なった状態を保つ。録画パイプラインが
   時刻表を事前計算して 0.5秒 重ねて置いているのと同じことを、尺が先に分からない
   配信では時間で刻んでやっている。表情は `_speak` が決めるのでここでは振らない
-- **待機中**: 9〜20秒おきにプールのモーションを1本（落ち着いたカテゴリを厚めに抽選）、
-  6〜14秒おきに valence/arousal を少し振る（直前の発話の感情を素の顔として引き継ぐ）
+- **待機中**: 6〜20秒おきにプールのモーションを1本（落ち着いたカテゴリを厚めに抽選）。
+  1本が約9秒なので、下限が9秒だと待機時間の4割が Animator の Idle（棒立ち）になる
+- **待機中の表情**: 3〜8秒おきに動かす。1/4 の確率で「ほほえみパルス」
+  （valence を 0.85〜0.95 まで上げて `IDLE_SMILE_HOLD_SEC` 保持してから戻す）、
+  1/10 で「はっと顔」（arousal を上げる）、残りは従来のランダムウォーク。
+  直前の発話の感情を素の顔として引き継ぐ
+
+  Unity が受け取れるのは valence/arousal の2軸だけで、**ウィンクのような個別の
+  表情は指定できない**（`LiveController` に `/expression` が無い）。表情の
+  バリエーションを作れるのは値の動かし方だけなので、はっきり分かる山を混ぜている。
+  ウィンクを入れるなら Unity 側に手を入れること（VRM には `blinkLeft`/`blinkRight`
+  プリセットも `Fcl_EYE_Close_L/R` モーフもある）
 
 `IDLE_ENABLED=false` で止まるのは待機中のぶんだけで、発話中は動く。
 
@@ -477,13 +606,259 @@ ARDY が予備動作として「膝を深く曲げて脚を大きく開くしゃ
 `schemaFilter` が `['public','affirmative_bot']` なので、drizzle の定義に無い
 テーブルをそこへ置くと **DROP 候補になる**ため。
 
-### 「botたんRAG」について
+### 記憶は SQL と Bot Memory API の2本立て
 
-pgvector も埋め込みテーブルも実在しない。`bsky-affirmative-bot` の埋め込みは
-`packages/bot_brain/src/gemini/embeddingTexts.ts` でその場で計算して捨てており、
-永続化されていない。記憶の実体は `affirmative_bot` スキーマの素の RDB なので、
-`memory.py` が SQL で引いてプロンプトに載せている。
-将来ベクトル検索が要るなら `bottan_live.comments` に `embedding` 列を足す形になる。
+**素の SQL**（`live/memory.py`）は、その日の行動・Nagi と Bluesky の高得点ポスト・
+直近のショート・前回配信のコメントを決め打ちで引く。フリートークの固定枠はこちら。
+
+**Bot Memory API**（`live/bot_memory_client.py`）が本来の RAG。biorhythm_server の
+LAN 内 API `POST /memory/search` を叩き、埋め込みと `pg_trgm` のハイブリッド検索は
+**サーバ側**で走る。`affirmative_bot.bot_memory_documents` に実体があり、
+`source_type` は `bsky_affirmed_post` / `nagi_affirmed_post` / `bsky_received_reply` /
+`nagi_received_reply` / `bsky_received_like` / `nagi_received_reaction` /
+`biorhythm` / `youtube_live_comment` の8種。
+
+配信で届いたコメントは `memory.BotMemoryWriter` が
+`bot_memory_documents`（`source_type='youtube_live_comment'`）へ非同期で upsert する。
+本文が変わったら `embedding` を NULL に落として、サーバに埋め直させる。
+
+**コメントへの返事もここから引く**（`live/recall.py`）。以前は決め打ちの SQL
+スナップショットしか載っておらず、質問の内容では何も引いていなかった。だから
+biorhythm にゲームの記録があるのに「最近やったゲームなに？」に答えられなかった。
+
+引くときは `source_type` を2つに分ける。
+
+- **`youtube_live_comment` は引かない。** いま届いた質問とほぼ同じ文の「前に誰かが
+  同じことを聞いたコメント」が上位を埋めるだけになる。返り値にそれへの返答は
+  入らない（サーバの `serializeBotMemorySearchResult`）ので、枠を食って答えにならない。
+- **`web_research` は別枠で引く。** 件数が桁違い（15件 対 9020件）で、まとめて引くと
+  知識カードが押し出される。実測: 「eu4ってどんなゲーム？」で5位、
+  「ワルプルギスの廻天って知ってる？」では20位までに出てこなかった。
+  2本を**同時に**投げて、遅いほうに待ち時間を合わせる（実測 約1.4秒）。
+  保管しているのが十数件しかないので必ず何かが返る。**質問がその語
+  （`metadata.term`）を含むものだけ**通す。
+
+検索はクエリが長いほど遅い（実測: 100文字 1.9秒 / 300文字 3.2秒 / 1000文字 9.1秒）。
+サーバがクエリ全文を埋め込んだうえ、`similarity` と `ilike` をクエリ全文で全行に
+当てるため。`BOT_MEMORY_QUERY_MAX_CHARS`（既定500）で頭を打たせている。
+
+**メインループから叩かないこと。** 先読みは `_start_chores()` の雑務スレッドが行い、
+ホットパスはキャッシュを読むだけにする。
+
+### 知らないことは、その場では調べない
+
+配信のホットパスから **Gemini を外した**（`LIVE_GROUNDING` の既定は `false`）。
+外の世界のことを聞かれたら、`common/grounding.classify()` が返した語を
+`affirmative_bot.bot_memory_research_jobs` へ積むだけにする（`live/recall.py`）。
+あとは biorhythm_server の `botMemoryResearchWorker` が60秒ごとに拾い、**SearXNG**
+で調べて `source_type='web_research'` として記憶へ入れる。次に同じ話題が来たときには
+上の思い出しで引ける（**同じ配信の数分後に間に合う**）。
+
+その場では「知らない」と正直に答える。これは Bluesky / Nagi のリプライ経路が前から
+やっていることで、配信だけが輪から外れて同期で Gemini を叩いていた。
+
+`subject_hash` は隣接リポジトリの `researchSubjectHash`（空白正規化 → trim → lower →
+sha256）と**同じ値でなければならない**。ずれると主キーが噛み合わず、同じ語が
+二重に積まれる。上限（60字 / 2字 / pending 200件）も `researchJobs.ts` に合わせる。
+
+コメントの仕分け（`common/grounding.classify()`）は WEB / SELF / NONE の3値で、
+調べる語も同じ1回の呼び出しで返させる。ここはローカルの ollama なので、
+何回呼んでもリクエスト数も課金も増えない。`LIVE_GROUNDING` を切っても走る。
+
+### 同じ話題を二度出さない
+
+`FillerPlanner` は配信中に出した話題を `_used` に貯め、**一度出た話題は二度選ばない**。
+キーは固有名詞を並べた `(種別, 語のシグネチャ)`。語が拾えないときだけ、
+`(種別, 空白を潰した本文の先頭60文字)` に落ちる。頭の60文字で見ていると、
+同じネタでも言い回しが違うだけで別物として通ってしまう。
+
+さらに `_used_terms`（出したお題に含まれていた固有名詞）を持ち、`_overlaps()` で
+**中身が同じネタを種別をまたいで弾く**。RAG は同じ話が別の document_id で何件も
+入っており、`excludeDocumentIds` は ID 単位なので原理的に防げない。受け取ってから
+内容で捨てる。ただし `hobby` / `ask` の固定文には掛けない（人手で書き分けた
+レパートリーなので、重なりで潰すと在庫が痩せる）。
+
+在庫は RAG を除くと最大38件（hobby 11 / ask 6 / mood・nagi・bsky・previous_live が
+各5まで / short 1）。`FILLER_IDLE_SEC` が25秒なので1時間の配信では**枯れうる**。
+枯れたら `_used` を畳んで2周目に入る（`[filler] 話題を一巡したので…`）。
+同じ話が二度出るのはよくないが、黙るよりはよい。
+
+畳む前に、抽選で拾えなかっただけなのか本当に尽きたのかを**種別を順に当たって
+確かめる**こと。`_KINDS` には重複があり、袋のどこから引き始めるかで一巡しても
+触らない種別が出るので、抽選の空振りだけで畳むと在庫を残したまま2周目に入る。
+
+**Nagi と Bluesky は同格に扱う。** botたんのホームは Nagi、Bluesky は毎日通う出張先で、
+ペルソナにも「Blueskyだけがあなたの居場所であるかのように話さないこと」と書いてある。
+`nagi` にだけ固定枠があると逆の偏りが出るので、`bsky`（`affirmative_bot.posts`）も
+同じ形で置いてある。
+
+**スコアの下限も揃える**（`LIVE_POST_MIN_SCORE`、既定80）。以前は両方 88 を直書き
+していたが、`affirmative_bot.posts` は15行しか残らない巻き取りウィンドウで、実測の
+スコアは 65〜88 と**最大値が閾値と同値**だった。88 で切ると Bluesky 枠だけが頻繁に
+空になり、「Nagiの話はするのに Blueskyの話はしない」という偏りになる。
+nagi 側は 70〜92 と分布に余裕があるので同じ閾値でも枯れない。
+
+### mood に引きずられない（`live/topics.py`）
+
+上の `_used` は**お題にしか効かない**。2026-08-24 の配信では、お題が別物でも
+「FLASHBULB」の話が61発話中14回出た。犯人はプロンプトの共通ブロックで、
+
+- `_bot_state_block` が `mood`（さっきまでしてたこと）を全プロンプトに載せ、
+  しかも「返事をこれに寄せてください」と指示していた
+- `mood` は biorhythm 由来で 20〜90分ごとにしか変わらない。1時間の配信では
+  ほぼ全発話に同じ文が乗る
+- `_memory_block` の「今日やってたこと」も同じ `biorhythm_history` を引いており、
+  先頭行が `mood` と同じ文だった（1プロンプトに同じ文が2回）
+- `prefetch_rag` のクエリ先頭も `mood` なので、その話題の記憶ばかり返ってくる
+
+対処は3つ。
+
+1. **`mood` は1回載せたら落とす**（`LiveSession._bot_for_prompt`）。
+   `BOT_MOOD_SERVE_LIMIT`（既定1）まで載せたら、以降のプロンプトから `mood` 行を
+   外す。`mood` が更新されれば数え直すので、配信中に2〜3回は近況を話せる。
+   落としたあとも記憶ブロックからは同じ話を外したいので、元の文は `mood_raw` に残す。
+   - **「実際にその話をしたか」は見ない。** 載せれば高い確率でその話をする
+     （それが上の症状そのもの）ので結果は変わらず、発話から固有名詞を拾う必要が
+     なくなる。mood の3件に1件はカギ括弧が無く、語の抽出に頼ると取りこぼす
+   - `_bot_context()` 側ではやらないこと。あちらは雑務スレッドからも呼ばれるので、
+     そこで予算を使い切ってしまう。覗くだけなら `consume=False`
+2. `_bot_state_block` の見出しから「寄せてください」を消し、`_memory_block` から
+   `mood` と同じ行・`FillerPlanner.used_terms()` に載っている語を含む行を落とす。
+3. `mood` が枯れたら `prefetch_rag` のクエリからも外す。ここを直さないと
+   「その話題で検索 → 候補が返る → 全部弾かれる」という空回りが30秒ごとに続く。
+
+`live/topics.py` は語を取るだけの小さなモジュール。**依存ゼロにしてある**
+（テストがスタブ無しで読める）。形態素解析器は使わず、カギ括弧の中身と
+ラテン文字語の2系統だけ。
+
+- **取りこぼしても壊れない。** 語が拾えなければ `_topic_key` は従来の先頭60文字に
+  落ち、`_overlaps` は False を返す。だから「拾えないかもしれない」を理由に
+  判定を足さないこと。逆に、**拾ってはいけないものは必ず落とす**
+  （抑制が効きすぎるほうが配信では目立つ）
+- カギ括弧はセリフの引用にも使う。実ログには「大丈夫。全部、いいんだよ。」
+  「おかしいな」が入っていたので、文の断片とひらがなだけの語は名前として数えない
+- **Nagi / Bluesky はストップワード。** 固有名詞だが「話題」ではなく居場所の名前で、
+  数えると「Nagiの投稿A」と「Nagiの投稿B」が同じネタ扱いになる
+
+**ネタ元の偏りは配信側では直せない。** FLASHBULB の出どころは
+`bot_state['seasonal_works_v1']`（Google 検索で取る「いま話題のもの」。music 枠は
+数件しかなく7日キャッシュ）→ 日次予定表 → `biorhythm_history.mood` という経路で、
+bsky-affirmative-bot 側の `seasonalWorks.ts` / `dailyPlan.ts` が持っている。
+配信側は「上流が何を出しても配信が壊れない」ところまでを引き受ける。
+
+### 他人の投稿を自分の体験にしない
+
+2026-08-25 の夜版Shortsで、botたんが Nagi の他人の投稿（「資格取得の為に警察署に
+行ってきました」）を**自分の一日の出来事として**喋った。原因はプロンプトの構造で、
+自分の行動と他人の投稿が**同じ箇条書きに並んでいた**こと（詳細は `HANDOFF.md` の23）。
+配信側にも同じ穴があったので一緒に塞いである。
+
+**自分の体験と他人の話は、プロンプトの上で必ずブロックを分ける。**
+`persona._memory_block` は2つの見出しを出す。
+
+```
+## 今日のあなたの出来事（あなた自身が体験したこと。自分の話として話してよい）
+- 今日やってたこと：…
+- 昨日出した動画：…
+
+## 見かけた他の人の投稿・発言（**他人の話**。あなたの体験ではない。…）
+- SNSのNagiで見かけた投稿：…
+- Blueskyで見かけた投稿：…
+- 前回の配信で視聴者が言っていたこと：…
+```
+
+- **行頭ラベルだけでは足りない。** 投稿本文は一人称で書かれているので、
+  同じ箇条書きに混ぜると本文の一人称のほうが強く効く
+- RAG も同じ。`_RAG_SOURCE_LABELS` は「自分の体験か他人の話か」が読み取れる
+  文言にすること。**未知 `source` のフォールバックを「思い出」にしないこと**
+  （以前の既定は「みんなとの思い出」で、他人の投稿が自分の思い出として読めた）
+- **出どころは発話のあとも持ち回る。** `persona.topic_origin(topic)` が返した札を
+  `conversation.add_solo_turn(..., origin=...)` と
+  `LiveSession._begin_thread(..., origin=...)` に渡す。渡さないと、
+  フリートークの発話は履歴で `（フリートーク）` ＋ `role=assistant` になり、
+  次のターンからは「自分が言ったこと」としてしか残らない。
+  掘り下げ（`build_followup_prompt`）には記憶ブロックが付かないので、
+  ここが最後の砦になる
+
+Shorts 側（`shorts/prompts.py`）は**そもそも選ばせない**という形にしてある。
+締めで使う botたん自身のエピソードは `pipeline.pick_closing_mood()` が
+Python 側で1件に確定し、プロンプトにはそれだけを載せる。直近2日で使った status の
+除外も Python 側で適用する（除外しきったら除外を無視して1件返す。無人実行なので
+候補ゼロで落とさない）。
+
+### 話題を掘り下げる
+
+コメントに答えて終わりにせず、出たテーマに別の角度をもう一言足す。
+`reply_to_comment` と `speak_filler` の末尾で `_begin_thread()` がテーマを覚え、
+`FOLLOWUP_IDLE_SEC`（既定8秒）空いたら `speak_followup()` が続きを喋る。
+`FOLLOWUP_MAX_DEPTH`（既定2）まで掘ったら次の話題へ移る。
+
+フリートークの後もテーマを立てるので、
+`話題 → 掘り下げ → 掘り下げ → 次の話題` と自然に多段になる。
+
+- **テーマの登録でネットワークを触らないこと。** `_begin_thread` はフラグを立てるだけで、
+  RAG を引くのは雑務スレッドの `prefetch_followup()`。返事を喋っている15〜25秒の
+  あいだに引き終わるので、掘り下げる時点では候補が揃っている
+- **資料が無くても喋る。** RAG が引けるまで黙るのは本末転倒
+- 掘り下げも `interruptible=True`。コメントが来たら文の切れ目で切り上がる
+- クロージングの `FILLER_STOP_LEAD_SEC`（既定120秒）前からは、フリートークも
+  掘り下げも出さずコメントの消化に専念する。`run_loop` は `LIVE_CLOSING_HHMM` で
+  抜けてしまい、**それ以降に届いたコメントには一切反応できない**
+
+### コメントを捨てるとき
+
+`CommentQueue` は返事せずに捨てた件数を `dropped` に積み、捨てるたびにログを出す。
+数えていないと「コメント欄には出たのに返事が来ない」に気づけない。
+
+- **溢れ**（`maxlen`=200 超）: 優先度が低く、かつ古いものから捨てる。
+  並べ替えは `(priority, -received_at)` で、残すのは先頭 maxlen 件。
+  **受信時刻を昇順にしてはいけない** — 末尾＝「一般視聴者のいちばん新しいコメント」が
+  捨てられ、意図と正反対になる（実際そうなっていた）
+- **滞留**（`COMMENT_MAX_AGE_SEC`、既定180秒）: それ以上待たせた一般コメントは捨てる。
+  取り出しは同じ優先度なら古い順なので、放っておくと「5分前のコメントにいま返事する」
+  状態になり、視聴者から見た遅れが配信の後半ほど伸びていく。
+  **スパチャ・メンバー・オーナーは古くても捨てない**
+
+待ち行列の様子は30秒ごとに出る:
+
+```
+[live] キュー: 待ち12件 / 最古 84秒 / 受信 137件 / 破棄 4件
+```
+
+返事が遅れているのが滞留のせいなのか溢れて捨てているのかは、これでしか切り分けられない。
+
+### 読みの直しは DB の1本管理
+
+読み間違いは `affirmative_bot.bot_memory_pronunciations` に登録して直す。
+`common/pronunciation.py` が**VOICEVOX へ送るテキストそのものを置換**する
+（`audio_query()` が `/audio_query` に投げる直前）。字幕に出る日本語は元のまま。
+
+**VOICEVOX エンジンのユーザー辞書は使わない。** エンジン側の辞書
+（`~/voicevox_user_dict/user_dict.json`）とは独立していて、DB へ入れても
+そちらには反映されない。二重に管理すると、どちらが効いているのか分からなくなる。
+
+置換は区切り（半角/全角スペース・中黒・読点）をまたいで当たる。登録どおりの
+一字一句でしか当たらないと実際にはまず外れる。2026-08-23 の配信では
+`ファイアーエムブレム万紫千紅` と登録してあったのに「ファイアーエムブレム 万紫千紅」と
+喋って素読みした。区切りを許すのは**文字種が変わる位置と、登録側に区切りがあった位置だけ**
+（どこでも許すと `アニメ` が「アニ、メートル」に当たる）。長音 `ー` は読みの一部なので
+境界にしない。ASCII は大小を無視するが、`Halo`(ヘイロー) と `halo`(ハロー) のように
+大小で別語として登録されているものは、大小を保ったキーで先に引くので混ざらない。
+
+**複合語は最小単位でも登録すること。** 長い surface だけに頼ると、
+その一部だけを喋ったときに必ず外れる（`万紫千紅` 単体の行が無いと救えない）。
+
+登録・無効化は bsky-affirmative-bot 側の CLI から行う（SQL を直接叩かない）:
+
+```bash
+pnpm tts-pronunciation -- set <surface> <spoken-form> [work|proper_noun]
+pnpm tts-pronunciation -- disable <surface>
+pnpm tts-pronunciation -- list
+```
+
+表の原典は `bsky-affirmative-bot/packages/database/src/botMemoryPronunciation.ts`。
+自動学習（`origin='auto'`）は `manual` と `disabled` の行を書き換えないので、
+手で入れた読みが後から流されることはない。surface は NFKC で正規化されて入る。
 
 ### energy
 

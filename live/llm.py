@@ -48,14 +48,18 @@ REPLY_SCHEMA = {
 MOTION_CATEGORIES = REPLY_SCHEMA["properties"]["motion_category"]["enum"]
 
 
-def generate_reply(system_prompt: str, user_prompt: str) -> dict:
+def generate_reply(system_prompt: str, user_prompt: str,
+                   history: list = None) -> dict:
     """配信の1返答を生成する。返り値は REPLY_SCHEMA の形。
 
     LLM はスキーマを守らないことがあるので、ここで最低限の正規化をしておく。
     配信中に KeyError で落ちるより、多少ぶれても喋り続けるほうが望ましい。
+
+    history は配信中の会話（persona.build_history が作る）。渡さなければ
+    従来どおり1問1答になる。
     """
     data = generate_json(system_prompt, user_prompt, REPLY_SCHEMA, "live_reply",
-                         temperature=1.0, debug=False)
+                         temperature=1.0, debug=False, history=history)
     return normalize_reply(data)
 
 

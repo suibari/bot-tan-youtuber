@@ -6,9 +6,9 @@ botたん YouTube Shorts 自動投稿パイプライン
   GEMINI_API_KEY      : Gemini APIキー (USE_LOCAL_LLM=false時)
   YOUTUBE_CLIENT_ID   : YouTube OAuth2 クライアントID
   YOUTUBE_CLIENT_SECRET: YouTube OAuth2 クライアントシークレット
-  USE_LOCAL_LLM       : true でOllama使用、false でGemini使用 (デフォルト: false)
+  USE_LOCAL_LLM       : true でOllama(Gemma 4 26B)、false でGemini (デフォルト: true)
+                        num_ctx は common/llm.py の定数。env では変えられない
   LOCAL_LLM_MODEL     : Ollamaで使うモデル名 (デフォルト: hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M)
-  LOCAL_LLM_CTX       : OllamaのコンテキストサイズOverride (デフォルト: 8192)
   GEMINI_MODEL        : Geminiのモデル名 (デフォルト: gemini-2.0-flash)
   VOICEVOX_URL        : VOICEVOXのURL (デフォルト: http://localhost:10101)
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)
@@ -21,6 +21,7 @@ botたん YouTube Shorts 自動投稿パイプライン
 """
 
 import os
+import random
 import json
 import time
 import urllib.parse
@@ -40,20 +41,21 @@ from thumbnail import capture_thumbnail_frame, generate_thumbnail
 # 既存の `from pipeline import ...` を壊さないよう、ここで再エクスポートする。
 from core import (  # noqa: F401
     VOICEVOX_URL, VOICEVOX_SPEAKER, UNITY_EXE, UNITY_PROJECT, BGM_PATH,
-    USE_LOCAL_LLM, llm_client, LLM_MODELS, LLM_MODEL, DB_CONFIG,
+    USE_LOCAL_LLM, LLM_MODELS, LLM_MODEL, DB_CONFIG,
     W, H, FONT_PATH,
     _timed, _retry, _llm_create, parse_script_json, llm_json,
     _rescale_va, enforce_variance, build_emotion_timeline,
     get_wav_duration, _synthesize, valence_arousal_to_voicevox_params,
     synthesize_sentences, make_silence_wav, concat_wavs, generate_voice,
     _query_mora_times, split_sentences, generate_subtitle_timing, _find_subtitle_time,
+    _dedupe_subtitle_overlaps,
     _start_xvfb, record_with_unity, VRMA_MOTION_DIR,
     ardy_start, ardy_wait_ready, ardy_stop, build_vrma_motions,
     VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD,
     VRMA_GAIN, VRMA_HIPS_Y, VRMA_SEG_TARGET_SEC, VRMA_MAX_SEGMENTS_TOTAL,
     VRMA_BODY_TILT, VRMA_YAW_LIMIT, VRMA_HEAD_YAW, VRMA_HEAD_COUNTER,
     plan_vrma_from_sentences, vrma_unity_args, env_flag,
-    esc_drawtext, base_vf_parts, build_subtitle_filters, build_corner_filters,
+    esc_drawtext, base_vf_parts, build_subtitle_filters, build_target_filters,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
 
@@ -61,6 +63,9 @@ from core import (  # noqa: F401
 # （Assets/Animations/Blow A Kiss.fbx, firstFrame:0 lastFrame:137 @30fps）。
 # 生成モーションを被せると尻切れになるので、これが終わるまでは置かない
 HOOK_MOTION_SEC = 4.6
+# 台本が長すぎたときに警告を出す閾値[秒]。目標は30秒。
+# 無人実行なので生成は止めず、ログに実測尺と文字数を残してプロンプト調整の材料にする
+NIGHT_DURATION_WARN_SEC = 35.0
 # 引き開始以降カメラを引く量[m]
 VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.7"))
 
@@ -159,7 +164,6 @@ def fetch_from_bot_db() -> dict:
     print(f"[DB] Nagiポスト: {len(interactions)}件, Mood履歴: {len(moods)}件")
     all_moods = [dict(r) for r in moods]
     # statusごとに1件ずつランダムサンプリング
-    import random
     seen_status = {}
     for m in all_moods:
         s = m.get("status")
@@ -173,33 +177,54 @@ def fetch_from_bot_db() -> dict:
         "moods":        sampled_moods,
     }
 
+
+def pick_closing_mood(moods: list[dict], corner_context: dict = None) -> dict | None:
+    """③締めで使う botたん自身のエピソードを1件だけ選ぶ。
+
+    **LLM に選ばせない。** 以前は Mood を20件並べて「この中から選んでください」と
+    書いていたが、同じプロンプトに他人の Nagi 投稿の一覧も並んでおり、どちらも
+    「一人称の日本語で書かれた具体的な出来事」の箇条書きだったので、LLM が
+    投稿のほうを botたんの体験として使ってしまった（2026-08-25 18:00 の
+    「資格取得のために警察署に行って」は、その日の Nagi 投稿そのもの）。
+    1件に確定して渡せば「選ぶ」余地が無くなり、混同そのものが起きなくなる。
+
+    直近2日で使った status（corner_context）は Python 側で避ける。避けた結果
+    候補が無くなったら、除外を無視して選ぶ（無人実行なので候補ゼロで落とさない）。
+    """
+    if not moods:
+        return None
+    excluded = set((corner_context or {}).get("excluded_first_greeting_statuses") or [])
+    candidates = [m for m in moods if m.get("status") not in excluded] or list(moods)
+    chosen = random.choice(candidates)
+    print(f"[Mood] ③締め: status={chosen.get('status')} / {str(chosen.get('mood'))[:40]}"
+          f"（候補{len(candidates)}件 / 除外status={sorted(excluded) or 'なし'}）")
+    return chosen
+
+
 # ──────────────────────────────────────────────
 # Step 2: LLMで台本生成
 # ──────────────────────────────────────────────
 
-def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None) -> str:
+def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None,
+                    closing_mood: dict = None) -> str:
     """DBデータから台本を生成する"""
     print(f"[LLM] 台本生成中...")
 
-    user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
-    extra_kwargs: dict = {}
-
-    if USE_LOCAL_LLM:
-        # Gemma(Ollama)はresponse_schema非対応のため構造化出力不可
-        extra_kwargs["extra_body"] = {
-            "options": {"num_ctx": int(os.getenv("LOCAL_LLM_CTX", "8192"))},
-            "think": False,
-        }
-    else:
-        # Gemini OpenAI互換エンドポイントの構造化出力はresponse_formatで渡す
-        # （extra_bodyにresponse_mime_type/response_schemaを渡すと400エラーになる）
-        extra_kwargs["response_format"] = {
+    user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context,
+                                    closing_mood=closing_mood)
+    # スキーマは経路によらず response_format で渡す。Gemini はそのまま
+    # OpenAI 互換で受け、Ollama は common/llm.py が native の format へ写す。
+    # （extra_body に response_mime_type/response_schema を渡すと Gemini は400になる。
+    #   逆に Ollama へ extra_body で options を渡しても黙って捨てられる）
+    extra_kwargs: dict = {
+        "response_format": {
             "type": "json_schema",
             "json_schema": {
                 "name":   "script",
                 "schema": SCRIPT_SCHEMA,
             },
         }
+    }
 
     response = _llm_create(
         messages=[
@@ -223,10 +248,13 @@ def generate_corner_timing(
     has_comments: bool = False,
 ) -> list[dict]:
     """セクションタグで確定したタイミングでコーナーラベルを生成する"""
-    corner_meta = [('OpeningAffirmation', "全肯定タイム", "#ff6b9d")]
-    corner_meta.append(('NagiCorner', "今日のNagi", "#00A88A"))
+    # label/color は画面に出さなくなった（左上のコーナーテロップは
+    # ターゲットテロップに置き換えた）が、corners はカメラ引き・サムネ撮影・
+    # DoThankful の探索開始位置を決めるのに使い続けるので残してある。
     if has_comments:
-        corner_meta.append(('CommentCorner', "コメントコーナー", "#ff9f43"))
+        corner_meta = [('CommentCorner', "コメントコーナー", "#ff9f43")]
+    else:
+        corner_meta = [('NagiCorner', "今日のNagi", "#00A88A")]
     corner_meta.append(('Closing', "全肯定メッセージ", "#7ec8e3"))
     total_duration = subtitles[-1]["end"] if subtitles else 90
 
@@ -242,12 +270,12 @@ def generate_corner_timing(
             print(f"[コーナー] {tag}: キーワード未検出、フォールバック使用")
         resolved_starts.append(t)
 
-    # フォールバック: 見つからないセクションは4等分で補完
+    # フォールバック: 見つからないセクションはコーナー数で等分して補完
     body_duration = total_duration - intro_duration
-    quarter = body_duration / 4
+    share = body_duration / len(corner_meta)
     corners = []
     for i, (tag, label, color) in enumerate(corner_meta):
-        start = resolved_starts[i] if resolved_starts[i] is not None else round(quarter * i + intro_duration, 3)
+        start = resolved_starts[i] if resolved_starts[i] is not None else round(share * i + intro_duration, 3)
         next_start = next((resolved_starts[j] for j in range(i + 1, len(resolved_starts)) if resolved_starts[j] is not None), None)
         end = next_start if next_start is not None else total_duration
         # tag は section 名。生成モーションの割り当てに使う（ffmpeg側は label/color しか見ない）
@@ -301,19 +329,21 @@ def build_vrma_blocks(sentences: list[dict], durations: list[float],
 
 def finalize_video(input_webm: str, output_mp4: str,
                    subtitles: list[dict] = None,
-                   corners: list[dict] = None,
-                   intro_duration: float = 0.0) -> None:
-    """FFmpegで縦型Shorts用MP4に変換・字幕合成する（夜版レイアウト）"""
-    print(f"[FFmpeg] MP4変換中...")
+                   target_text: str = "") -> None:
+    """FFmpegで縦型Shorts用MP4に変換・字幕合成する（夜版レイアウト）
 
-    if intro_duration > 0 and corners is not None:
-        corners = [{"start": 0, "end": intro_duration, "label": "今日の全肯定", "color": "#00A88A"}] + corners
+    target_text は「誰に向けた動画か」を示す一言（Thumbnail セクション＝サムネに
+    焼くのと同じ文言）。以前は左上にコーナー名（「今日のNagi」等）を出していたが、
+    Shorts はスワイプで途中から入るので、コーナー名より「自分向けの動画か」が
+    分かるほうが効く。
+    """
+    print(f"[FFmpeg] MP4変換中...")
 
     vf_parts = base_vf_parts()
     if subtitles:
         vf_parts += build_subtitle_filters(subtitles)
-    if corners:
-        vf_parts += build_corner_filters(corners)
+    if target_text:
+        vf_parts += build_target_filters(target_text)
 
     run_ffmpeg_finalize(input_webm, output_mp4, vf_parts)
 
@@ -371,25 +401,38 @@ def main():
         except Exception as e:
             print(f"[corner_context] 取得失敗（スキップ）: {e}")
 
+        # ③締めで使う botたん自身のエピソードは Python 側で1件に確定する。
+        # LLM に一覧から選ばせると、隣に並ぶ他人の Nagi 投稿を自分の体験として
+        # 使うことがある（README「他人の投稿を自分の体験にしない」）
+        closing_mood = pick_closing_mood(data["moods"], corner_context)
+
         # ARDYサーバーを先に起動しておく。
-        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる
+        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる。
+        # 裏で走るぶん優先度は下げる。CPU 版 VOICEVOX と食い合うと合成が数十秒に
+        # 伸びて Step3 で落ちる（2026-08-31）。読み込みは遅れても待てる
         ardy_proc = None
         if VRMA_MOTION_DIR:
-            ardy_proc = ardy_start()
+            ardy_proc = ardy_start(low_priority=True)
 
         # Step 2: 台本生成
         script_cache = os.getenv("SCRIPT_CACHE", "")
         if script_cache and Path(script_cache).exists():
             raw_script = open(script_cache).read()
             print(f"[LLM] キャッシュから台本読み込み: {script_cache}")
+            # 台本は別の Mood で書かれているので、いま選んだものは捨てる
+            closing_mood = None
         else:
-            raw_script = _timed("Step2 台本生成", generate_script, data, comments, corner_context)
+            raw_script = _timed("Step2 台本生成", generate_script, data, comments,
+                                corner_context, closing_mood)
 
         # Step 2.5: JSONパース、クリーン台本作成
         script_data = parse_script_json(raw_script)
         sections = {s["section"]: s["sentences"] for s in script_data["sections"]}
         script_meta = script_data["meta"]
-        print(f"[META] first_greeting_status={script_meta.get('first_greeting_status')}, "
+        # first_greeting_status は Python 側で確定した Mood のものを正とする。
+        # LLM の自己申告は、実際に使った Mood とズレることがある
+        closing_status = (closing_mood or {}).get("status") or script_meta.get("first_greeting_status", "")
+        print(f"[META] first_greeting_status={closing_status}, "
               f"nagi_themes={script_meta.get('nagi_themes')}")
         thumbnail_sentences = sections.get("Thumbnail", [])
         thumbnail_text = thumbnail_sentences[0]["text"][:20] if thumbnail_sentences else "今日も全肯定だよ！"
@@ -420,10 +463,22 @@ def main():
         actual_main_duration = get_wav_duration(wav_path) - intro_duration if Path(wav_path).exists() else None
         print(f"[字幕] 本編音声長さ: {actual_main_duration:.3f}s" if actual_main_duration else "[字幕] 本編音声長さ取得失敗、フォールバック使用")
 
+        total_sec = intro_duration + (actual_main_duration or 0.0)
+        print(f"[尺] 合計 {total_sec:.1f}秒 (冒頭一言 {intro_duration:.1f}s + 本編 "
+              f"{(actual_main_duration or 0.0):.1f}s / 本文{len(clean_script)}文字)")
+        if total_sec > NIGHT_DURATION_WARN_SEC:
+            print(f"[警告] 台本が長すぎます: {total_sec:.1f}秒 "
+                  f"(目標30秒 / 警告閾値{NIGHT_DURATION_WARN_SEC}秒, 本文{len(clean_script)}文字)")
+
         # Step 3.5: 字幕・コーナータイミング生成
         subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration, actual_duration=actual_main_duration)
         if intro_duration > 0:
-            subtitles = [{"start": 0.0, "end": round(intro_duration, 3), "text": thumbnail_text}] + subtitles
+            # 冒頭一言も本編チャンクと同じ扱いにする（+0.05 の余韻を付け、
+            # 本編1枚目との間隔を dedupe に通す）。以前は dedupe のあとに
+            # 足していたので、冒頭字幕だけ言い終わる前に消えることがあった
+            subtitles = [{"start": 0.0, "end": round(intro_duration + 0.05, 3),
+                          "text": thumbnail_text}] + subtitles
+            _dedupe_subtitle_overlaps(subtitles)
         corners   = generate_corner_timing(clean_script, subtitles, intro_duration, section_starts, has_comments)
 
         # 感情タイムライン生成
@@ -453,6 +508,13 @@ def main():
             finally:
                 ardy_stop(ardy_proc)
                 ardy_proc = None
+            if not vrma_motions:
+                # 動画は完成するのでパイプラインは成功のまま（notify.error ではない）。
+                # 黙らせておくと「動画は出ているが棒立ち」に何日も気づけない。
+                # 2026-08-31 の夜は exit 0 で公開まで通り、誰も気づかなかった
+                from common import notify
+                notify.warn("夜のShorts: ARDY のモーション生成に失敗しました。"
+                            "モーション無しで公開します（logs/pipeline_*.log を確認）")
 
         # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
@@ -493,7 +555,7 @@ def main():
         generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
 
         # Step 5: MP4変換
-        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, corners, intro_duration)
+        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, thumbnail_text)
 
         # Step 6: YouTubeアップロード
         title = build_title(thumbnail_text)
@@ -503,7 +565,7 @@ def main():
             if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
                 corners_metadata = [
                     {"corner_name": "Thumbnail", "theme": thumbnail_text},
-                    {"corner_name": "Closing", "status": script_meta.get("first_greeting_status", "")},
+                    {"corner_name": "Closing", "status": closing_status},
                 ]
                 nagi_themes = script_meta.get("nagi_themes", [])
                 if isinstance(nagi_themes, list) and nagi_themes:

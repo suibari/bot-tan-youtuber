@@ -59,6 +59,21 @@ done
 
 systemctl daemon-reload
 
+# ollama は別ホストの bsky-affirmative-bot と共用しているので、勝手に上書きしない。
+# ずれていたら知らせるだけにする。ここがずれると 11GB のモデルが読み直され続け、
+# ARDY の生成がタイムアウトして Shorts からモーションが消える（2026-09-02）
+OLLAMA_DROPIN=/etc/systemd/system/ollama.service.d/override.conf
+if [ ! -f "$OLLAMA_DROPIN" ]; then
+    echo
+    echo "警告: $OLLAMA_DROPIN がありません。" >&2
+    echo "      setup/ollama-override.conf を参照して入れてください。" >&2
+elif ! diff -q "$HERE/ollama-override.conf" "$OLLAMA_DROPIN" >/dev/null; then
+    echo
+    echo "警告: $OLLAMA_DROPIN が setup/ollama-override.conf と違います:" >&2
+    diff -u "$OLLAMA_DROPIN" "$HERE/ollama-override.conf" | sed 's/^/      /' >&2 || true
+    echo "      OLLAMA_CONTEXT_LENGTH が common/llm.py の OLLAMA_NUM_CTX と同値か特に確認すること。" >&2
+fi
+
 # ライブ配信は GPU 仮想ディスプレイが要る。入っていなければ警告だけ出す
 if [ ! -f /etc/systemd/system/bottan-live-xorg.service ]; then
     echo

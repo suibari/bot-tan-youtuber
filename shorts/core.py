@@ -13,9 +13,9 @@ botたん動画パイプライン 共通処理
 
 環境変数:
   GEMINI_API_KEY      : Gemini APIキー (USE_LOCAL_LLM=false時)
-  USE_LOCAL_LLM       : true でOllama使用、false でGemini使用 (デフォルト: false)
+  USE_LOCAL_LLM       : true でOllama(Gemma 4 26B)、false でGemini (デフォルト: true)
+                        num_ctx は common/llm.py の定数。env では変えられない
   LOCAL_LLM_MODEL     : Ollamaで使うモデル名
-  LOCAL_LLM_CTX       : OllamaのコンテキストサイズOverride (デフォルト: 8192)
   GEMINI_MODEL        : Geminiのモデル名 (カンマ区切りで複数指定可、左から順にフォールバック)
   VOICEVOX_URL        : VOICEVOXのURL (デフォルト: http://localhost:10101)
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)
@@ -49,6 +49,7 @@ botたん動画パイプライン 共通処理
 
 import os
 import re
+import unicodedata
 import sys
 import json
 import time
@@ -101,8 +102,9 @@ FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
 WAV_RATE     = _voice.WAV_RATE
 WAV_CHANNELS = _voice.WAV_CHANNELS
 
-# LLMクライアントは common/llm.py で初期化済み。ここは後方互換の再輸出
-llm_client = _llm.client
+# LLM の実体は common/llm.py。ここは後方互換の再輸出。
+# **client は再輸出しない。** ローカル経路では OpenAI クライアントを作らないので
+# None になり、掴んだ側が黙って壊れる（呼ぶべきは _llm.create のほう）
 LLM_MODELS = _llm.LLM_MODELS
 LLM_MODEL  = _llm.LLM_MODEL
 
@@ -220,23 +222,194 @@ def split_sentences(script: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-SUBTITLE_GAP = 0.06   # 隣り合う字幕の間に必ず空ける秒数
+SUBTITLE_GAP     = 0.06   # 隣り合う字幕の間に必ず空ける秒数
+SUBTITLE_MIN_SEC = 0.40   # 1ブロックの最短表示時間。これを下回るものは隣と結合する
+
+# 行頭・行末に置けない文字（禁則処理）。wrap_cjk と split_subtitle_chunks で共有する。
+_NO_LINE_START = set("ぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮーぐんゝゞ、。，．・？！」』）】〕〉》")
+_NO_LINE_END   = set("「『（【〔〈《")
+
+# 途中で切ってはいけない文字（ラテン文字・数字とその内部に現れる記号）。
+# 「Don't ever give up.」が「Don't eve」「r give up.」に割れるのを防ぐ。
+_WORD_CHAR = re.compile(r"[0-9A-Za-z'’\-.]")
+
+
+def _char_width(ch: str) -> int:
+    return 2 if unicodedata.east_asian_width(ch) in "WFA" else 1
+
+
+def wrap_cjk(text: str, max_units: int) -> list[str]:
+    """全角=2 / 半角=1 で数えて折り返す。textwrap は CJK の幅を扱えないため自前。
+
+    行頭に小書き仮名や句読点が来ないよう、1文字ぶん前の行に送る。
+    朝版（quiz_layout）と夜版（build_subtitle_filters）で共有する。
+    """
+    lines: list[str] = []
+    cur = ""
+    width = 0
+    for ch in text:
+        cw = _char_width(ch)
+        if width + cw > max_units and cur:
+            # 次の文字が行頭に来られないなら、この文字は今の行に残す
+            if ch in _NO_LINE_START:
+                cur += ch
+                lines.append(cur)
+                cur, width = "", 0
+                continue
+            # 行末に来られない文字で終わるなら1文字繰り越す
+            if cur[-1] in _NO_LINE_END:
+                carry = cur[-1]
+                lines.append(cur[:-1])
+                cur, width = carry, _char_width(carry)
+            else:
+                lines.append(cur)
+                cur, width = "", 0
+        cur += ch
+        width += cw
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def wrap_subtitle_lines(text: str, max_units: int, max_lines: int = 2) -> list[str]:
+    """字幕1枚を行に割る。**2行になるときは行の長さを均す。**
+
+    素の wrap_cjk は先頭行を目一杯詰めるので、19文字が「18文字」＋「も、」のように
+    泣き別れる。読みにくいだけでなく、帯の中で下の行だけ極端に短く見える。
+    幅を半分から広げていって、max_lines に収まる最小の幅を採る。
+
+    朝版（quiz_layout.build_caption_filters）と夜版（build_subtitle_filters）で共有。
+    """
+    lines = wrap_cjk(text, max_units)
+    if len(lines) <= 1:
+        return lines
+    total = sum(_char_width(ch) for ch in text)
+    for units in range(-(-total // max_lines), max_units + 1):
+        balanced = wrap_cjk(text, units)
+        if len(balanced) <= max_lines:
+            return balanced
+    return lines[:max_lines]
+
+
+# 語を割らないために max_chars からはみ出してよい文字数。
+# 2行に折り返して描くので、多少長くても帯には収まる（20文字=40単位に対して
+# 2行ぶんの max_units は 72単位ある）。
+_CUT_SLACK = 4
+
+
+def _snap_cut(text: str, cut: int, lo: int, hi: int) -> int:
+    """cut がラテン文字・数字の連続の内側なら、語の境界へ寄せる。
+
+    [lo, hi] は「そこで切れば前後のチャンクが max_chars に収まる」範囲で、
+    語を割らないためだけに _CUT_SLACK ぶんまで外へはみ出してよい。
+    手前の語頭に戻すのを優先し、駄目なら語尾へ送る。どちらも届かない
+    （1語が max_chars より長い）なら諦めて cut のまま切る。
+    """
+    if cut <= 0 or cut >= len(text):
+        return cut
+    if not (_WORD_CHAR.match(text[cut - 1]) and _WORD_CHAR.match(text[cut])):
+        return cut
+    lo = max(1, lo - _CUT_SLACK)
+    hi = min(len(text) - 1, hi + _CUT_SLACK)
+    back = cut
+    while back > 0 and _WORD_CHAR.match(text[back - 1]):
+        back -= 1
+    if lo <= back <= hi:
+        return back
+    fwd = cut
+    while fwd < len(text) and _WORD_CHAR.match(text[fwd]):
+        fwd += 1
+    if lo <= fwd <= hi:
+        return fwd
+    return cut
+
+
+def split_subtitle_chunks(sentence: str, max_chars: int) -> list[str]:
+    """1文を字幕1枚ぶんのチャンクに割る。
+
+    - まず読点・中点で切る（意味の切れ目が最優先）
+    - 短い断片は max_chars まで**先に**結合する。「萩、」「桔梗、」のように
+      1語だけの字幕が並ぶのを防ぐ。**結合は分割より先**でないと効かない
+      （以前は分割の後にやっていたので、`15文字+1文字` に割れたあと
+      `15+1=16 > 15` で判定に落ち、1文字の字幕が必ず残っていた）
+    - それでも max_chars を超える断片は**均等割り**にする。固定長スライスだと
+      16文字 / max_chars=15 が必ず「15文字 + 1文字」になる。均等割りなら「8+8」
+    - 切れ目がラテン文字・数字の内側に落ちたら語の境界へ寄せる
+      （`Don't eve` / `r give up.` を防ぐ）。ただし寄せた結果どれかの
+      チャンクが max_chars を超えるなら寄せない。
+    """
+    fragments = [c for c in re.split(r"(?<=[、,，・])", sentence) if c.strip()]
+    if not fragments:
+        return []
+
+    chunks = [fragments[0]]
+    for frag in fragments[1:]:
+        if len(chunks[-1]) + len(frag) <= max_chars:
+            chunks[-1] += frag
+        else:
+            chunks.append(frag)
+
+    out: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            out.append(chunk)
+            continue
+        n = -(-len(chunk) // max_chars)          # ceil
+        pos = 0
+        for i in range(n - 1, 0, -1):
+            remain = len(chunk) - pos
+            target = pos + max(1, -(-remain // (i + 1)))
+            # 残り i ピースが max_chars に収まる最小位置 〜 現ピースが収まる最大位置
+            lo = max(pos + 1, len(chunk) - i * max_chars)
+            hi = min(pos + max_chars, len(chunk) - 1)
+            cut = min(max(target, lo), hi)
+            out.append(chunk[pos:_snap_cut(chunk, cut, lo, hi)])
+            pos += len(out[-1])
+        out.append(chunk[pos:])
+    return [c for c in out if c]
+
+
+def _chunk_mora_bounds(chunks: list[str], n_sent_moras: int) -> list[tuple]:
+    """各チャンクが文のモーラ列のどこからどこまでかを返す [(s_idx, e_idx), ...]。
+
+    **文字数比では割らない。** 「1文字あたりのモーラ数は文中で一定」という前提は
+    ラテン文字が混ざると崩れる。`Don't ever give up.` は19文字あるがモーラは
+    ずっと少ないので、分母の文字数だけが膨らみ、同じ文の日本語チャンクに
+    割り当てられるモーラが本来の 1/3 以下になる（「実はね、」が 0.179秒 に潰れた）。
+
+    そこでチャンクごとに audio_query を投げて**実モーラ数**を数え、その累積で
+    境界を決める。読点で切っただけなら合計は文全体のモーラ数と一致するが、
+    アクセント句の切れ方で前後することがあるので比率で正規化する。
+    """
+    counts = [len(_query_mora_times(c)[0]) for c in chunks]
+    total = sum(counts)
+    if total <= 0 or n_sent_moras <= 0:
+        return [(0, max(n_sent_moras - 1, 0)) for _ in chunks]
+
+    bounds = []
+    acc = 0
+    for c in counts:
+        s_idx = min(int(round(acc * n_sent_moras / total)), n_sent_moras - 1)
+        acc += c
+        idx_end = int(round(acc * n_sent_moras / total))
+        # 終端は「次のチャンクの先頭モーラの1つ手前」。-1 を忘れると
+        # e_idx(N) == s_idx(N+1) となり、前後の字幕が境界で2枚描画される。
+        e_idx = max(s_idx, min(idx_end, n_sent_moras) - 1)
+        bounds.append((s_idx, e_idx))
+    return bounds
 
 
 def generate_subtitle_timing(script: str, time_offset: float = 0.0,
                              actual_duration: float = None,
-                             max_chars: int = 15,
-                             merge_short: bool = False) -> list[dict]:
+                             max_chars: int = 20) -> list[dict]:
     """文ごとにaudio_queryを発行してタイミングを取得し、字幕データを生成する。
 
     文単位で独立したモーラ計測を行うことで、漢字とかなの混在による
     文字数比率ずれを排除する。
     actual_duration: 実際の音声WAVの本編部分の長さ（秒）。渡された場合はそれを
     スケーリング基準にする。各文個別合成+concatの場合はこれを使うと正確になる。
-    max_chars: 1字幕ブロックの最大文字数。
-    merge_short: 読点で切れた短い断片を max_chars まで結合する。
-                 「萩、」「桔梗、」のように1語だけの字幕が並ぶのを防ぐ。
-                 夜版の見た目を変えないよう既定はFalse。
+    max_chars: 1字幕ブロックの最大文字数。朝版・夜版とも 20。
+               夜版は build_subtitle_filters が2行に折り返して描く。
     """
     print("[字幕] タイミング情報取得中...")
 
@@ -270,57 +443,80 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0,
         n_sent_moras = len(sent_moras)
         mora_scale = scaled_dur / sent_dur if sent_dur > 0 else 1.0
 
-        # 読点・中点でさらに分割 → max_chars 上限チャンク
-        chunks = re.split(r"(?<=[、,，・])", sentence)
-        chunks = [c for c in chunks if c.strip()]
-        final_chunks = []
-        for chunk in chunks:
-            if len(chunk) <= max_chars:
-                final_chunks.append(chunk)
-            else:
-                for i in range(0, len(chunk), max_chars):
-                    final_chunks.append(chunk[i:i+max_chars])
+        final_chunks = split_subtitle_chunks(sentence, max_chars)
+        if not final_chunks:
+            current_time += scaled_dur
+            continue
 
-        if merge_short and final_chunks:
-            merged = [final_chunks[0]]
-            for chunk in final_chunks[1:]:
-                if len(merged[-1]) + len(chunk) <= max_chars:
-                    merged[-1] += chunk
-                else:
-                    merged.append(chunk)
-            final_chunks = merged
-
-        sentence_chars = sum(len(c) for c in final_chunks)
-        char_offset = 0
-
-        for chunk in final_chunks:
-            if n_sent_moras > 0 and sentence_chars > 0:
-                s_idx = min(int(char_offset * n_sent_moras / sentence_chars), n_sent_moras - 1)
-                # 終端は「次のチャンクの先頭モーラの1つ手前」。
-                # -1 を忘れると e_idx(N) == s_idx(N+1) となり、前後の字幕が
-                # そのモーラ長ぶん重なって同じ位置に2枚描画される。
-                idx_end = int((char_offset + len(chunk)) * n_sent_moras / sentence_chars)
-                e_idx   = max(s_idx, min(idx_end, n_sent_moras) - 1)
+        if n_sent_moras > 0:
+            bounds = _chunk_mora_bounds(final_chunks, n_sent_moras)
+            for chunk, (s_idx, e_idx) in zip(final_chunks, bounds):
                 start_t = current_time + sent_moras[s_idx]["start"] * mora_scale
-                end_t   = current_time + (sent_moras[e_idx]["start"] + sent_moras[e_idx]["duration"]) * mora_scale + 0.05
-            else:
+                end_t   = current_time + (sent_moras[e_idx]["start"]
+                                          + sent_moras[e_idx]["duration"]) * mora_scale + 0.05
+                subtitles.append({"start": round(start_t + time_offset, 3),
+                                  "end":   round(end_t + time_offset, 3),
+                                  "text":  chunk})
+        else:
+            sentence_chars = sum(len(c) for c in final_chunks)
+            char_offset = 0
+            for chunk in final_chunks:
                 ratio_s = char_offset / max(sentence_chars, 1)
                 ratio_e = (char_offset + len(chunk)) / max(sentence_chars, 1)
-                start_t = current_time + ratio_s * scaled_dur
-                end_t   = current_time + ratio_e * scaled_dur + 0.05
-            subtitles.append({
-                "start": round(start_t + time_offset, 3),
-                "end":   round(end_t   + time_offset, 3),
-                "text":  chunk,
-            })
-            char_offset += len(chunk)
+                subtitles.append({
+                    "start": round(current_time + ratio_s * scaled_dur + time_offset, 3),
+                    "end":   round(current_time + ratio_e * scaled_dur + 0.05 + time_offset, 3),
+                    "text":  chunk})
+                char_offset += len(chunk)
 
         current_time += scaled_dur
 
+    _merge_short_subtitles(subtitles, max_chars)
     _dedupe_subtitle_overlaps(subtitles)
+    _close_subtitle_gaps(subtitles)
 
     print(f"[字幕] {len(subtitles)}ブロック生成完了")
     return subtitles
+
+
+def _merge_short_subtitles(subtitles: list[dict], max_chars: int) -> None:
+    """SUBTITLE_MIN_SEC より短い表示になったブロックを隣と結合する（in-place）。
+
+    分割と割り当てを直したのでほとんど出ないが、モーラが極端に短い語
+    （「ねぇ、」など）では残りうる。読めない一瞬の点滅は「字幕が消えた」に見えるので、
+    最後の安全網として潰す。**2行に折り返せる前提**なので、結合の上限は
+    max_chars の2倍まで許す。
+    """
+    limit = max_chars * 2
+    i = 0
+    while i < len(subtitles):
+        cur = subtitles[i]
+        if cur["end"] - cur["start"] >= SUBTITLE_MIN_SEC:
+            i += 1
+            continue
+        prev = subtitles[i - 1] if i > 0 else None
+        nxt  = subtitles[i + 1] if i + 1 < len(subtitles) else None
+        # 時間的に近いほうへ寄せる。文の切れ目には読点のポーズが入るので、
+        # 素直に「間隔が短いほう」を選べば同じ文の中で結合される。
+        # 前後どちらも長すぎて入らないなら、その1枚は諦めてそのままにする。
+        cand = []
+        if prev is not None and len(prev["text"]) + len(cur["text"]) <= limit:
+            cand.append(("prev", cur["start"] - prev["end"]))
+        if nxt is not None and len(cur["text"]) + len(nxt["text"]) <= limit:
+            cand.append(("next", nxt["start"] - cur["end"]))
+        if not cand:
+            i += 1
+            continue
+        side = min(cand, key=lambda c: c[1])[0]
+        if side == "prev":
+            prev["text"] += cur["text"]
+            prev["end"] = cur["end"]
+            subtitles.pop(i)
+        else:
+            nxt["text"] = cur["text"] + nxt["text"]
+            nxt["start"] = cur["start"]
+            subtitles.pop(i)
+        i = max(i - 1, 0)
 
 
 def _dedupe_subtitle_overlaps(subtitles: list[dict]) -> None:
@@ -337,10 +533,46 @@ def _dedupe_subtitle_overlaps(subtitles: list[dict]) -> None:
             cur["end"] = round(max(cur["start"] + 0.15, limit), 3)
 
 
+SUBTITLE_MAX_HOLD = 1.2   # 空白を埋めるために字幕を伸ばしてよい上限[秒]
+
+
+def _close_subtitle_gaps(subtitles: list[dict], max_hold: float = SUBTITLE_MAX_HOLD) -> None:
+    """字幕どうしの空白を、前の字幕を伸ばして埋める（in-place）。
+
+    モーラ列には読点のポーズ（pause_mora）が要素として入らないので、素で作ると
+    「ねぇ、」のあとに 0.6秒 の空白ができる。字幕はその間だけ消え、読んでいる側には
+    点滅に見える。実際の字幕は文が続くあいだ出しっぱなしにするのが普通なので、
+    次の字幕の直前まで伸ばす。
+
+    ただし無音が長い箇所（セクションの切れ目など）で古い字幕が居座らないよう、
+    伸ばす量は max_hold で頭打ちにする。
+    """
+    for cur, nxt in zip(subtitles, subtitles[1:]):
+        limit = round(nxt["start"] - SUBTITLE_GAP, 3)
+        if cur["end"] < limit:
+            cur["end"] = round(min(limit, cur["end"] + max_hold), 3)
+
+
 def _find_subtitle_time(subtitles: list[dict], keyword: str, start_from: float = 0.0) -> float | None:
-    """keyword を含む最初の字幕の start を返す。見つからなければ None。"""
-    for sub in subtitles:
-        if sub["start"] >= start_from and keyword in sub["text"]:
+    """keyword を含む最初の字幕の start を返す。見つからなければ None。
+
+    **チャンクを跨いだ場合も拾う。** 字幕は max_chars で機械的に割られるので、
+    「高評価」「行ってらっしゃい」が2枚に割れることがある。1枚ずつしか見ないと
+    見つからず、呼び出し側の thankfulTime が 0 に落ちてモーションが変わる。
+    跨いだときは keyword が始まったほうのブロックの start を返す。
+    """
+    cands = [s for s in subtitles if s["start"] >= start_from]
+    for i, sub in enumerate(cands):
+        if keyword in sub["text"]:
+            return sub["start"]
+        # 後続を連結して、このブロックから始まる出現を探す
+        joined = sub["text"]
+        for nxt in cands[i + 1:]:
+            joined += nxt["text"]
+            if len(joined) >= len(sub["text"]) + len(keyword):
+                break
+        hit = joined.find(keyword)
+        if 0 <= hit < len(sub["text"]):
             return sub["start"]
     return None
 
@@ -568,6 +800,16 @@ ARDY_MAX_SEGMENTS = 12
 # ARDY_GEN_TIMEOUT の既定300秒では長いブロックの1本目が溢れるので、尺から動的に伸ばす
 ARDY_GEN_SEC_PER_SEC = float(os.getenv("ARDY_GEN_SEC_PER_SEC", "10"))
 
+# 生成が溢れたときのやり直し回数と、その前に空ける時間[秒]。
+# **予算は Step3.8 全体で、ブロックごとではない。** 朝版は 06:00 開始で投稿まで16分しか
+# 無く、ブロック単位で再試行すると Unity 録画が押す（2026-09-02 の朝は ARDY の
+# 300秒待ちが丸ごと足されて総所要 976秒だった）。
+# 同居する ollama の負荷はバースト的なので、間を置けば1回目が溢れても2回目は通る。
+# タイムアウトそのもの（ARDY_GEN_TIMEOUT=300）は伸ばさない。GPU が空いていれば
+# 実測 17〜54秒で、300秒は十分すぎる。伸ばすのは症状を隠すだけ
+ARDY_GEN_RETRIES = int(os.getenv("ARDY_GEN_RETRIES", "1"))
+ARDY_RETRY_DELAY_SEC = float(os.getenv("ARDY_RETRY_DELAY_SEC", "30"))
+
 # 1セグメントの目安の長さ[秒]。big は明確なジェスチャー、small は待機動作。
 # この比で実尺を按分するだけなので、合計が尺に合わなくても構わない。
 #
@@ -630,6 +872,8 @@ OLLAMA_URL        = _ardy.OLLAMA_URL
 _free_ollama       = _ardy._free_ollama
 ardy_wait_memory   = _ardy.wait_memory
 _mem_available_gb  = _ardy.mem_available_gb
+ardy_vram_free_gb  = _ardy.vram_free_gb
+ardy_log_gpu_state = _ardy.log_gpu_state
 ardy_available     = _ardy.available
 ardy_health        = _ardy.health
 _kill_stray_server = _ardy.kill_stray_server
@@ -872,6 +1116,12 @@ def build_vrma_motions(blocks: list[dict], out_dir: str, seed_base: str) -> list
     if not blocks:
         return []
 
+    # 同居相手を1行残す。ARDY が遅いときの原因はほぼ GPU の相手側にあるが、
+    # 2026-09-02 まで GPU の情報がログに一切残っておらず、journalctl -u ollama と
+    # 突き合わせるまで切り分けられなかった
+    ardy_log_gpu_state()
+    retries_left = ARDY_GEN_RETRIES
+
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     # 消さないと emotions.json に載らない過去の .vrma が溜まり続ける
@@ -896,6 +1146,15 @@ def build_vrma_motions(blocks: list[dict], out_dir: str, seed_base: str) -> list
 
             t0 = time.time()
             length = ardy_generate_segments(segs, seed, spec_json)
+            if length is None and retries_left > 0:
+                # 溢れる原因は同居する ollama の負荷で、それはバースト的。
+                # サーバーは読み込み済みのまま使い回すので、かかるのは生成のぶんだけ
+                retries_left -= 1
+                print(f"[ARDY] {part} の生成をやり直します "
+                      f"（{ARDY_RETRY_DELAY_SEC:.0f}秒待つ / 残り{retries_left}回）")
+                time.sleep(ARDY_RETRY_DELAY_SEC)
+                ardy_log_gpu_state()
+                length = ardy_generate_segments(segs, seed, spec_json)
             if length is None or not ardy_to_vrma(spec_json, str(vrma_path)):
                 # 続きを繋げる位置が決まらないので、このブロックはここで打ち切る
                 break
@@ -924,13 +1183,16 @@ def esc_drawtext(s: str) -> str:
 
     ffmpeg 6.1.1 での実測に基づく:
       - リテラルの `\\` を出すには 4個必要（1個・2個だと文字ごと消える）
-      - `'` は `\\'` ではエスケープできない。シングルクォート内に `'` は書けないので
-        いったん閉じて `\\'` を置き、また開く（`'\\''`）必要がある。
-        単体では通ってしまうがフィルタを連結すると後続フィルタの解析が壊れる。
+      - `'` はシングルクォート内には書けない。いったん閉じ、**バックスラッシュ3個**を
+        付けた `\\\\\\'` を置いてから開き直す（`'\\\\\\''`）。
+        アンエスケープが2段（フィルタグラフ → オプション値）かかるため、
+        `'\\''`（1個）だと**その drawtext だけ静かに何も描かれない**。
+        ffmpeg は 0 で終了し、後続フィルタも動くのでログにも出ない。
+        実測: 「Nagiで「Don't ever」の1枚が丸ごと透明になっていた
       - `%{...}` は `\\%` でエスケープしても展開される。`expansion=none` でしか止まらない
     """
     return (s.replace("\\", "\\\\\\\\")
-             .replace("'", "'\\''")
+             .replace("'", "'\\\\\\''")
              .replace(":", "\\:"))
 
 
@@ -942,48 +1204,118 @@ def base_vf_parts() -> list[str]:
     ]
 
 
+SUBTITLE_FONT_SIZE = 52
+SUBTITLE_LINE_H    = 62      # fontsize=52 の行送り
+SUBTITLE_BAND_Y    = H - 420  # 帯の上端。**動かさないこと**（下げると口が隠れる）
+SUBTITLE_BAND_H    = 160      # 1行のときの帯の高さ
+SUBTITLE_TEXT_Y    = H - 370  # 1行目のベースライン位置
+SUBTITLE_COLOR     = "0x00A88A"
+
+
 def build_subtitle_filters(subtitles: list[dict]) -> list[str]:
-    """下部のミント帯 + 白文字の字幕フィルタを生成する（夜版レイアウト）"""
-    parts = []
-    for sub in subtitles:
-        start = sub["start"]
-        end   = sub["end"]
-        text  = esc_drawtext(sub["text"])
-        parts.append(
-            f"drawbox=x=0:y={H-420}:w={W}:h=160:color=0x00A88A@0.92:t=fill"
-            f":enable='between(t,{start},{end})'"
-        )
-        parts.append(
-            f"drawtext=fontfile={FONT_PATH}:text='{text}'"
-            f":expansion=none"
-            f":fontcolor=white:fontsize=52:x=(w-text_w)/2:y={H-370}"
-            f":enable='between(t,{start},{end})'"
-        )
+    """下部のミント帯 + 白文字の字幕フィルタを生成する（夜版レイアウト）。
+
+    朝版（quiz_layout.build_caption_filters）と同じく wrap_cjk で最大2行に
+    折り返す。1行に収める前提だと max_chars を 15 まで下げるしかなく、
+    読点の無い長い句が機械的に割れて 1文字だけの字幕が出ていた。
+
+    **帯（drawbox）は字幕ごとに出さない。** 以前は帯にも字幕と同じ enable を
+    付けていたので、ブロックの切れ目（SUBTITLE_GAP=0.06秒、実測では最大0.6秒）
+    ごとに帯が丸ごと消えてチカチカしていた。字幕がある区間を通しで1枚塗る。
+
+    帯の高さは**動画を通して一定**にする（いちばん長い字幕の行数で決める）。
+    字幕ごとに変えると帯が上下して目立つ。伸ばすのは下方向だけ。上端を下げると
+    カメラを上げたときの口元にかかる（quiz_layout.py の冒頭を参照）。
+
+    行ごとに drawtext を分けるのは build_target_filters と同じ理由。1つの
+    drawtext に改行を入れると ffmpeg はブロック全体の外接矩形を中央に置くだけで、
+    短いほうの行が左に寄って見える（text_align は ffmpeg 7 以降にしか無い）。
+    """
+    if not subtitles:
+        return []
+
+    max_units = (W - 120) * 2 // SUBTITLE_FONT_SIZE
+    wrapped = [(s, wrap_subtitle_lines(s["text"], max_units)) for s in subtitles]
+    n_lines = max((len(lines) for _, lines in wrapped), default=1)
+
+    band_h = SUBTITLE_BAND_H + SUBTITLE_LINE_H * (n_lines - 1)
+    band_start, band_end = subtitles[0]["start"], subtitles[-1]["end"]
+    parts = [
+        f"drawbox=x=0:y={SUBTITLE_BAND_Y}:w={W}:h={band_h}"
+        f":color={SUBTITLE_COLOR}@0.92:t=fill"
+        f":enable='between(t,{band_start},{band_end})'"
+    ]
+    for sub, lines in wrapped:
+        start, end = sub["start"], sub["end"]
+        # 行数の少ない字幕は帯の中で縦中央に置く
+        top = SUBTITLE_TEXT_Y + SUBTITLE_LINE_H * (n_lines - len(lines)) // 2
+        for i, line in enumerate(lines):
+            parts.append(
+                f"drawtext=fontfile={FONT_PATH}:text='{esc_drawtext(line)}'"
+                f":expansion=none"
+                f":fontcolor=white:fontsize={SUBTITLE_FONT_SIZE}"
+                f":x=(w-text_w)/2:y={top + SUBTITLE_LINE_H * i}"
+                f":enable='between(t,{start},{end})'"
+            )
     return parts
 
 
-def build_corner_filters(corners: list[dict]) -> list[str]:
-    """左上のコーナーテロップ（白箱 + カラー下線 + カラー文字）"""
-    parts = []
-    for corner in corners:
-        start = corner["start"]
-        end   = corner["end"]
-        label = esc_drawtext(corner["label"])
-        color = corner["color"].replace("#", "0x")
-        box_w = min(len(corner["label"]) * 38 + 40, W - 40)
+# ターゲットテロップ（夜版）。「誰に向けた動画か」を動画全体に出し続ける。
+# Shorts はスワイプで途中から入るので、冒頭だけに出しても届かない。
+TARGET_FONT_SIZE   = 72
+TARGET_LINE_H      = 92     # fontsize=72 の行送り（実測に合わせた概算）
+TARGET_MAX_CHARS   = 11     # 72px × 11文字 = 792px。W=1080 に収まる最大
+TARGET_COLOR       = "0x00A88A"
+
+
+def wrap_target_text(text: str, max_chars: int = TARGET_MAX_CHARS) -> list[str]:
+    """テロップを最大2行に折り返す。
+
+    Thumbnail の一言は20文字以内なので 11文字 × 2行 で必ず収まる。
+    句読点で切れると読みやすいので、後半に句読点があればそこを優先する。
+    """
+    text = text.strip()
+    if len(text) <= max_chars:
+        return [text]
+    # 折り返し位置の候補: 前半すぎない位置にある句読点の直後
+    cut = max_chars
+    for i in range(min(max_chars, len(text) - 1), max_chars // 2, -1):
+        if text[i - 1] in "、。！？":
+            cut = i
+            break
+    return [text[:cut], text[cut:cut + max_chars]]
+
+
+def build_target_filters(text: str) -> list[str]:
+    """画面上部に出し続ける大テロップ（白箱 + カラー下線 + カラー文字）。
+
+    以前ここにあった左上のコーナーテロップ（「今日のNagi」等）の意匠を踏襲しつつ、
+    中央寄せ・大サイズにしたもの。
+    enable を付けないので動画全体に出る（Shorts はスワイプで途中から入るため）。
+
+    複数行は drawtext を行ごとに分けて出す。1つの drawtext に改行を入れると
+    ffmpeg はブロック全体の外接矩形を中央に置くだけなので、短いほうの行が
+    左に寄って見える（text_align は ffmpeg 7 以降にしか無い）。
+    """
+    lines = wrap_target_text(text)
+    if not lines or not lines[0]:
+        return []
+
+    box_h  = TARGET_LINE_H * len(lines) + 28
+    box_w  = min(max(len(l) for l in lines) * TARGET_FONT_SIZE + 56, W - 40)
+    box_x  = (W - box_w) // 2
+    box_y  = 40
+
+    parts = [
+        f"drawbox=x={box_x}:y={box_y}:w={box_w}:h={box_h}:color=white@0.9:t=fill",
+        f"drawbox=x={box_x}:y={box_y + box_h}:w={box_w}:h=6:color={TARGET_COLOR}@1.0:t=fill",
+    ]
+    for i, line in enumerate(lines):
         parts.append(
-            f"drawbox=x=20:y=40:w={box_w}:h=70:color=white@0.9:t=fill"
-            f":enable='between(t,{start},{end})'"
-        )
-        parts.append(
-            f"drawbox=x=20:y=108:w={box_w}:h=6:color={color}@1.0:t=fill"
-            f":enable='between(t,{start},{end})'"
-        )
-        parts.append(
-            f"drawtext=fontfile={FONT_PATH}:text='{label}'"
+            f"drawtext=fontfile={FONT_PATH}:text='{esc_drawtext(line)}'"
             f":expansion=none"
-            f":fontcolor={color}:fontsize=36:x=30:y=52"
-            f":enable='between(t,{start},{end})'"
+            f":fontcolor={TARGET_COLOR}:fontsize={TARGET_FONT_SIZE}"
+            f":x=(w-text_w)/2:y={box_y + 14 + TARGET_LINE_H * i}"
         )
     return parts
 

@@ -35,4 +35,17 @@ echo "[run_live] 開始: $(date '+%F %T')" | tee -a "$LOG"
 # tee の終了コードではなく python のほうを systemd に返す
 STATUS=${PIPESTATUS[0]}
 echo "[run_live] 終了: $(date '+%F %T') status=$STATUS" | tee -a "$LOG"
+
+# 失敗を無人で握り潰さない。
+# 2026-08-29 の GPU 交換で Unity のライセンスが外れたとき、配信は
+# 「返事したコメント 0件」で終わっていたのに誰も気付けなかった。
+if [ "$STATUS" -ne 0 ]; then
+    ./venv/bin/python -c "
+import sys
+sys.path.insert(0, '$SCRIPT_DIR')
+from common import notify
+notify.error('夜の配信', open('$LOG', errors='replace').read()[-1500:])
+" 2>/dev/null || true
+fi
+
 exit "$STATUS"

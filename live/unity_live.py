@@ -38,6 +38,26 @@ def _start_xvfb() -> tuple:
                            reserved=(LIVE_DISPLAY,))
 
 
+def _display_refresh_hz(display: str) -> float:
+    """xrandr が示す現在モードのリフレッシュレート。取得不能なら0。"""
+    try:
+        out = subprocess.run(
+            ["xrandr", "--current"], env={**os.environ, "DISPLAY": display},
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+    for line in out.splitlines():
+        for token in line.split():
+            if "*" not in token:
+                continue
+            try:
+                return float(token.rstrip("*+"))
+            except ValueError:
+                continue
+    return 0.0
+
+
 class UnityLive:
     """配信中ずっと生きている Unity プロセス。"""
 
@@ -47,9 +67,19 @@ class UnityLive:
         self.display = None
         self._display_num = None
         self.log_path = Path(log_path) if log_path else Path("/tmp/bottan-live-unity.log")
+        self._start_count = 0
+
+    def _next_log_path(self) -> Path:
+        """再起動で最初のクラッシュログを上書きしないログ名を返す。"""
+        self._start_count += 1
+        if self._start_count == 1:
+            return self.log_path
+        return self.log_path.with_name(
+            f"{self.log_path.stem}_restart{self._start_count - 1}{self.log_path.suffix}")
 
     def start(self, ready_timeout: float = 300.0) -> dict:
         """Unity を起動し、LiveController が応答するまで待つ。"""
+        current_log_path = self._next_log_path()
         env = os.environ.copy()
         env.pop("XAUTHORITY", None)          # 仮想ディスプレイには不要
 
@@ -64,9 +94,18 @@ class UnityLive:
                     f"LIVE_DISPLAY='' にして Xvfb にフォールバックしてください"
                     f"（Xvfb は GPU を使えないため 1.7fps しか出ません）"
                 )
+            refresh = _display_refresh_hz(LIVE_DISPLAY)
+            if refresh < 30.0:
+                raise RuntimeError(
+                    f"ディスプレイ {LIVE_DISPLAY} に有効な表示クロックがありません "
+                    f"({refresh:.2f}Hz)。NoScanout/CurrentMetaMode=NULL のままでは "
+                    f"Unity が約1fpsになりクラッシュします。"
+                    f"`sudo bash setup/install_xorg.sh` を再実行してください"
+                )
             self.display = LIVE_DISPLAY
             self._cleanup_stale(remove_x_locks=False)
-            print(f"[Unity] 既存ディスプレイを使います: DISPLAY={self.display}")
+            print(f"[Unity] 既存ディスプレイを使います: "
+                  f"DISPLAY={self.display} refresh={refresh:.2f}Hz")
         else:
             print("[Unity] 警告: Xvfb で起動します。GPU が使われないため配信品質は出ません")
             self._cleanup_stale(remove_x_locks=True)
@@ -89,7 +128,7 @@ class UnityLive:
             "-projectPath", UNITY_PROJECT,
             "-liveMode",
             "-livePort", str(LIVE_PORT),
-            "-logFile", str(self.log_path),
+            "-logFile", str(current_log_path),
         ]
         # 横画面の構図。既定は縦画面と同じ真ん中寄せなので、指定がなければ渡さない
         if LIVE_CAMERA_X is not None:
@@ -123,7 +162,7 @@ class UnityLive:
             if self.proc.poll() is not None:
                 raise RuntimeError(
                     f"Unity が起動直後に終了しました (code={self.proc.returncode})。"
-                    f"ログ: {self.log_path}"
+                    f"ログ: {current_log_path}"
                 )
             try:
                 st = unity_client.status()
@@ -134,7 +173,7 @@ class UnityLive:
 
         self.stop()
         raise RuntimeError(f"{ready_timeout:.0f}秒待っても LiveController が応答しません。"
-                           f"ログ: {self.log_path}")
+                           f"ログ: {current_log_path}")
 
     def _cleanup_stale(self, remove_x_locks: bool = True) -> None:
         """前回の残骸を片付ける。

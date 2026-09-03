@@ -16,18 +16,33 @@ from quiz_data import answer_text, wrong_text
 
 QUIZ_SYSTEM_PROMPT = CHARACTER_PROMPT + """
 【この動画について】
-朝6時に配信する、約55秒の「日常の勘違い・雑学クイズ」ショート動画の台本を書く。
+朝6時に配信する、約30秒の「日常の勘違い・雑学クイズ」ショート動画の台本を書く。
+テンポが命なので、どのパートも指定の文字数を必ず守ること。
 視聴者はこれから一日を始める人。眠い頭でも聞ける、軽くて明るいテンションで話すこと。
 
 【絶対に守ること】
 - 与えられた【クイズデータ】の事実（正解・解説の内容）を一切改変しないこと
 - 解説に書かれていない数値・年号・人名・地名・研究名・団体名を新たに追加しないこと
   クイズデータは人間がファクトチェックしたものなので、補足を足すと誤情報になる
-- 解説はbotたんの口調に整えるだけ。情報量を増やさない、減らしすぎない
+- 解説はbotたんの口調に整えたうえで、指定の文字数まで要約してよい。
+  削ってよいのは修飾・言い換え・出典の調査名や団体名まで。
+  **核となる事実（なぜその答えが正解なのか）は必ず残すこと**
+- 書かれていない事実・数値を足すのは引き続き禁止（削るのは可、足すのは不可）
 - 選択肢の文言はデータのまま使うこと（言い換えない）
 - 「諸説あります」のような逃げの言い回しは入れない
 
 【出力ルール】
+- **ローカルLLM（Ollama）では JSONのキーが名前のアルファベット順で出力される。**
+  その場合の書く順番は affirmation → answer_reveal → explanation → motions →
+  question_intro → thumbnail_text → title_hook になる。
+  下の①〜⑦は動画の**再生順**であって、書く順ではない。
+  **各キーには、そのキーの担当ぶんだけを入れること。**
+  いちばん最初に書く affirmation に台本を丸ごと入れてしまう事故が実際に起きた。
+  書き始める前に、頭の中で①〜⑦を全部組み立ててから、キーの順に取り出して書くこと。
+- sentence の中のフィールドも同じ理由で arousal → motion → text → valence の順に
+  なりうる。**text より先に motion を書かされる**ので、
+  「どんな文を言うか」を決めてから motion を書くこと。
+  motion は必ず英文で書く（"motions.think" のようなキー名を入れてはいけない）。
 - 日本語のみで出力する
 - textフィールドに[Happy][Sad]などの感情タグを含めないこと。感情はvalence/arousalで表現する
 - 1文は短く区切る（字幕が読みやすくなる）
@@ -102,23 +117,27 @@ def build_quiz_user_prompt(quiz: dict) -> str:
 
 【書いてほしいパート】
 
-① question_intro（約5秒・25文字程度・2〜3文）
-  - 「今日の勘違いクイズ！」のような短い掛け声で始める
+① question_intro（約6秒・40文字以内・2文）— 問題文の文字数を含む
+  - 「勘違いクイズ！」のような**短い**掛け声で始める
   - 続けて問題文を読み上げる（データの問題文をほぼそのまま使う）
-  - 「AとB、どっちだと思う？」で締める
+  - **選択肢A/Bの文言は画面に表示されるので、音声では読み上げないこと**
+  - 「どっち？」の一言で締める（「AとB、どっちだと思う？」と長く言わない）
   - わくわくした雰囲気にする（valence 高め、arousal 高め）
 
-② answer_reveal（約3秒・15文字程度・1〜2文）
+② answer_reveal（約3秒・15文字以内・1〜2文）
   - 「正解は……{ans}！」の形で発表する
   - 驚きが伝わるように arousal をいちばん高くする
 
-③ explanation（約22秒・80文字程度・3〜5文）
-  - 【クイズデータ】の解説を、botたんの口調に整える
+③ explanation（約7秒・45文字以内・2〜3文）
+  - 【クイズデータ】の解説を、botたんの口調に整えて**45文字以内**に要約する
+    （CSVの解説は60〜75文字あるので、必ず削る作業が要る。そのまま口調だけ直すと必ず超える）
+  - 要約で落としてよいのは修飾・言い換え・出典の調査名や団体名。
+    「なぜその答えが正解なのか」の核だけは必ず残すこと
   - 「〜なんだ」「〜なんだって」「〜って言われてるよ」など柔らかい言い回しにする
   - 事実・数値は解説に書かれているものだけを使う
   - 落ち着いたトーン（arousal は低め）
 
-④ affirmation（約10秒・35文字程度・2〜3文）
+④ affirmation（約4秒・25文字以内・1文）
   - この豆知識を知らなかった視聴者を全肯定する
   - 「間違えても大丈夫」「知らなかったってことは、今日ひとつ知れたってこと」の方向性
   - 説教くさくしない。朝の背中をそっと押す一言にする
@@ -136,8 +155,9 @@ def build_quiz_user_prompt(quiz: dict) -> str:
 
   **answer_reveal / explanation / affirmation の各sentenceに "motion" を付ける**こと
   （question_intro は動きを付ける区間の外なので不要）。
-  さらに motions.think に、シンキングタイム中の動きを**英文2つの配列**で入れること
+  さらに motions.think に、シンキングタイム中の動きを**英文1つの配列**で入れること
   （ここだけ発話が無いので文に紐づけられない）。
+  シンキングタイムは3秒しかないので、2つ入れても後ろは再生されずに捨てられる。
 
   **最重要: その文の内容と動きが一致していること**。ただ動いていればよいのではない。
   文で言っていることを体で表す。合っていないと、見ていて不安になる画になる。
@@ -192,7 +212,9 @@ def build_quiz_user_prompt(quiz: dict) -> str:
     turns her upper body to her right, then back to the front /
     leans her upper body to her left, then straightens up
 
-重要：合計の尺は55秒以内。各パートの文字数の目安を大きく超えないこと。
+重要：合計の尺は30秒以内。
+**VOICEVOXの読み上げ速度は約6.5文字/秒**なので、各パートの文字数の目安を超えると
+必ず尺オーバーになる。秒数より文字数を優先して、目安を超えないこと。
 """
 
 
@@ -205,9 +227,9 @@ def build_fallback_script(quiz: dict) -> dict:
     ans = quiz["正解"]
     return {
         "question_intro": [
-            {"text": "今日の勘違いクイズ！",       "valence": 0.8, "arousal": 0.8},
-            {"text": quiz["問題"],                  "valence": 0.5, "arousal": 0.6},
-            {"text": "AとB、どっちだと思う？",      "valence": 0.6, "arousal": 0.7},
+            {"text": "勘違いクイズ！",  "valence": 0.8, "arousal": 0.8},
+            {"text": quiz["問題"],      "valence": 0.5, "arousal": 0.6},
+            {"text": "どっち？",        "valence": 0.6, "arousal": 0.7},
         ],
         "answer_reveal": [
             {"text": f"正解は、{ans}の{answer_text(quiz)}！", "valence": 0.9, "arousal": 0.9,
@@ -220,8 +242,6 @@ def build_fallback_script(quiz: dict) -> dict:
         "affirmation": [
             {"text": "知らなかったってことは、今日ひとつ知れたってことだよ。", "valence": 1.0, "arousal": 0.2,
              "motion": "A woman stands in place and clasps both hands together in front of her chest."},
-            {"text": "それってすごく素敵なことだと思うんだ。",                 "valence": 1.0, "arousal": 0.3,
-             "motion": "A woman stands in place and opens both arms out to the sides at chest height."},
         ],
         "thumbnail_text": quiz["問題"][:20],
         "title_hook":     quiz["問題"][:25],
@@ -229,7 +249,6 @@ def build_fallback_script(quiz: dict) -> dict:
         "motions": {
             "think": [
                 "A woman stands in place and brings one hand up to her chin.",
-                "A woman stands in place and turns her upper body to her right, then back to the front.",
             ],
         },
     }
@@ -285,6 +304,14 @@ def validate_script(script: dict, quiz: dict) -> list[str]:
     new_nums = [n for n in re.findall(r"\d+", expl) if n not in src_nums]
     if new_nums:
         warnings.append(f"explanation に元データに無い数字があります: {new_nums}（要確認）")
+
+    # 発話パートの文字数。超えるとそのまま尺オーバーになるので、
+    # プロンプト調整の材料としてログに残す（生成は止めない）
+    for key, limit in (("question_intro", 40), ("answer_reveal", 15),
+                       ("explanation", 45), ("affirmation", 25)):
+        text = "".join(s.get("text", "") for s in script.get(key) or [])
+        if len(text) > limit:
+            warnings.append(f"{key} が{len(text)}文字（目安{limit}）→ 尺オーバーの原因")
 
     for key, limit in (("thumbnail_text", 20), ("title_hook", 25)):
         val = (script.get(key) or "").strip()
