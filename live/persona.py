@@ -646,8 +646,6 @@ _RAG_SOURCE_LABELS = {
     "nagi_affirmed_post": "SNSのNagiで見かけた他の人の投稿",
     "bsky_received_reply": "Blueskyで他の人からもらった返信",
     "nagi_received_reply": "SNSのNagiで他の人からもらった返信",
-    "bsky_received_like": "Blueskyで他の人からもらったいいね",
-    "nagi_received_reaction": "SNSのNagiで他の人からもらったリアクション",
     "biorhythm": "あなた自身の今日の出来事",
     "youtube_live_comment": "配信で視聴者から届いたコメント",
     # **これだけ「誰かとのやりとりの記憶」ではない。** 外から仕入れた知識で、

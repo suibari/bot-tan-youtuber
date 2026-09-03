@@ -9,6 +9,7 @@ import hashlib
 import importlib
 import importlib.util
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -68,16 +69,25 @@ class FakeClient:
         self.knowledge = knowledge or []
         self.boom = boom
         self.calls = []
+        self.usage_calls = []
 
-    def search(self, query, exclude_document_ids=None, limit=10, sources=None):
+    def search(self, query, exclude_document_ids=None, limit=10, sources=None,
+               purpose="live_filler"):
         sources = tuple(sources or ())
-        self.calls.append({"query": query, "limit": limit, "sources": sources})
+        self.calls.append({"query": query, "limit": limit, "sources": sources,
+                           "purpose": purpose})
         # 本物は中で例外を握り潰して [] を返す（bot_memory_client.py:80-82）
         if self.boom:
             return []
         if sources == ("web_research",):
             return self.knowledge[:limit]
         return self.memories[:limit]
+
+    def record_usage(self, document_ids, output_ref="", purpose="live_filler"):
+        self.usage_calls.append({"document_ids": document_ids,
+                                 "output_ref": output_ref,
+                                 "purpose": purpose})
+        return not self.boom
 
 
 class SubjectHashTest(unittest.TestCase):
@@ -147,6 +157,7 @@ class LookupTest(unittest.TestCase):
         self.assertEqual(got, client.memories)
         for call in client.calls:
             self.assertEqual(call["query"], "最近やったゲームなに？")
+            self.assertEqual(call["purpose"], "live_reply")
 
     def test_past_viewer_comments_are_not_searched(self):
         """**youtube_live_comment を引かないこと。**
@@ -159,6 +170,22 @@ class LookupTest(unittest.TestCase):
         recall.CommentRecall(memory_client=client).lookup("最近やったゲームなに？")
         for call in client.calls:
             self.assertNotIn("youtube_live_comment", call["sources"])
+            self.assertNotIn("bsky_received_like", call["sources"])
+            self.assertNotIn("nagi_received_reaction", call["sources"])
+
+    def test_usage_is_recorded_as_live_reply(self):
+        client = FakeClient()
+        comment_recall = recall.CommentRecall(memory_client=client)
+        self.assertTrue(comment_recall.record_usage(
+            [{"id": 3}, {"id": 3}, {"id": "bad"}], "broadcast-1"))
+        deadline = time.time() + 1
+        while not client.usage_calls and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(client.usage_calls, [{
+            "document_ids": [3],
+            "output_ref": "broadcast-1",
+            "purpose": "live_reply",
+        }])
 
     def test_a_knowledge_card_gets_its_own_seat(self):
         """調べて覚えた知識は別枠で引き、いちばん前に置くこと。
@@ -207,10 +234,12 @@ class LookupTest(unittest.TestCase):
         started = threading.Barrier(2, timeout=2.0)
 
         class SlowClient(FakeClient):
-            def search(self, query, exclude_document_ids=None, limit=10, sources=None):
+            def search(self, query, exclude_document_ids=None, limit=10, sources=None,
+                       purpose="live_filler"):
                 started.wait()       # 相手が始まっていなければ TimeoutError
                 time.sleep(0.05)
-                return super().search(query, exclude_document_ids, limit, sources)
+                return super().search(
+                    query, exclude_document_ids, limit, sources, purpose)
 
         recall.CommentRecall(memory_client=SlowClient()).lookup("eu4って何？")
 

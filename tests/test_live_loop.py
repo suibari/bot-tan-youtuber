@@ -178,6 +178,16 @@ class ClosingSoonTest(unittest.TestCase):
         self.assertFalse(session._closing_soon(closing_at))
 
 
+class ReplyMemoryUsagePolicyTest(unittest.TestCase):
+    def test_usage_is_after_speech_and_excludes_fallbacks(self):
+        source = (LIVE / "live.py").read_text(encoding="utf-8")
+        speech_guard = source.index("if not spoken_text:")
+        usage_guard = source.index('if remembered and not reply.get("_fallback"):')
+        usage_call = source.index("self.recall.record_usage(remembered, output_ref)")
+        self.assertLess(speech_guard, usage_guard)
+        self.assertLess(usage_guard, usage_call)
+
+
 class ThreadTest(unittest.TestCase):
     def test_beginning_a_thread_hands_the_theme_to_the_planner(self):
         session = bare_session()

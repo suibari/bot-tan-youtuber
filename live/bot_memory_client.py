@@ -54,7 +54,7 @@ class BotMemoryClient:
         )
 
     def search(self, query: str, exclude_document_ids=None, limit: int = 10,
-               sources=None) -> list:
+               sources=None, purpose: str = "live_filler") -> list:
         """記憶を引く。**sources を渡すとその source_type だけに絞れる。**
 
         サーバ側が検証するので、綴りを間違えると 400 で何も返らない
@@ -64,7 +64,7 @@ class BotMemoryClient:
             return []
         payload = {
             "query": query[:1000],
-            "purpose": "live_filler",
+            "purpose": purpose,
             "limit": max(1, min(20, int(limit))),
         }
         if sources:
@@ -89,7 +89,8 @@ class BotMemoryClient:
             print(f"[bot-memory] 検索APIを利用できません（従来話題へ戻します）: {error}")
             return []
 
-    def record_usage(self, document_ids: list, output_ref: str = "") -> bool:
+    def record_usage(self, document_ids: list, output_ref: str = "",
+                     purpose: str = "live_filler") -> bool:
         ids = list(dict.fromkeys(
             value for value in document_ids if isinstance(value, int)
         ))[:20]
@@ -98,7 +99,7 @@ class BotMemoryClient:
         try:
             self._post("/memory/usages", {
                 "documentIds": ids,
-                "purpose": "live_filler",
+                "purpose": purpose,
                 "outputRef": output_ref,
             })
             return True

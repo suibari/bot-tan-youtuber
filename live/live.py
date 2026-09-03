@@ -607,6 +607,9 @@ class LiveSession:
         # 実際に喋ったぶんだけを残す。合成が途中で落ちたとき、口に出していない
         # 文まで「こう返した」として記録すると、次の配信の記憶がずれる
         self.memory_writer.update_response(comment.message_id, spoken_text)
+        if remembered and not reply.get("_fallback"):
+            output_ref = self.broadcast.broadcast_id if self.broadcast else "dry-run"
+            self.recall.record_usage(remembered, output_ref)
         try:
             memory.save_comment(
                 self.broadcast.broadcast_id if self.broadcast else "dry-run",

@@ -58,7 +58,21 @@ class BotMemoryClientTest(unittest.TestCase):
         self.assertEqual(requests[0][2]["Authorization"], "Bearer test-secret")
         self.assertEqual(requests[0][3]["limit"], 20)
         self.assertEqual(requests[0][3]["excludeDocumentIds"], [7])
+        self.assertEqual(requests[0][3]["purpose"], "live_filler")
         self.assertEqual(requests[0][4], 3.0)
+
+    def test_live_reply_purpose_is_sent_for_search_and_usage(self):
+        requests = []
+
+        def transport(method, url, headers, payload, timeout):
+            requests.append((method, payload))
+            return {"memories": []} if url.endswith("/search") else {"ok": True}
+
+        client = client_module.BotMemoryClient(transport=transport)
+        client.search("最近どう？", purpose="live_reply")
+        self.assertTrue(client.record_usage([1], "broadcast", "live_reply"))
+        self.assertEqual(requests[0][1]["purpose"], "live_reply")
+        self.assertEqual(requests[1][1]["purpose"], "live_reply")
 
     def test_timeout_or_api_failure_falls_back_to_empty(self):
         def failing(*_args):
@@ -95,7 +109,7 @@ class FillerRagTest(unittest.TestCase):
                 self.queries.append((query, exclude_document_ids, limit))
                 return [{
                     "id": 42,
-                    "source": "nagi_received_reaction",
+                    "source": "nagi_received_reply",
                     "content": "青空の写真が好き",
                 }]
 

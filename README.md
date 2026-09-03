@@ -615,8 +615,9 @@ ARDY が予備動作として「膝を深く曲げて脚を大きく開くしゃ
 LAN 内 API `POST /memory/search` を叩き、埋め込みと `pg_trgm` のハイブリッド検索は
 **サーバ側**で走る。`affirmative_bot.bot_memory_documents` に実体があり、
 `source_type` は `bsky_affirmed_post` / `nagi_affirmed_post` / `bsky_received_reply` /
-`nagi_received_reply` / `bsky_received_like` / `nagi_received_reaction` /
-`biorhythm` / `youtube_live_comment` の8種。
+`nagi_received_reply` / `biorhythm` / `youtube_live_comment` / `web_research` が有効。
+BlueskyのいいねとNagiの絵文字リアクションは会話内容ではなくbotたん自身の投稿を
+重複させるため、RAGには保存・検索しない。
 
 配信で届いたコメントは `memory.BotMemoryWriter` が
 `bot_memory_documents`（`source_type='youtube_live_comment'`）へ非同期で upsert する。
@@ -637,6 +638,10 @@ biorhythm にゲームの記録があるのに「最近やったゲームなに�
   2本を**同時に**投げて、遅いほうに待ち時間を合わせる（実測 約1.4秒）。
   保管しているのが十数件しかないので必ず何かが返る。**質問がその語
   （`metadata.term`）を含むものだけ**通す。
+
+検索でプロンプトへ渡した文書IDは、返答が実際に読み上げられ、かつLLMの
+フォールバックでなかった場合だけ `purpose='live_reply'` として非同期記録する。
+フリートークの利用記録 `live_filler` とは分けて追跡する。
 
 検索はクエリが長いほど遅い（実測: 100文字 1.9秒 / 300文字 3.2秒 / 1000文字 9.1秒）。
 サーバがクエリ全文を埋め込んだうえ、`similarity` と `ilike` をクエリ全文で全行に

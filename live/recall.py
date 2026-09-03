@@ -9,8 +9,9 @@
 ここが2つの入口になる。
 
   SELF（自分の過去のこと）… `CommentRecall.lookup()` が Bot Memory API を
-      **質問文で**引く。`source_type` は9種すべてが対象で、`web_research`
-      （前に調べて覚えた知識）もここで出る。
+      **質問文で**引く。公開SNSの投稿・返信とbiorhythmを検索し、
+      `web_research`（前に調べて覚えた知識）は別枠で引く。いいね・絵文字
+      リアクション由来の文書と、返答本文を持たない過去の配信コメントは引かない。
 
   WEB（外の世界のこと）… `CommentRecall.enqueue_research()` が
       `affirmative_bot.bot_memory_research_jobs` へ語を積む。その場では調べない。
@@ -72,7 +73,6 @@ _RECALL_SOURCES = (
     "biorhythm",              # 自分の行動ログ
     "bsky_affirmed_post", "nagi_affirmed_post",
     "bsky_received_reply", "nagi_received_reply",
-    "bsky_received_like", "nagi_received_reaction",
 )
 
 # 調べて覚えた知識は**別枠で引く**。
@@ -160,7 +160,7 @@ class CommentRecall:
         # search() は中で例外を握り潰して [] を返す（bot_memory_client.py:80-82）
         memories = self._client.search(
             query, limit=max(1, LIVE_RECALL_LIMIT - _KNOWLEDGE_SLOTS),
-            sources=_RECALL_SOURCES)
+            sources=_RECALL_SOURCES, purpose="live_reply")
         worker.join(timeout=LIVE_RECALL_TIMEOUT_SEC)
         # 知識カードが先。**「知ってる？」への答えそのもの**なので、
         # 感想の投稿より前に置く
@@ -186,7 +186,8 @@ class CommentRecall:
         asked = topics.term_key(asked if asked is not None else query)
         picked = []
         for item in self._client.search(query, limit=_KNOWLEDGE_CANDIDATES,
-                                        sources=_KNOWLEDGE_SOURCES):
+                                        sources=_KNOWLEDGE_SOURCES,
+                                        purpose="live_reply"):
             metadata = item.get("metadata")
             term = (metadata or {}).get("term") if isinstance(metadata, dict) else ""
             # metadata が無い古い行のために、本文の1行目（＝語）も見る
@@ -197,6 +198,22 @@ class CommentRecall:
                 if len(picked) >= _KNOWLEDGE_SLOTS:
                     break
         return picked
+
+    def record_usage(self, items: list, output_ref: str = "") -> bool:
+        """実際に読み上げた返答へ渡した記憶を、配信ループを止めず記録する。"""
+        ids = list(dict.fromkeys(
+            item.get("id") for item in (items or [])
+            if isinstance(item, dict) and isinstance(item.get("id"), int)
+        ))
+        if not ids:
+            return False
+        threading.Thread(
+            target=self._client.record_usage,
+            args=(ids, output_ref, "live_reply"),
+            daemon=True,
+            name="live-reply-memory-usage",
+        ).start()
+        return True
 
     # ── WEB: あとで調べさせる ─────────────────────
     #
