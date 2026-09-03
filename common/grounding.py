@@ -79,7 +79,7 @@ import re
 import requests
 
 from common.env import env_flag, env_float
-from common.llm import LOCAL_LLM_MODEL, OLLAMA_NUM_CTX, OLLAMA_URL
+from common.llm import LOCAL_LLM_MODEL, OLLAMA_URL
 
 # 配信でコメントに聞かれたことを Gemini で調べるか。**既定は False。**
 # 外のことは非同期の調査キューへ回す（モジュール冒頭の説明を参照）。
@@ -282,10 +282,10 @@ def _gate_ask(text: str, timeout: float = None):
         # 理由を喋り始めて判定が1秒を超える。**語を返させるぶんだけ広げてある**
         # （YES/NO だけだった頃は 4）。
         #
-        # **num_ctx は common/llm.py と同じ値でなければならない。** 以前ここだけ
-        # 2048 にしていた。ollama は num_ctx が違うと runner を作り直すので、
-        # 判定のたびに 26B がもう1つロードされることになる
-        "options": {"temperature": 0, "num_predict": 24, "num_ctx": OLLAMA_NUM_CTX},
+        # **num_ctx は送らない。** 以前ここだけ 2048 にしていて、判定のたびに 26B が
+        # もう1つロードされていた。ollama は num_ctx が違うと runner を作り直すので、
+        # サーバの OLLAMA_CONTEXT_LENGTH に全員で乗る（common/llm.py の定数コメント参照）。
+        "options": {"temperature": 0, "num_predict": 24},
         "think": False,
     }
     if LIVE_GROUNDING_GATE_KEEPALIVE:

@@ -7,18 +7,15 @@
 
 ## ローカルは OpenAI 互換ではなくネイティブ /api/chat を使う
 
-`/v1/chat/completions` では `num_ctx` と `think` を渡す手段が無い。
-`extra_body` に `options` を入れても **Ollama は黙って無視する**（400 にもならない）。
-これを踏むと次の2つが起きる。
+`/v1/chat/completions` では `think` を渡す手段が無い。`extra_body` に `options` を
+入れても **Ollama は黙って無視する**（400 にもならない）。思考するモデルは reasoning を
+別に吐き、そのぶんが生成上限を食うので、`think` を切らないと短い出力（分類など）が
+content 空のまま返る。bsky-affirmative-bot の移行（commit 020ae31）が実機で潰した罠。
 
-1. `num_ctx` が既定の 4096 に落ちる。`live/persona.py` のペルソナだけで 9,000字を超え、
-   そこへ会話履歴と調べもの結果が乗るので、**応答が空文字で返る**。エラーにならないので
-   気付けない。
-2. 思考するモデルは reasoning を別に吐き、そのぶんが生成上限を食う。`think` を切らないと
-   短い出力（分類など）が content 空のまま返る。
-
-どちらも bsky-affirmative-bot の移行（commit 020ae31）が実機で潰した既知の罠なので、
-ここでは最初からネイティブに寄せる。
+**num_ctx はネイティブでも送らない**（2026-09-03〜）。サーバの OLLAMA_CONTEXT_LENGTH が
+唯一の源で、送らないクライアントは全員そこに乗る。詳細は OLLAMA_NUM_CTX の定数コメント。
+なおサーバ側の設定が消えると Ollama 既定の 4096 に落ち、`live/persona.py` のペルソナだけで
+9,000字を超えるので**応答が空文字で返る**（エラーにならないので気付けない）。
 
 ## 構造化出力のキーは**アルファベット順**で生成される
 
@@ -62,24 +59,25 @@ GEMINI_MODELS = [
     m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").split(",") if m.strip()
 ]
 
-# ローカル生成の全リクエストで使う num_ctx。**env で可変にしない。**
+# サーバ側 OLLAMA_CONTEXT_LENGTH のミラー。**リクエストには載せない。**
 #
-# 1. この PC の ollama は bsky-affirmative-bot（別ホストから接続）と共用で、
-#    あちらは画像入力に必要な 32768 を送る。
-#    **Ollama は num_ctx が違うと同じモデルでも runner を作り直す。** 2026-09-01 の
-#    配信では live の 16384 と別ホストの 32768 が交互に来て、11GB のモデルを
-#    数秒おきに SSD から再ロードした。結果、I/O wait が約30%まで上がり、ARDY・
-#    VOICEVOX・Unity のローカル HTTP がすべてタイムアウトした。
-# 2. 既定の 4096 ではペルソナだけで溢れて応答が空文字になる（上のモジュール docstring）。
+# **Ollama は num_ctx が違うと同じモデルでも runner を作り直す。** 2026-09-01 の
+# 配信では live の 16384 と別ホストの 32768 が交互に来て、11GB のモデルを数秒おきに
+# SSD から再ロードした。I/O wait が約30%まで上がり、ARDY・VOICEVOX・Unity の
+# ローカル HTTP がすべてタイムアウトした。2026-09-02 の実測では load_tensors が
+# 1時間に114回起き、ARDY の生成が300秒でタイムアウトして朝夜の Shorts から
+# モーションが消えた。
 #
-# ホスト差を吸収するより、全経路で揃っていることのほうが重要。
+# 以前は「全経路で同じ値を送って揃える」方式で、setup/ollama-override.conf と
+# bsky-affirmative-bot の3箇所を人手で合わせていた。いまは
+# **どこからも送らない**（2026-09-03）。サーバの OLLAMA_CONTEXT_LENGTH が唯一の源で、
+# 送らないクライアントは全員そこに乗るので、揃え忘れが起こりようがない。
+# 送る側が1つでも残っていると、サーバ側だけ下げたときにそこだけ古い値を要求して
+# runner を往復させる（これがいちばん原因を読みにくい壊れ方）。
 #
-# **サーバ側の OLLAMA_CONTEXT_LENGTH（setup/ollama-override.conf）とも同値にすること。**
-# ここを揃えても、num_ctx を送らないクライアントが1つでも居ると ollama の既定値で
-# runner を作り直しにいく。OpenAI互換の /v1/chat/completions は options を黙って
-# 捨てるので、そういう呼び元は自覚なく既定値を要求する。2026-09-02 の実測では
-# 32768 と 4096 が交互に来て load_tensors が1時間に114回起き、ARDY の生成が
-# 300秒でタイムアウトして朝夜の Shorts からモーションが消えた。
+# 既定の 4096 ではペルソナだけで溢れて応答が空文字になる（上のモジュール docstring）
+# ので、サーバ側の設定が消えていないかだけは気にすること。
+# この定数は起動ログの表示と、値が食い違っていないかの目視確認にだけ使う。
 OLLAMA_NUM_CTX = 32768
 
 # 1リクエストの上限[秒]。指定しないと OpenAI SDK の既定 600秒 が効き、
@@ -104,7 +102,9 @@ if USE_LOCAL_LLM:
     client = None
     LLM_MODELS = [LOCAL_LLM_MODEL]
     LLM_MODEL = LOCAL_LLM_MODEL
-    print(f"[LLM] Ollama ({LLM_MODEL}) を使用します (num_ctx={OLLAMA_NUM_CTX})")
+    # num_ctx は送らない。ここに出すのはサーバ既定と食い違っていないかの目視確認用。
+    print(f"[LLM] Ollama ({LLM_MODEL}) を使用します "
+          f"(num_ctx はサーバ既定に従う。想定 {OLLAMA_NUM_CTX})")
 else:
     client = OpenAI(api_key=GEMINI_API_KEY, base_url=GEMINI_BASE_URL,
                     timeout=LLM_TIMEOUT_SEC, max_retries=0)
@@ -134,7 +134,8 @@ def _response(content: str, finish_reason: str):
 
 def _ollama_options(kwargs: dict) -> dict:
     """OpenAI 互換の引数を Ollama の options へ写す。"""
-    options = {"num_ctx": OLLAMA_NUM_CTX}
+    # num_ctx は送らない。サーバの OLLAMA_CONTEXT_LENGTH が唯一の源（上の定数コメント参照）。
+    options = {}
     if kwargs.get("temperature") is not None:
         options["temperature"] = kwargs["temperature"]
     if kwargs.get("max_tokens") is not None:

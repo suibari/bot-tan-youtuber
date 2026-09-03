@@ -97,18 +97,23 @@ class OllamaRequestTest(unittest.TestCase):
         return sent, response
 
     def test_it_uses_the_native_endpoint_not_the_openai_one(self):
-        """/v1/chat/completions では num_ctx も think も渡せない。"""
+        """/v1/chat/completions では think を渡せず、reasoning が生成上限を食う。"""
         sent, _ = self._send(messages=[])
         self.assertTrue(sent["url"].endswith("/api/chat"), sent["url"])
         self.assertNotIn("/v1", sent["url"])
 
-    def test_num_ctx_is_always_sent(self):
-        """既定の 4096 に落ちるとペルソナが入りきらず、応答が空文字で返る。"""
-        sent, _ = self._send(messages=[])
-        self.assertEqual(sent["body"]["options"]["num_ctx"], self.llm.OLLAMA_NUM_CTX)
+    def test_num_ctx_is_never_sent(self):
+        """送るとサーバ既定とずれたときに 26B runner が往復する。
 
-    def test_num_ctx_matches_the_shared_runner(self):
-        """bsky-affirmative-bot と同じ値。ずれると 26B runner が再ロードされる。"""
+        num_ctx はサーバの OLLAMA_CONTEXT_LENGTH が唯一の源。送らないクライアントは
+        全員そこに乗るので、揃え忘れが起こりようがない。1つでも送る側が残っていると、
+        サーバ側だけ下げたときにそこだけ古い値を要求してリロードを誘発する。
+        """
+        sent, _ = self._send(messages=[])
+        self.assertNotIn("num_ctx", sent["body"]["options"])
+
+    def test_num_ctx_constant_mirrors_the_server_default(self):
+        """送りはしないが、サーバ側 OLLAMA_CONTEXT_LENGTH と同値に保つ（目視確認用）。"""
         self.assertEqual(self.llm.OLLAMA_NUM_CTX, 32768)
 
     def test_thinking_is_always_off(self):
