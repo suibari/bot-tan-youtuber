@@ -156,6 +156,9 @@ class LlmGateTest(unittest.TestCase):
         VRAM は 16GB しかないので 13.1GB のモデルは1つしか載らない。
         2026-08-30 の配信では判定用の gemma3:4b が 503 で載らず、
         調べもの判定がまるごと語句へ降格していた。
+
+        num_ctx は誰も送らない（サーバの OLLAMA_CONTEXT_LENGTH が唯一の源）ので、
+        ここでは「送っていないこと」を確かめる。
         """
         from common import llm
         self.assertEqual(grounding.LIVE_GROUNDING_GATE_MODEL, llm.LOCAL_LLM_MODEL)
@@ -163,7 +166,7 @@ class LlmGateTest(unittest.TestCase):
                           return_value=gate_reply("YES")) as post:
             grounding.classify("東京タワーの高さしってる")
         body = post.call_args.kwargs["json"]
-        self.assertEqual(body["options"]["num_ctx"], llm.OLLAMA_NUM_CTX)
+        self.assertNotIn("num_ctx", body["options"])
 
     def test_ollama_failure_falls_back_to_the_regex(self):
         # ollama が落ちていても配信は続ける
