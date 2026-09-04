@@ -32,6 +32,29 @@ from common.env import env_int
 LIVE_POST_MIN_SCORE = env_int("LIVE_POST_MIN_SCORE", 80)
 
 
+YOUTUBE_SUBJECT_PREFIX = "youtube:"
+
+
+def normalize_subject_key(channel_id: str) -> str | None:
+    """author_id へ YouTube の名前空間の印を付ける。
+
+    affirmative_bot.bot_memory_documents.author_id には Nagi/Bluesky の
+    `did:plc:...` と YouTube のチャンネルID `UC...` が同居している。形式が違うので
+    現状は衝突しないが、こっそり投稿の可視判定が author_id の一致に乗ったので、
+    その偶然に依存しないよう印を付ける。名寄せはしない（別人のまま）。
+
+    原典は packages/database/src/botMemory.ts の normalizeMemorySubjectKey。
+    ここは TS を通らない直INSERT経路なので、同じ規則を手で揃える必要がある。
+    冪等: すでに印が付いた値を再度通しても二重にならない。
+    """
+    value = (channel_id or "").strip()
+    if not value:
+        return None
+    if value.startswith(YOUTUBE_SUBJECT_PREFIX):
+        return value
+    return f"{YOUTUBE_SUBJECT_PREFIX}{value}"
+
+
 class BotMemoryWriter:
     """配信のホットパスを止めずに共通bot memoryへ書き込む。"""
 
@@ -64,7 +87,7 @@ class BotMemoryWriter:
             self._queue.put(("upsert", {
                 "message_id": message_id,
                 "broadcast_id": broadcast_id,
-                "author_id": author_id,
+                "author_id": normalize_subject_key(author_id),
                 "content": content,
                 "metadata": {"broadcastId": broadcast_id,
                              "authorName": author_name, **(metadata or {})},

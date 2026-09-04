@@ -100,6 +100,17 @@ class ChatMemoryIngestTest(unittest.TestCase):
         writer.stop()
         self.assertEqual([kind for kind, _ in actions], ["upsert", "response", "delete"])
         self.assertEqual(actions[0][1]["metadata"]["authorName"], "name")
+        # author_id は名前空間の印付きで積む。DID と同じ列に入るため。
+        self.assertEqual(actions[0][1]["author_id"], "youtube:channel")
+
+    def test_subject_key_is_namespaced_and_idempotent(self):
+        # 原典は packages/database/src/botMemory.ts の normalizeMemorySubjectKey。
+        self.assertEqual(memory.normalize_subject_key("UCabc"), "youtube:UCabc")
+        # すでに印が付いた値を再度通しても二重にならない（バックフィルの再実行対策）。
+        self.assertEqual(memory.normalize_subject_key("youtube:UCabc"), "youtube:UCabc")
+        self.assertEqual(memory.normalize_subject_key("  UCabc  "), "youtube:UCabc")
+        self.assertIsNone(memory.normalize_subject_key(""))
+        self.assertIsNone(memory.normalize_subject_key(None))
 
     def test_writer_failure_does_not_stop_later_actions(self):
         attempts = []
