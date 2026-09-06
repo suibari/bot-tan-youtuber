@@ -21,6 +21,7 @@ botたん動画パイプライン 共通処理
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)
   UNITY_EXE           : Unityエディタのパス
   UNITY_PROJECT       : Unityプロジェクトのパス
+  UNITY_RECORD_TIMEOUT_SEC : Unity録画の待機上限秒 (デフォルト: 600)
   VRMA_MOTION_DIR     : AI生成モーション(.vrma)の出力先 (省略時は従来のMixamoモーションのみ)
   ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /mnt/data/ardy-engine)
   ARDY_MERGED_BASE    : テキストエンコーダ(15GB)の置き場。読み込み速度が
@@ -88,6 +89,7 @@ VOICEVOX_SPEAKER  = _voice.VOICEVOX_SPEAKER
 HOOK_VOICE_PARAMS = _voice.HOOK_VOICE_PARAMS
 UNITY_EXE        = os.getenv("UNITY_EXE", "/home/suibari/Unity/Hub/Editor/6000.0.76f1/Editor/Unity")
 UNITY_PROJECT    = os.getenv("UNITY_PROJECT", "/home/suibari/bottan-video")
+UNITY_RECORD_TIMEOUT_SEC = max(60, env_int("UNITY_RECORD_TIMEOUT_SEC", 600))
 # 指定するとUnityへ -vrmaMotionDir が渡り、VrmaMotionPlayer が該当モーションを差し替える。
 # 未指定なら Unity 側は完全な no-op で、従来のMixamoモーションのまま。
 VRMA_MOTION_DIR  = os.getenv("VRMA_MOTION_DIR", "")
@@ -624,6 +626,8 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
         _unity_lock.unlink(missing_ok=True)
 
     output_base = output_webm.replace(".webm", "")
+    # リトライ時に前回の未完成ファイルを検出しないよう、起動前に必ず消す。
+    Path(output_webm).unlink(missing_ok=True)
 
     env = os.environ.copy()
     env.pop("XAUTHORITY", None)  # Xvfb は XAUTHORITY 不要
@@ -652,7 +656,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
         # 「書き込み完了を確認してから自分でkillした」= 録画は成功、を表すフラグ。
         # この経路を通った場合、Unityの終了コードは我々がkillした結果でしかなく、判定に使えない。
         write_completed = False
-        deadline = time.time() + 300
+        deadline = time.time() + UNITY_RECORD_TIMEOUT_SEC
         while time.time() < deadline:
             if Path(output_webm).exists() and os.path.getsize(output_webm) > 0:
                 print(f"[Unity] ファイル検出: {output_webm}")
@@ -722,7 +726,9 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
                 print("[Unity] Editor.log (最後50行):")
                 for _line in _lines[-50:]:
                     print(f"  {_line}")
-            raise TimeoutError("Unity録画タイムアウト (300秒)")
+            raise TimeoutError(
+                f"Unity録画タイムアウト ({UNITY_RECORD_TIMEOUT_SEC}秒)"
+            )
 
         # 判定は終了コードではなく成果物で行う。
         # Unityは録画完了後のシャットダウンで mono が SIGSEGV し、恒常的に 255 を返す
