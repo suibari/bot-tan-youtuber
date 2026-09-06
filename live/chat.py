@@ -1,8 +1,7 @@
 """YouTube Live のチャットを読む。
 
-liveChatMessages.list をポーリングする。レスポンスの pollingIntervalMillis を
-必ず守ること。無視して短い間隔で叩くとクォータを使い切り、配信の途中から
-コメントが一切読めなくなる。
+liveChatMessages.streamList の持続接続で新着を受け取る。
+切断時は最後のnextPageTokenから再開し、重複した返答を防ぐ。
 
 読んだコメントは優先度つきで並べる。1時間で来る量に対して返事できる数は
 限られるので、拾う順番が配信の印象を決める。
@@ -13,6 +12,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -20,7 +20,6 @@ from config import (COMMENT_MAX_AGE_SEC, COMMENT_USER_COOLDOWN_SEC,
                     DRY_RUN, FAKE_COMMENTS)
 import safety
 import subtitle
-from youtube_auth import get_client
 
 
 @dataclass
@@ -33,6 +32,7 @@ class Comment:
     is_member: bool = False
     is_owner: bool = False
     received_at: float = field(default_factory=time.monotonic)
+    delivery_delay_sec: float | None = None  # YouTube投稿時刻→受信。ローカル時計との差も含む
 
     @property
     def priority(self) -> int:
@@ -184,66 +184,107 @@ class ChatPoller:
         self._page_token = None
         self._on_comment = on_comment
         self._on_delete = on_delete
+        self._transport = None
+        self._seen_ids = set()
+        self._seen_order = deque()
 
     def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name="chat")
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        if self._transport is not None:
+            self._transport.close()
         if self._thread is not None:
             self._thread.join(timeout=5)
 
-    # 取得に失敗したときの待ち時間[秒]。失敗が続くたびに倍にして頭を打たせる。
-    #
-    # 以前は失敗しても10秒固定で叩き続けていた。クォータを使い切ると
-    # （2026-08-21 の配信は videos.insert 1600ユニット×2本ぶんが効いて枠を
-    # 使い切った）復旧まで全部 403 になり、10秒おきの空振りが112回続いて
-    # ログが埋まったうえ、翌日ぶんの枠まで削っていた。
-    FAIL_INTERVAL_MIN = 10.0
+    FAIL_INTERVAL_MIN = 1.0
     FAIL_INTERVAL_MAX = 120.0
+    # これだけ続いた接続の切断は一時的なものとして待ち時間を戻す。コメントが
+    # 来ない配信でも接続自体は続くので、受信件数ではなく接続時間で判断する。
+    # 短くしすぎると、1件だけ通してすぐ制限される状態でリセットを繰り返す。
+    STABLE_CONNECTION_SEC = 60.0
+    SEEN_LIMIT = 10000
 
     def _run(self) -> None:
-        interval = 5.0
+        try:
+            from common.youtube_stream import LiveChatStream
+            transport = LiveChatStream()
+            self._transport = transport
+            self._receive(transport)
+        except Exception as e:
+            print(f"[chat] streamListを開始できません（配信は継続します）: {type(e).__name__}")
+        finally:
+            if self._transport is not None:
+                self._transport.close()
+
+    def _receive(self, transport) -> None:
+        import grpc
+
         fail_interval = self.FAIL_INTERVAL_MIN
         while not self._stop.is_set():
+            started = time.monotonic()
+            interval = fail_interval
             try:
-                interval = self._poll_once()
-                fail_interval = self.FAIL_INTERVAL_MIN
+                print(f"[chat] streamList接続（{'再開' if self._page_token else '初回'}）")
+                for res in transport.responses(self.live_chat_id, self._page_token):
+                    if self._stop.is_set():
+                        return
+                    if not self._handle_response(res):
+                        print("[chat] ライブチャット終了")
+                        return
+                if self._connection_was_stable(started):
+                    fail_interval = self.FAIL_INTERVAL_MIN
+                interval = max(1.0, fail_interval)
             except Exception as e:
-                # チャットが読めなくても配信は続ける。フリートークで場は持つ
-                print(f"[chat] 取得に失敗（配信は継続します。"
-                      f"次は{fail_interval:.0f}秒後）: {e}")
+                if self._stop.is_set():
+                    return
+                code = e.code() if isinstance(e, grpc.RpcError) else None
+                if code in (grpc.StatusCode.NOT_FOUND, grpc.StatusCode.FAILED_PRECONDITION,
+                            grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.INVALID_ARGUMENT):
+                    print(f"[chat] streamList停止: {code.name}（配信は継続します）")
+                    return
+                if code == grpc.StatusCode.UNAUTHENTICATED:
+                    transport.force_refresh = True
+                # 無言のまま接続上限で切れた場合も、待たせずに繋ぎ直す。
+                if self._connection_was_stable(started):
+                    fail_interval = self.FAIL_INTERVAL_MIN
                 interval = fail_interval
-                fail_interval = min(self.FAIL_INTERVAL_MAX, fail_interval * 2)
+                if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                    # 日次枯渇とは断定しない。配信中にも回復した実績がある。
+                    interval = max(30.0, interval)
+                print(f"[chat] streamList切断: {code.name if code else type(e).__name__} "
+                      f"（配信は継続します。次は{interval:.0f}秒後）")
+            fail_interval = min(self.FAIL_INTERVAL_MAX, interval * 2)
             self._stop.wait(interval)
 
-    def _poll_once(self) -> float:
-        """1回ぶん読んで、次までの待ち時間[秒]を返す。"""
-        yt = get_client()
-        res = yt.liveChatMessages().list(
-            liveChatId=self.live_chat_id,
-            part="snippet,authorDetails",
-            pageToken=self._page_token,
-            maxResults=200,
-        ).execute()
+    def _connection_was_stable(self, started: float) -> bool:
+        return time.monotonic() - started >= self.STABLE_CONNECTION_SEC
 
-        self._page_token = res.get("nextPageToken")
-
+    def _handle_response(self, res: dict) -> bool:
         for item in res.get("items", []):
+            if self._stop.is_set():
+                return False
+            if item.get("snippet", {}).get("type") == "chatEndedEvent":
+                return False
             self._accept(item)
-
-        # サーバが指定した間隔を守る。短く叩くとクォータを焼き切る
-        return max(1.0, res.get("pollingIntervalMillis", 5000) / 1000.0)
+        # 全件処理できてから進める。処理途中の例外では再接続時に取り直す。
+        self._page_token = res.get("nextPageToken") or self._page_token
+        return not bool(res.get("offlineAt"))
 
     def _accept(self, item: dict) -> None:
         snippet = item.get("snippet", {})
         author = item.get("authorDetails", {})
 
         kind = snippet.get("type")
-        if kind == "messageDeletedEvent":
-            deleted_id = snippet.get("messageDeletedDetails", {}).get("deletedMessageId", "")
+        if kind in ("messageDeletedEvent", "messageRetractedEvent", "tombstone"):
+            deleted_id = (snippet.get("messageDeletedDetails", {}).get("deletedMessageId")
+                          or snippet.get("messageRetractedDetails", {}).get("retractedMessageId")
+                          or (item.get("id", "") if kind == "tombstone" else ""))
             if deleted_id and self._on_delete:
                 try:
                     self._on_delete(deleted_id)
@@ -253,6 +294,10 @@ class ChatPoller:
 
         # テキストメッセージとスパチャだけ扱う。参加通知などは無視
         if kind not in ("textMessageEvent", "superChatEvent", "superStickerEvent"):
+            return
+
+        message_id = item.get("id", "")
+        if message_id and message_id in self._seen_ids:
             return
 
         raw = (snippet.get("displayMessage")
@@ -265,17 +310,33 @@ class ChatPoller:
             print(f"[chat] 除外({why}): {name}: {raw[:40]}")
             return
 
+        delay = None
+        try:
+            published = datetime.fromisoformat(snippet.get("publishedAt", "").replace("Z", "+00:00"))
+            if published.tzinfo is not None:
+                delay = max(0.0, (datetime.now(timezone.utc) - published).total_seconds())
+        except (TypeError, ValueError, AttributeError):
+            pass
+
         comment = Comment(
             author=name,
             channel_id=author.get("channelId", ""),
             text=text,
-            message_id=item.get("id", ""),
+            message_id=message_id,
             is_super_chat=kind in ("superChatEvent", "superStickerEvent"),
             is_member=bool(author.get("isChatSponsor")),
             is_owner=bool(author.get("isChatOwner")),
+            delivery_delay_sec=delay,
         )
         self.recent.append({"author": comment.author, "text": comment.text})
         self.queue.push(comment)
+        if message_id:
+            self._seen_ids.add(message_id)
+            self._seen_order.append(message_id)
+            if len(self._seen_order) > self.SEEN_LIMIT:
+                self._seen_ids.discard(self._seen_order.popleft())
+        if delay is not None:
+            print(f"[chat] 投稿→受信 {delay:.2f}秒")
         if self._on_comment:
             try:
                 self._on_comment(comment)

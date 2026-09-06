@@ -41,23 +41,19 @@ def _save_creds(creds) -> None:
         pickle.dump(creds, f)
 
 
-def get_client(interactive: bool = False, force_new: bool = False):
-    """認証済みクライアントを返す。使い回すのでプロセス内で1つ。
+def get_credentials(interactive: bool = False, force_refresh: bool = False):
+    """REST / gRPC 共通のOAuth認証。呼び出し元ごとに独立した資格情報を返す。
 
     interactive=True のときだけ、トークンが無い／無効な場合に
     コンソールの認可フローへ入る（人が居る前提。systemd からは絶対に通らない）。
     """
-    global _client
-    if _client is not None and not force_new:
-        return _client
-
-    from googleapiclient.discovery import build
+    from functools import partial
     from google.auth.transport.requests import Request
 
     creds = _load_creds()
 
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+    if creds and (creds.expired or force_refresh) and creds.refresh_token:
+        creds.refresh(partial(Request(), timeout=20))
         _save_creds(creds)
 
     if not creds or not creds.valid:
@@ -80,5 +76,15 @@ def get_client(interactive: bool = False, force_new: bool = False):
         raise YouTubeAuthError(
             f"トークンに必要なスコープがありません: {missing}。再認可してください")
 
-    _client = build("youtube", "v3", credentials=creds, cache_discovery=False)
+    return creds
+
+
+def get_client(interactive: bool = False, force_new: bool = False):
+    """認証済みRESTクライアントを返す。プロセス内で使い回す。"""
+    global _client
+    if _client is not None and not force_new:
+        return _client
+    from googleapiclient.discovery import build
+    _client = build("youtube", "v3", credentials=get_credentials(interactive),
+                    cache_discovery=False)
     return _client

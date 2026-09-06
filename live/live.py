@@ -585,10 +585,14 @@ class LiveSession:
                            origin="配信で視聴者から届いたコメント")
 
         started = self._speech_started_at
+        delivery = getattr(comment, "delivery_delay_sec", None)
+        delivery_log = (f" / 投稿→受信 {delivery:.1f} / 投稿→反応 "
+                        f"{delivery + started - comment.received_at:.1f}秒"
+                        if delivery is not None else "")
         print(f"[live] 反応まで {started - comment.received_at:.1f}秒 "
               f"(待ち {t_pop - comment.received_at:.1f} / "
               f"DB {t_ctx - t_pop:.1f} / 思い出し {t_search - t_ctx:.1f} / "
-              f"LLM {t_llm - t_search:.1f} / 合成 {started - t_llm:.1f})")
+              f"LLM {t_llm - t_search:.1f} / 合成 {started - t_llm:.1f}){delivery_log}")
         # どう仕分けてどう答えたかを残す。**これが無いと、答えられなかったのが
         # 仕分けの誤りなのか記憶に無かったのかを配信後に切り分けられない。**
         detail = f"記憶{len(remembered)}件" if kind == grounding.SELF else ""

@@ -43,7 +43,7 @@ logs/             pipeline_* quiz_* live_* ardy_*
 
 ```
                     YouTube Live
-                   ↗ RTMP      ↖ liveChatMessages.list
+                   ↗ RTMP      ↖ liveChatMessages.streamList
               [OBS Studio]          │
                    ↑ ウィンドウキャプチャ │
         [Unity 常駐 :99]             │
@@ -437,7 +437,7 @@ curl localhost:2338/status
 
 | どこ | 時間 | 対処 |
 |---|---|---|
-| YouTube がコメントを配る | 数秒 | **どうにもならない。** liveChatMessages は `pollingIntervalMillis` を守る義務があり、無視するとクォータを焼き切って配信の途中からコメントが読めなくなる |
+| YouTube がコメントを配る | 次回配信で実測 | `liveChatMessages.streamList` のgRPC持続接続で新着を受信する。定期ポーリングの待ち時間をなくす。YouTube側の配信遅延は残る |
 | コメント欄への反映 | 最大10秒 | `ChatPoller._accept` が受信と同時に `comments.txt` を書く。以前は10秒ごとの雑務に任せていた |
 | 直前の発話が終わるのを待つ | 5〜15秒 | **ここがいちばん効いている。** フリートークは `interruptible=True` で、文と文の切れ目でコメントの有無を見て切り上げる。コメントへの返信は途中で切らない方針なので、ここは残る |
 | DB（気分・energy） | 0〜数秒 | `_bot_context()` は `BOT_CONTEXT_TTL_SEC`（既定20秒）キャッシュし、DB は1往復だけ。以前は同じ行を2回引いて接続を2本張っていた |
@@ -447,6 +447,24 @@ curl localhost:2338/status
 
 実測は `[live] 反応まで X.X秒 (待ち a / DB b / LLM c / 合成 d)` としてログに出る。
 「待ち」がコメント受信から取り出しまで＝ほぼ直前の発話が終わるのを待った時間。
+投稿時刻があるコメントは `[chat] 投稿→受信 X.XX秒` と、返答時の
+`投稿→反応 X.X秒` も記録する。ローカル時計とYouTube側の時計の差、初回接続時の
+過去コメントも含むため、定常時の新着コメントで比較する。
+
+チャット受信は公式の [streamList](https://developers.google.com/youtube/v3/live/docs/liveChatMessages/streamList)
+を使う。`requirements.txt` の `grpcio` / `protobuf` と、リポジトリ内の生成済みprotoが必要。
+既存のYouTube OAuth認証を共用し、再接続時に更新を確認する。接続は最大30分で更新し、
+切断時は最後の `nextPageToken` から再開する。直近10,000件のIDで二重取り込みを防ぐ。
+無通信でも定期的なREST取得は行わず、終了時は受信待ちをキャンセルする。
+
+一時的な切断は1〜120秒でバックオフし、`RESOURCE_EXHAUSTED` は最低30秒待つ。
+日次枯渇と決めつけて翌日まで停止はしない。チャット終了・無効化・権限エラーなどは
+取得を停止し、配信本体は継続する。RESTの `list` への自動切り戻しは行わない。
+Google Cloudのクォータ自体が増える変更ではない。
+
+公式の現行protoには `messageDeletedEvent` / `messageRetractedEvent` の定義がない。
+受信した `tombstone` は既存の記憶削除コールバックへ渡すが、削除時に即通知される保証はない。
+protoの出典・再生成方法は [こちら](common/youtube_stream_proto/README.md)。
 
 **メインループから DB・LAN を触らないこと。** energy ゲージ・RAG 先読み・記憶の
 引き直しは `_start_chores()` の別スレッドで回している。以前は `run_loop` の中で
