@@ -648,6 +648,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
         print(f"[Unity] コマンド: {' '.join(cmd)}")
 
         unity_proc = subprocess.Popen(cmd, env=env, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+        expected_duration = get_wav_duration(wav_path)
         # 「書き込み完了を確認してから自分でkillした」= 録画は成功、を表すフラグ。
         # この経路を通った場合、Unityの終了コードは我々がkillした結果でしかなく、判定に使えない。
         write_completed = False
@@ -655,16 +656,34 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
         while time.time() < deadline:
             if Path(output_webm).exists() and os.path.getsize(output_webm) > 0:
                 print(f"[Unity] ファイル検出: {output_webm}")
-                # ファイルサイズが安定するまで待つ
+                # ファイルサイズが安定し、かつ有効な尺が書き込まれるまで待つ。
+                # Recorder は開始直後にも WebM ヘッダを書き出す。この直後にI/Oが
+                # 2秒止まることがあり、サイズだけを見るとヘッダだけのファイルを
+                # 完成品と誤認して Unity を終了させてしまう。
                 prev_size = 0
                 while True:
                     time.sleep(2)
+                    if unity_proc.poll() is not None:
+                        break
                     current_size = os.path.getsize(output_webm)
                     print(f"[Unity] ファイルサイズ: {current_size} bytes")
                     if current_size == prev_size and current_size > 0:
-                        print(f"[Unity] 書き込み完了を確認")
-                        break
+                        actual_duration = probe_media_duration(output_webm)
+                        if actual_duration >= max(1.0, expected_duration - 0.5):
+                            print(f"[Unity] 書き込み完了を確認 "
+                                  f"(尺 {actual_duration:.3f}秒)")
+                            break
+                        print(f"[Unity] サイズは一時停止中ですが未完成です "
+                              f"(尺 {actual_duration:.3f}/{expected_duration:.3f}秒)")
                     prev_size = current_size
+                    if time.time() >= deadline:
+                        break
+                actual_duration = probe_media_duration(output_webm)
+                if actual_duration < max(1.0, expected_duration - 0.5):
+                    raise RuntimeError(
+                        f"Unity録画が不完全です "
+                        f"(尺 {actual_duration:.3f}/{expected_duration:.3f}秒)"
+                    )
                 try:
                     os.killpg(os.getpgid(unity_proc.pid), signal.SIGTERM)
                 except ProcessLookupError:
@@ -1353,8 +1372,32 @@ def run_ffmpeg_finalize(input_webm: str, output_mp4: str, vf_parts: list[str],
         Path(dump).write_text(json.dumps(cmd, ensure_ascii=False, indent=1))
         print(f"[FFmpeg] コマンドを保存: {dump}")
 
+    input_duration = probe_media_duration(input_webm)
+    if input_duration <= 0:
+        raise RuntimeError(f"入力動画が壊れています（有効な尺なし）: {input_webm}")
+
     subprocess.run(cmd, check=True, timeout=timeout)
-    print(f"[FFmpeg] 変換完了: {output_mp4}")
+    output_duration = probe_media_duration(output_mp4)
+    if output_duration < max(1.0, input_duration - 0.5):
+        raise RuntimeError(
+            f"MP4変換結果が不完全です "
+            f"(尺 {output_duration:.3f}/{input_duration:.3f}秒): {output_mp4}"
+        )
+    print(f"[FFmpeg] 変換完了: {output_mp4} (尺 {output_duration:.3f}秒)")
+
+
+def probe_media_duration(path: str) -> float:
+    """ffprobeでメディアの尺を返す。未完成・破損・尺不明なら0を返す。"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+        duration = float(result.stdout.strip())
+        return duration if duration > 0 else 0.0
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0.0
 
 
 # ──────────────────────────────────────────────
