@@ -8,7 +8,7 @@ botたん YouTube Shorts 自動投稿パイプライン
   YOUTUBE_CLIENT_SECRET: YouTube OAuth2 クライアントシークレット
   USE_LOCAL_LLM       : true でOllama(Gemma 4 26B)、false でGemini (デフォルト: true)
                         num_ctx は common/llm.py の定数。env では変えられない
-  LOCAL_LLM_MODEL     : Ollamaで使うモデル名 (デフォルト: hf.co/unsloth/gemma-4-12b-it-GGUF:Q4_K_M)
+  LOCAL_LLM_MODEL     : Ollamaで使うモデル名 (デフォルト: hf.co/unsloth/gemma-4-12B-it-qat-GGUF:UD-Q4_K_XL)
   GEMINI_MODEL        : Geminiのモデル名 (デフォルト: gemini-2.0-flash)
   VOICEVOX_URL        : VOICEVOXのURL (デフォルト: http://localhost:10101)
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)

@@ -239,7 +239,7 @@ VRAM の内訳（RTX 5070 Ti / 16,303 MiB）:
 
 | | VRAM |
 |---|---|
-| ollama `llama-server`（gemma-4-26B UD-IQ3_S, num_ctx 32768, KV q8_0） | 約11,470 MiB（2026-09-01実測） |
+| ollama `llama-server`（gemma-4-12B QAT UD-Q4_K_XL, num_ctx 32768, KV q8_0） | 約7,100 MiB（2026-09-05。26B UD-IQ3_S のときは約11,470 MiB） |
 | ARDY engine（テキストエンコーダは CPU） | 1,102 MiB |
 | Unity（**配信のみ**。`:99` の実GPU Xorg） | 408 MiB |
 | Xorg(:0 + :99) + gnome-shell | 251 MiB |
@@ -281,13 +281,15 @@ journalctl -u ollama --since "1 hour ago" | grep -oE "n_ctx_slot = [0-9]+" | sor
 
 収録ログにも `[ARDY] 生成前の GPU: VRAM 空き ... / ollama 常駐 ...(ctx=...)` が出る。
 
-**ollama の 26B が常駐しているぶん、余裕はほとんど無い。** 苦しくなったら上から順に:
+**ollama のモデルが常駐しているぶん、余裕は限られる。** 苦しくなったら上から順に:
 
 1. `LIVE_GROUNDING_GATE=regex`（判定に GPU を使わなくなる。ただし返答生成は
-   同じモデルなので、これだけでは 26B は降りない）
-2. リクエストの `options.num_gpu` を絞って MoE エキスパートを CPU へ逃がす
-   （活性 4B の MoE なので速度低下が小さい）
-3. `USE_LOCAL_LLM=false` で Gemini へ戻す（返答生成のぶん 13GB がまるごと空く）
+   同じモデルなので、これだけではモデルは降りない）
+2. `USE_LOCAL_LLM=false` で Gemini へ戻す（返答生成のぶん 7GB がまるごと空く）
+
+（26B UD-IQ3_S だった頃は `options.num_gpu` を絞って MoE エキスパートを CPU へ
+逃がす手が使えた。12B は dense なのでこの手は効かない代わり、常駐が 11.5GB →
+7.1GB へ減って余裕そのものが増えている。）
 
 **VOICEVOX は 2026-08-30 から CPU。** 同梱の ONNX Runtime が cuDNN 8 で、
 sm_120（Blackwell）のカーネルを持っていないため GPU では推論できない。

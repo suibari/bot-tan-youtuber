@@ -52,8 +52,10 @@ GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 # ネイティブ API のルート。`/v1` は付けない（common/ardy.py・common/grounding.py と同じ）
 OLLAMA_URL      = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/").removesuffix("/v1")
+# **bsky-affirmative-bot と同じモデルにすること。** 同じ ollama を共用しており、
+# ずらすと runner が2つ立って 16GB に収まらない（下の num_ctx の注意と同じ壊れ方）。
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL",
-                            "hf.co/unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ3_S")
+                            "hf.co/unsloth/gemma-4-12B-it-qat-GGUF:UD-Q4_K_XL")
 # カンマ区切りで複数指定でき、左から順にフォールバックする
 GEMINI_MODELS = [
     m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite").split(",") if m.strip()

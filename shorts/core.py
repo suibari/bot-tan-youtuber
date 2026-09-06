@@ -13,7 +13,7 @@ botたん動画パイプライン 共通処理
 
 環境変数:
   GEMINI_API_KEY      : Gemini APIキー (USE_LOCAL_LLM=false時)
-  USE_LOCAL_LLM       : true でOllama(Gemma 4 26B)、false でGemini (デフォルト: true)
+  USE_LOCAL_LLM       : true でOllama(Gemma 4 12B QAT)、false でGemini (デフォルト: true)
                         num_ctx は common/llm.py の定数。env では変えられない
   LOCAL_LLM_MODEL     : Ollamaで使うモデル名
   GEMINI_MODEL        : Geminiのモデル名 (カンマ区切りで複数指定可、左から順にフォールバック)
