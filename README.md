@@ -251,6 +251,33 @@ OBS を NVENC にすると足りなくなるので x264 のままにすること
 別ホストの bsky-affirmative-bot が使う埋め込みモデル（snowflake-arctic-embed2, 1.2GB）は
 **配信中は載らない**。
 
+システム RAM（32GB）の内訳と、**足りないと何が起きるか**:
+
+| | RSS |
+|---|---|
+| ollama `llama-server` | 約9.4GB |
+| ARDY engine（8Bのテキストエンコーダを CPU に載せる） | 約15GB（`ARDY_MIN_AVAIL_GB` 参照） |
+| VOICEVOX（CPU 推論） | 約450MB |
+| OBS | 約1.1GB |
+
+**配信中は `bot-tan-imagegen` の uvicorn（RSS 543MB＋swap 1.0GB）、Unity Hub、
+chrome を落としておくこと。** 足りなくなると OBS がスワップアウトし、配信開始で
+エンコーダを作るときにページインを待たされ、描画スレッドも 33ms に間に合わなく
+なる。OBS 起動時の空き RAM と描画落ちの相関:
+
+| 起動時の空き | lagged frames due to rendering lag/stalls |
+|---|---|
+| 503MB | 96.7%（21分間ずっと。出力はほぼ止まっていた） |
+| 1.8GB | 0.1〜0.3% と 26.2%／68.5% が混在 |
+| 1.7GB | 0.0〜0.3%（1時間走りきった回が7本） |
+
+`vm.swappiness` は `setup/99-bottan-live.conf` で 10 に下げている
+（既定の 60 では OBS のページまで退避される）。配信開始の直前に空き RAM を
+点検して `OBS_MIN_AVAIL_GB`（既定3GB）を下回れば Discord に警告するが、
+**枠はもう作ってあるので止めはしない**。開始30秒後・60秒後に
+`stream_stats()` を見て、フレームが出ていなければこれも警告する
+（2026-09-07 は37秒で出力3フレームだった）。
+
 **収録パイプラインの Unity は VRAM を使わない。** `:100` の Xvfb（Mesa llvmpipe＝
 CPUソフトウェアラスタライザ）へ描くので `nvidia-smi` に出てこない。
 代わりに CPU を食い切る（実測 load average 9.6）ので、**収録中はローカルLLMの
@@ -298,6 +325,15 @@ sm_120（Blackwell）のカーネルを持っていないため GPU では推論
 `obsws` の `StartStream` はリクエストが通っただけで成功を返すので、
 `Obs.start_stream()` は実際に `output_active` になるまで確かめる。これを見て
 いなかったせいで、YouTube 側の 180秒 タイムアウトまで原因が分からなかった。
+
+**待つ時間は `OBS_START_TIMEOUT`（既定60秒）。短くしないこと。** 通常は
+StartStream から `==== Streaming Start ====` まで 0.5〜6秒だが、裾は長い。
+15秒にしていた 2026-09-07 は 28.6秒かかり（x264 の初期化から libfdk_aac の
+生成まで20秒、RTMP のハンドシェイクに7秒）、配信は立ち上がっていたのに
+こちらが先に諦めた。しかも諦めたあとに OBS が走り出し、誰も見ていない配信が
+29秒ぶん流れた（`teardown()` の `stop_stream()` は、その時点でまだ
+`output_active` が false なので何もしない）。今は
+`Obs._cancel_start()` が StopStream を投げて取り消す。
 
 ### 3.5 背景（フリー素材）
 

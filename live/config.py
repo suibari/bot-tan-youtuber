@@ -186,6 +186,19 @@ STREAM_VIDEO_KBPS = env_int("STREAM_VIDEO_KBPS", 6000)
 STREAM_AUDIO_KBPS = env_int("STREAM_AUDIO_KBPS", 160)
 OBS_COLLECTION = os.getenv("OBS_COLLECTION", "bottan-live")
 OBS_PROFILE    = os.getenv("OBS_PROFILE", "bottan-live")
+# 配信開始が実際に走り出すまで待つ上限[秒]。
+# 15秒にしていたが短すぎた。2026-09-07 は StartStream から 28.6秒（x264 の
+# 初期化から libfdk_aac の生成まで20秒、RTMP のハンドシェイクに7秒）かかり、
+# 配信自体は立ち上がっていたのにこちらが先に諦めていた。待ちループは
+# output_active になった瞬間に抜けるので、正常時に伸ばした分は払わない
+OBS_START_TIMEOUT = env_float("OBS_START_TIMEOUT", 60.0)
+# 配信開始前に欲しい空き RAM[GB]。下回っても止めずに警告するだけ。
+# 枠はもう作ってあるので、ここで落とすほうが損失が大きい。
+# ARDY 側の ARDY_MIN_AVAIL_GB（common/ardy.py）と同じ趣旨で、
+# 足りないと OBS がスワップアウトして描画スレッドが 33ms に間に合わなくなる。
+# 実測: 起動時の空きが 503MB の回は lagged frames 96.7%、
+# 1.6〜1.8GB の回は 0.1〜0.3% だった
+OBS_MIN_AVAIL_GB = env_float("OBS_MIN_AVAIL_GB", 3.0)
 
 # ── 字幕（OBS のテキストソースが読むファイル） ──────
 SUBTITLE_DIR = Path(os.getenv("SUBTITLE_DIR", DATA_DIR / "obs"))

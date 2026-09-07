@@ -29,11 +29,21 @@ logging.getLogger("obsws_python").addHandler(logging.NullHandler())
 from config import (OBS_HOST, OBS_PORT, OBS_PASSWORD, OBS_LAUNCH, OBS_COMMAND,
                     OBS_COLLECTION, OBS_PROFILE, LIVE_DISPLAY,
                     STREAM_VIDEO_KBPS, STREAM_AUDIO_KBPS,
+                    OBS_START_TIMEOUT, OBS_MIN_AVAIL_GB,
                     SUBTITLE_JA, SUBTITLE_EN)
+
+# **config より後に置くこと。** リポジトリのルートを sys.path へ足しているのは
+# config（live/config.py:17-18）なので、先に書くと単体起動で import に失敗する
+from common import ardy  # noqa: E402
 
 # 字幕の送信を何回続けて失敗したらファイル経路へ戻すか。
 # 一時的な取りこぼしで戻すと、以後ずっと1秒遅れの字幕になってしまう
 _TEXT_FAIL_LIMIT = 3
+
+# 配信開始のデッドラインを過ぎてから、もう一度だけ様子を見る秒数。
+# 0.5秒ごとのポーリングがデッドラインをまたぐと、あと1秒で立ち上がって
+# いたものを失敗にしてしまう。2026-09-07 の失敗はまさにこの境界だった
+_START_GRACE_SEC = 5.0
 
 
 # xwininfo -root -tree の1行:
@@ -157,8 +167,24 @@ def ensure_profile_settings() -> bool:
     return True
 
 
-def _last_output_error() -> str:
-    """OBS のログから出力開始まわりのエラーを拾う。原因を即座に出すため。"""
+# OBS のログ行の頭。`20:42:57.224: ==== Streaming Start ...`
+_LOG_TS = re.compile(r"^(\d{2}:\d{2}:\d{2})\.\d{3}: ")
+
+
+def _log_time(line: str) -> str | None:
+    m = _LOG_TS.match(line)
+    return m.group(1) if m else None
+
+
+def _last_output_error(since: str | None = None) -> str:
+    """OBS のログから出力開始まわりのエラーを拾う。原因を即座に出すため。
+
+    `since` は "HH:MM:SS"。since から今までに書かれた行だけを見る。OBS のログは
+    1つのファイルに複数セッションぶんが**時刻順に並ばないまま**追記されるので、
+    末尾 N 行で切ると前のセッションの行を今回の失敗として引用してしまう。実際
+    2026-09-07 の失敗では、別セッションの RTMP 接続**成功**行がエラーとして
+    出て、原因を真逆に誘導した。
+    """
     logs = sorted(
         (Path.home() / ".var/app/com.obsproject.Studio/config/obs-studio/logs").glob("*.txt"),
         key=lambda p: p.stat().st_mtime, reverse=True)
@@ -167,11 +193,98 @@ def _last_output_error() -> str:
                       key=lambda p: p.stat().st_mtime, reverse=True)
     if not logs:
         return "  （OBS のログが見つかりません）"
-    lines = logs[0].read_text(errors="replace").splitlines()[-60:]
+    lines = logs[0].read_text(errors="replace").splitlines()
+    until = time.strftime("%H:%M:%S")
+    if since and since <= until:
+        # 末尾から遡り、[since, 今] の外の時刻に当たったところで切る。上限も
+        # 見ないと、時刻順に並んでいない前のセッションの塊を巻き込む。
+        # 時刻を持たない行（設定のダンプなど）は前の行に属するので素通しする。
+        # 日付をまたいだ等でうまく切れなかったときは従来どおり末尾を見る
+        cut = 0
+        for i in range(len(lines) - 1, -1, -1):
+            t = _log_time(lines[i])
+            if t is not None and not (since <= t <= until):
+                cut = i + 1
+                break
+        lines = lines[cut:]
+        if not lines:
+            # OBS がこの間1行も書いていない。それ自体が答えで、たいてい
+            # 描画スレッドごと止まっている。ここで末尾へ落とすと、また
+            # 無関係な過去のセッションを引用することになる
+            return (f"  OBS は {since} 以降ログを1行も書いていません"
+                    f"（{logs[0]}）")
+    else:
+        lines = lines[-60:]
     keys = ("failed to start", "out of memory", "fall back", "cuda_ctx_init",
-            "Connection to", "is offline", "Failed to connect")
-    hits = [l for l in lines if any(k in l for k in keys)]
+            "Connection to", "is offline", "Failed to connect",
+            "Disconnected from", "send error")
+    # 「Connection to ... successful」も "Connection to" に当たる。失敗の説明として
+    # 成功行を並べると読む側を誤らせるので落とす
+    hits = [l for l in lines if any(k in l for k in keys) and "successful" not in l]
     return "\n".join("  " + h for h in hits) if hits else f"  （{logs[0]} を確認してください）"
+
+
+# ── メモリ ────────────────────────────────────────
+#
+# OBS がスワップアウトしていると、配信開始でエンコーダやRTMPスレッドを作る際に
+# ページインを待たされ、描画スレッドも 33ms に間に合わなくなる。2026-09-07 の
+# 失敗では OBS 自身が 947MB スワップアウトしており、x264 の初期化から
+# libfdk_aac の生成まで20秒、37秒で3フレームしかエンコードできていなかった。
+# ARDY 側は common/ardy.py の ARDY_MIN_AVAIL_GB で同じ失敗を先に防いでいる。
+
+
+def _swap_gb() -> tuple[float, float]:
+    """スワップの (使用量, 総量)[GB]。読めなければ (0.0, 0.0)。"""
+    total = free = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("SwapTotal:"):
+                total = int(line.split()[1]) / 1024 / 1024
+            elif line.startswith("SwapFree:"):
+                free = int(line.split()[1]) / 1024 / 1024
+    except (OSError, ValueError, IndexError):
+        return (0.0, 0.0)
+    if total is None or free is None:
+        return (0.0, 0.0)
+    return (total - free, total)
+
+
+def _top_swappers(limit: int = 4) -> str:
+    """スワップアウト量の多いプロセス。同居している相手を名指しするため。"""
+    rows = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            kb = 0
+            for line in (proc / "status").read_text().splitlines():
+                if line.startswith("VmSwap:"):
+                    kb = int(line.split()[1])
+                    break
+            if kb > 0:
+                rows.append((kb, (proc / "comm").read_text().strip()))
+        except (OSError, ValueError, IndexError):
+            continue   # 見ている間に消えたプロセス
+    rows.sort(reverse=True)
+    return ", ".join(f"{name} {kb / 1024:.0f}MB" for kb, name in rows[:limit])
+
+
+def memory_note() -> str:
+    """今のメモリ事情を1〜2行で。失敗メッセージと配信前の点検の両方で使う。"""
+    used, total = _swap_gb()
+    note = (f"  空き RAM {ardy.mem_available_gb():.1f}GB / "
+            f"空き VRAM {ardy.vram_free_gb():.1f}GB / "
+            f"スワップ {used:.1f}/{total:.1f}GB")
+    top = _top_swappers()
+    return f"{note}\n  スワップ上位: {top}" if top else note
+
+
+def check_memory() -> str | None:
+    """空き RAM が足りなければ警告文を返す。足りていれば None。"""
+    avail = ardy.mem_available_gb()
+    if avail >= OBS_MIN_AVAIL_GB:
+        return None
+    return (f"空き RAM が {avail:.1f}GB しかありません"
+            f"（目安 {OBS_MIN_AVAIL_GB:.1f}GB）。OBS がスワップで詰まると、"
+            f"配信は始まってもフレームがほとんど出ません:\n" + memory_note())
 
 
 def _clear_crash_sentinel() -> None:
@@ -548,29 +661,106 @@ class Obs:
         )
         print(f"[OBS] 配信先を設定しました: {ingestion_address}")
 
-    def start_stream(self, timeout: float = 15.0) -> None:
+    def start_stream(self, timeout: float = OBS_START_TIMEOUT) -> None:
+        """配信が実際に走り出すまで待つ。
+
+        StartStream はリクエストが通っただけで成功を返す。エンコーダの
+        初期化に失敗しても例外にならないので、実際に走り出したか確かめる。
+        ここを見ていなかったせいで、YouTube 側の 180秒 タイムアウトまで
+        原因が分からなかった。
+
+        待ち時間の裾は長い。通常は StartStream から 0.5〜6秒で
+        `==== Streaming Start ====` まで行くが、2026-09-07 は 28.6秒かかった
+        （メモリが尽きて OBS がスワップアウトしていた。memory_note 参照）。
+        """
         status = self.client.get_stream_status()
-        if status.output_active:
+        if status.output_active and not status.output_reconnecting:
             print("[OBS] すでに配信中です")
             return
+        if status.output_active:
+            # 再接続を繰り返している出力が居座っている。2026-09-07 に諦めた
+            # あとで走り出した配信が、翌朝までここに残っていた（切れた宛先へ
+            # 繋ぎ直し続けていた）。OBS は出力を開始する時点の配信先を使うので、
+            # このまま「すでに配信中です」と返すと、新しく設定した宛先ではなく
+            # 昨日の宛先へ流し続ける出力をそのまま使ってしまう
+            print("[OBS] 再接続中の配信が残っています。止めてから始め直します")
+            if not self._force_stop():
+                raise ObsError(
+                    "再接続中の配信を止められませんでした。"
+                    "このまま始めても昨日の配信先へ繋ぎに行きます:\n"
+                    + _last_output_error()
+                )
+
+        started = time.time()
+        # OBS のログから今回ぶんだけを拾うための目印。前のセッションの行を
+        # 引用しないよう、StartStream を投げる直前の時刻を控えておく
+        since = time.strftime("%H:%M:%S", time.localtime(started))
         self.client.start_stream()
 
-        # StartStream はリクエストが通っただけで成功を返す。エンコーダの
-        # 初期化に失敗しても例外にならないので、実際に走り出したか確かめる。
-        # ここを見ていなかったせいで、YouTube 側の 180秒 タイムアウトまで
-        # 原因が分からなかった
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = started + timeout
+        announced = 0.0
+        while True:
             if self.client.get_stream_status().output_active:
-                print("[OBS] 配信を開始しました")
+                print(f"[OBS] 配信を開始しました（{time.time() - started:.0f}秒）")
                 return
+            now = time.time()
+            if now >= deadline:
+                break
+            if now - started >= announced + 10.0:
+                announced = now - started
+                print(f"[OBS] 配信の開始を待っています"
+                      f"（{announced:.0f}/{timeout:.0f}秒）")
             time.sleep(0.5)
 
+        # 0.5秒ごとのポーリングがデッドラインをまたぐと、あと1秒で立ち上がって
+        # いたものを失敗にしてしまう。境界を越えてからもう一度だけ確かめる
+        time.sleep(_START_GRACE_SEC)
+        try:
+            if self.client.get_stream_status().output_active:
+                print(f"[OBS] 配信を開始しました"
+                      f"（{time.time() - started:.0f}秒・猶予中）")
+                return
+        except Exception:
+            pass
+
+        detail = _last_output_error(since)
+        self._cancel_start()
         raise ObsError(
             f"OBS が配信を開始できませんでした（{timeout:.0f}秒）。"
-            f"多くはエンコーダの初期化失敗です:\n"
-            + _last_output_error()
+            f"エンコーダの初期化失敗か、メモリ不足によるスワップです:\n"
+            f"{memory_note()}\n" + detail
         )
+
+    def _cancel_start(self) -> None:
+        """諦めた配信の開始要求を取り消す。
+
+        こちらが諦めたあとに OBS が遅れて走り出すと、誰も見ていない配信が
+        残る。2026-09-07 はこれで29秒ぶんが YouTube へ流れ、切られたあとも
+        出力は再接続を繰り返したまま翌朝まで居座った。
+        """
+        if not self._force_stop():
+            print("[OBS] 配信が止まりません。OBS 側を確認してください")
+
+    def _force_stop(self) -> bool:
+        """走っている（あるいはこれから走り出す）出力を確実に止める。
+
+        stop_stream() は output_active が false だと何もしないので、
+        「まだ立ち上がっていない出力」の取り消しには使えない。StopStream を
+        直接投げたうえで、遅れて active になった場合にもう一度止める。
+        """
+        for _ in range(2):
+            try:
+                self.client.stop_stream()
+            except Exception:
+                pass   # まだ走っていなければ StopStream は失敗する。それでよい
+            time.sleep(_START_GRACE_SEC)
+            try:
+                if not self.client.get_stream_status().output_active:
+                    return True
+            except Exception:
+                return False
+            print("[OBS] まだ止まりません。もう一度止めます")
+        return False
 
     def stop_stream(self) -> None:
         try:
@@ -582,12 +772,25 @@ class Obs:
         except Exception as e:
             print(f"[OBS] 停止に失敗: {e}")
 
+    def video_fps(self) -> float:
+        """キャンバスの fps。配信が中身を出せているかを測る基準に使う。
+
+        シーンは tools/build_scene.py が 30fps で組むが、OBS 側を手で触られて
+        いることもあるので実際の値を聞く。読めなければ 30 とみなす。
+        """
+        try:
+            v = self.client.get_video_settings()
+            return v.fps_numerator / v.fps_denominator
+        except Exception:
+            return 30.0
+
     def stream_stats(self) -> dict:
         """配信の健全性。フレームドロップが増えていたら回線か描画が苦しい。"""
         try:
             s = self.client.get_stream_status()
             return {
                 "active": s.output_active,
+                "reconnecting": s.output_reconnecting,
                 "duration_sec": s.output_duration / 1000.0,
                 "skipped_frames": s.output_skipped_frames,
                 "total_frames": s.output_total_frames,

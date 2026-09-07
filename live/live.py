@@ -231,13 +231,73 @@ class LiveSession:
 
         self.obs.set_stream_target(
             self.broadcast.ingestion_address, self.broadcast.stream_name)
+        self._check_obs_memory()
         self.obs.start_stream()
 
         if not self.broadcast.wait_for_ingestion(timeout=180):
             raise RuntimeError("OBS からの映像が YouTube に届きません")
 
+        self._check_stream_health()
+
         memory.start_broadcast(self.broadcast.broadcast_id,
                                self.broadcast.url, title)
+
+    def _check_obs_memory(self) -> None:
+        """配信を始める前にメモリ事情を記録し、足りなければ警告する。
+
+        止めはしない。枠はもう作ってあるので、ここで落とすほうが損失が大きい。
+        2026-09-07 の失敗では OBS 自身が 947MB スワップアウトしていたのに、
+        ログにその手掛かりが一切残っていなかった。
+        """
+        import obs as obs_mod
+        print(f"[OBS] メモリ:\n{obs_mod.memory_note()}")
+        warning = obs_mod.check_memory()
+        if not warning:
+            return
+        print(f"[OBS] 警告: {warning}")
+        try:
+            notify.warn(f"[配信] {warning}")
+        except Exception as e:
+            print(f"[OBS] 通知に失敗（続行します）: {e}")
+
+    def _check_stream_health(self, samples: int = 2, interval: float = 30.0) -> None:
+        """配信が始まった直後に、中身が本当に出ているか確かめる。
+
+        output_active になっても中身が出ているとは限らない。2026-09-07 は
+        37秒で出力3フレーム（描画が 68.5% 落ちていた）のまま流れ続け、
+        YouTube に切られるまで誰も気づかなかった。ここで見ておけば、
+        1時間の空配信になる前に手を打てる。
+
+        止めはしない。ここは開始時刻まで待つだけの時間帯なので、
+        数十秒使っても配信の予定には響かない。
+        """
+        if self.obs is None:
+            return
+        fps = self.obs.video_fps()
+        for _ in range(samples):
+            time.sleep(interval)
+            stats = self.obs.stream_stats()
+            print(f"[OBS] 配信の状態: {stats}")
+            if "error" in stats:
+                return
+            # 配信時間ぶんのフレームが出ているか。半分も出ていないなら
+            # 描画かエンコードが詰まっている（2026-09-07 は37秒で3枚だった）
+            expected = stats.get("duration_sec", 0.0) * fps
+            frames = stats.get("total_frames", 0)
+            if stats.get("reconnecting"):
+                detail = f"配信が再接続を繰り返しています: {stats}"
+            elif expected >= fps and frames < expected * 0.5:
+                detail = (f"{stats.get('duration_sec', 0.0):.0f}秒で {frames} "
+                          f"フレームしか出ていません（想定 {expected:.0f}）。"
+                          f"描画かエンコードが詰まっています: {stats}")
+            else:
+                continue
+            print(f"[OBS] 警告: {detail}")
+            try:
+                notify.error("配信の映像", detail)
+            except Exception as e:
+                print(f"[OBS] 通知に失敗（続行します）: {e}")
+            return
 
     def start_testing(self) -> None:
         """配信開始の前にモニターストリームを立ち上げておく。

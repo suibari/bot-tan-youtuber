@@ -74,6 +74,16 @@ elif ! diff -q "$HERE/ollama-override.conf" "$OLLAMA_DROPIN" >/dev/null; then
     echo "      OLLAMA_CONTEXT_LENGTH が common/llm.py の OLLAMA_NUM_CTX と同値か特に確認すること。" >&2
 fi
 
+# スワップの出しやすさ。OBS がスワップアウトしていると、配信開始でエンコーダを
+# 作るときにページインを待たされ、描画スレッドも 33ms に間に合わなくなる。
+# 2026-09-07 の配信事故はこれ（詳細は 99-bottan-live.conf のコメント）
+SYSCTL_DROPIN=/etc/sysctl.d/99-bottan-live.conf
+if [ ! -f "$SYSCTL_DROPIN" ] || ! diff -q "$HERE/99-bottan-live.conf" "$SYSCTL_DROPIN" >/dev/null; then
+    install -m 0644 "$HERE/99-bottan-live.conf" "$SYSCTL_DROPIN"
+    sysctl -p "$SYSCTL_DROPIN"
+    echo "  配置: $(basename "$SYSCTL_DROPIN")"
+fi
+
 # ライブ配信は GPU 仮想ディスプレイが要る。入っていなければ警告だけ出す
 if [ ! -f /etc/systemd/system/bottan-live-xorg.service ]; then
     echo
