@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -181,6 +182,18 @@ class VoiceAudioQueryTest(unittest.TestCase):
             "コウカク、キドウタイの人形遣い",
         )
         self.assertEqual(original, "攻殻機動隊の人形遣い")
+
+    def test_warmup_runs_real_synthesis_and_removes_temporary_wav(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(voice.tempfile, "gettempdir", return_value=tmp), \
+                patch.object(voice, "synthesize") as synthesize:
+            synthesize.side_effect = lambda _text, path: Path(path).write_bytes(b"wav")
+            elapsed = voice.warmup()
+            output = Path(synthesize.call_args.args[1])
+            self.assertFalse(output.exists())
+
+        self.assertGreaterEqual(elapsed, 0.0)
+        synthesize.assert_called_once()
 
 
 if __name__ == "__main__":

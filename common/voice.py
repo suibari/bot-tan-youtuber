@@ -158,6 +158,25 @@ def health_check() -> str:
     raise VoicevoxError(f"話者ID {VOICEVOX_SPEAKER} がエンジンに存在しません")
 
 
+def warmup() -> float:
+    """実際の合成まで通し、VOICEVOX の作業ページを RAM へ戻す。
+
+    /speakers だけでは音声モデルや推論経路に触れない。配信準備中に ARDY・
+    Unity を読んだ後、CPU 版 VOICEVOX が swap へ追い出され、21:00 の
+    第一声でだけ HDD から大量に swap-in した実績がある。そのため、長い
+    準備の後に短い文を1本合成する。戻り値は所要秒。
+    """
+    output = Path(tempfile.gettempdir()) / f"voicevox_warmup_{os.getpid()}.wav"
+    started = time.monotonic()
+    try:
+        synthesize("今日もよろしくね。", output)
+        elapsed = time.monotonic() - started
+        print(f"[VOICEVOX] 実合成のウォームアップ完了: {elapsed:.1f}秒")
+        return elapsed
+    finally:
+        output.unlink(missing_ok=True)
+
+
 def get_wav_duration(wav_path) -> float:
     """WAVファイルの長さを秒で返す"""
     with wave.open(str(wav_path), "r") as f:

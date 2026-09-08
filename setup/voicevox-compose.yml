@@ -61,6 +61,11 @@ services:
     container_name: voicevox
     image: voicevox/voicevox_engine:cpu-latest
     restart: unless-stopped
+    # エンジンの実使用量は約1GB（resident 約330MB + swap 約660MB）。配信準備で
+    # ARDY と Unity を読み込むと、このほぼ全量が低速HDD上の swap へ追い出されていた。
+    # 21:00 の最初の合成だけ swap-in が集中し、VOICEVOX と Ollama が同時に
+    # タイムアウトしたため、cgroup v2 の memory.low で作業セットを保護する。
+    mem_reservation: 1g
     ports:
       - "10101:50021"
     volumes:

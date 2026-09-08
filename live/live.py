@@ -1065,6 +1065,17 @@ def main() -> int:
         if not session._recover_unity(force=True):
             raise RuntimeError("配信開始前に Unity を復旧できません")
         session.start_testing()
+
+        # health_check() は ARDY・Unity の読み込み前なうえ /speakers しか
+        # 叩かない。その後に VOICEVOX が swap へ追い出されると、第一声の
+        # synthesis で低速 HDD からの swap-in が集中する。testing の2分間で
+        # 実合成まで済ませ、放送中ではなくここで復帰コストを払う。
+        try:
+            voice.warmup()
+        except Exception as e:
+            # ウォームアップ失敗だけで配信を中止しない。詳細は
+            # _post_with_retry が I/O PSI とともに残す。
+            print(f"[VOICEVOX] 配信前ウォームアップ失敗（続行します）: {e}")
         _sleep_until(start_at, "配信開始まで")
 
         if not session._recover_unity(force=True):
