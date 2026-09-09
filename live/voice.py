@@ -14,4 +14,5 @@ from common.voice import (  # noqa: F401
     preload_pronunciations,
     synthesize,
     synthesize_lines,
+    warmup,
 )

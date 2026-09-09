@@ -42,6 +42,7 @@ from config import (
     IDLE_ENABLED, LIVE_CLOSING_HHMM,
     LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
     BOT_CONTEXT_TTL_SEC, BOT_MOOD_SERVE_LIMIT, FPS_LOG_SEC,
+    LIVE_HEALTH_CHECK_SEC, LIVE_HEALTH_STALL_SEC, MEMORY_LOG_SEC,
     LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
     SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT, UNITY_RESTART_MAX,
     UNITY_RESTART_TIMEOUT_SEC, UNITY_RESTART_COOLDOWN_SEC,
@@ -100,6 +101,14 @@ class LiveSession:
         self.last_speech_at = 0.0
         self.started_at = None
         self._stopping = False
+        # 配信そのものが死んだために止まるのか（_check_broadcast 参照）。
+        # 立っているとクロージング発話を省く
+        self._broadcast_dead = False
+        # OBS の総フレーム数と、それが最後に増えた時刻（_output_stalled 参照）
+        self._last_frames = -1
+        self._frames_at = time.monotonic()
+        # output_active が False だった連続回数（_output_stalled 参照）
+        self._inactive_count = 0
         # 直近の発話が実際に鳴り始めた時刻。反応までの内訳を出すのに使う
         self._speech_started_at = 0.0
         # fps を最後に出した時刻
@@ -127,6 +136,10 @@ class LiveSession:
         # 画面に前回のコメントが並んだままになる
         subtitle.clear_comments()
         subtitle.write_clock()
+
+        # ARDY（読み込みで十数GB）と Unity を起こす前に、要らないものを退かす。
+        # 順番が大事で、あとから閉じても ARDY が swap に落ちたあとでは遅い
+        unity_live.close_unity_hub()
 
         print("[準備] DB を確認します")
         memory.ensure_schema()
@@ -466,6 +479,13 @@ class LiveSession:
         self.subs.begin()
 
         for i, line in enumerate(lines):
+            if self._broadcast_dead:
+                # 配信が途切れたと分かった。残りの文を合成しても届かないうえ、
+                # そのときは VOICEVOX も詰まっているので1文につき最大32秒
+                # （読み取り15秒 × 2回 + 待ち1秒）待たされて片付けが伸びる
+                print(f"[live] 配信が途切れたので{tag or '発話'}を"
+                      f"{i}/{len(lines)}文で打ち切ります")
+                break
             if i > 0:
                 # いまの文が終わる少し手前まで待つ。ここが割り込みの窓になる
                 if self._wait_line(last_dur, interruptible):
@@ -850,6 +870,13 @@ class LiveSession:
         # 何件取り残したかは配信後に効き具合を見る唯一の手がかりになる
         self._log_queue("[live] クロージングへ入ります")
 
+        if self._broadcast_dead:
+            # 配信はもう流れていない。聞いている人は居らず、ここが呼ばれる
+            # ときは VOICEVOX と Unity も詰まっている。締めの合成を試みても
+            # 1文ごとにタイムアウトを待って teardown が数分伸びるだけになる
+            print("[live] 配信が途切れているのでクロージングは行いません")
+            return
+
         self.speak_scripted(
             "配信のクロージングです。「botたん」という自分の名前を必ず言って、"
             "高評価とチャンネル登録がうれしいことを伝えて、「また明日ね」で締めてください。"
@@ -883,8 +910,19 @@ class LiveSession:
             gauge_at = 0.0
             rag_at = 0.0
             memory_at = time.monotonic()
+            health_at = time.monotonic()
+            meminfo_at = 0.0
             while not self._stopping:
                 now = time.monotonic()
+                # 配信がまだ生きているか。YouTube API と OBS の websocket を
+                # 叩くので、メインループではなくここに置く
+                if (LIVE_HEALTH_CHECK_SEC > 0
+                        and now - health_at > LIVE_HEALTH_CHECK_SEC):
+                    health_at = now
+                    self._check_broadcast()
+                if MEMORY_LOG_SEC > 0 and now - meminfo_at > MEMORY_LOG_SEC:
+                    meminfo_at = now
+                    self._log_memory()
                 if now - gauge_at > ENERGY_REFRESH_SEC:
                     gauge_at = now
                     try:
@@ -920,6 +958,96 @@ class LiveSession:
 
         self._chores = threading.Thread(target=run, daemon=True, name="chores")
         self._chores.start()
+
+    def _log_memory(self) -> None:
+        """メモリ事情を1行だけ残す。配信中の詰まりを後から追えるように。
+
+        2026-09-09 の配信では記録が開始時の1行しかなく、swap がいつ膨らんだかを
+        リポジトリのログからは追えなかった（sar が別にあったから分かった）。
+        """
+        try:
+            import obs as obs_mod
+            print(f"[live] メモリ:\n{obs_mod.memory_note()}")
+        except Exception as e:
+            print(f"[live] メモリを読めません（無視します）: {e}")
+
+    def _check_broadcast(self) -> None:
+        """配信がまだ生きているかを確かめ、死んでいたら配信を畳む。
+
+        2026-09-09 は 21:08 に YouTube が enableAutoStop で枠を閉じたのに、
+        こちらはそれに気づかず 23分間喋り続けた。ホストが swap で詰まって
+        OBS の送出が止まったのが元で、Unity はプロセスとしては生きていたので
+        既存の死活監視（_housekeeping の unity.is_alive）には何も掛からない。
+
+        見るのは2つ。
+        - YouTube の lifeCycleStatus。complete / revoked なら確定。
+        - OBS の総フレーム数。増えないまま LIVE_HEALTH_STALL_SEC 続いたら
+          送出が止まっている。YouTube が切る前に気づける。
+        """
+        reason = self._broadcast_gone() or self._output_stalled()
+        if not reason:
+            return
+        print(f"[live] 配信が続いていません: {reason}")
+        try:
+            import obs as obs_mod
+            detail = f"{reason}\n{obs_mod.memory_note()}"
+        except Exception:
+            detail = reason
+        try:
+            notify.error("配信", f"配信が途切れたため終了します\n{detail}")
+        except Exception as e:
+            print(f"[live] 通知に失敗（続行します）: {e}")
+        self._broadcast_dead = True
+        self._stopping = True
+
+    def _broadcast_gone(self) -> str:
+        """YouTube 側で配信枠が閉じていれば理由を返す。生きていれば空文字。"""
+        if self.broadcast is None:
+            return ""
+        try:
+            status = self.broadcast.lifecycle_status()
+        except Exception as e:
+            # ネットワークの一時的な失敗で配信を畳まない。次の点検で見直す
+            print(f"[live] 配信枠の状態を確認できません（無視します）: {e}")
+            return ""
+        if status in ("complete", "revoked"):
+            return f"YouTube の配信枠が {status} になっています"
+        return ""
+
+    def _output_stalled(self) -> str:
+        """OBS の送出が止まっていれば理由を返す。出ていれば空文字。"""
+        if self.obs is None:
+            return ""
+        try:
+            stats = self.obs.stream_stats()
+        except Exception as e:
+            print(f"[live] OBS の状態を確認できません（無視します）: {e}")
+            return ""
+        if "error" in stats:
+            print(f"[live] OBS の状態を確認できません（無視します）: {stats['error']}")
+            return ""
+        now = time.monotonic()
+        if not stats.get("active"):
+            # 1回の観測で配信を畳まない。配信を早く終わらせてしまう損のほうが、
+            # 気づくのが点検1回ぶん遅れる損より大きい
+            self._inactive_count += 1
+            if self._inactive_count < 2:
+                print("[live] OBS が配信を送っていません。次の点検で見直します")
+                return ""
+            return (f"OBS が配信を送っていません"
+                    f"（output_active=False が {self._inactive_count}回続き）")
+        self._inactive_count = 0
+        frames = stats.get("total_frames", 0)
+        if frames != self._last_frames:
+            self._last_frames = frames
+            self._frames_at = now
+            return ""
+        # 再接続中は OBS が自分で戻そうとしている。猶予を倍にして待つ
+        limit = LIVE_HEALTH_STALL_SEC * (2 if stats.get("reconnecting") else 1)
+        if now - self._frames_at < limit:
+            return ""
+        return (f"OBS の出力フレームが {now - self._frames_at:.0f}秒 "
+                f"{frames} のまま増えていません")
 
     def _housekeeping(self) -> None:
         """数秒ごとの雑務。落ちても配信に影響しない処理だけ置くこと。

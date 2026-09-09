@@ -58,6 +58,65 @@ def _display_refresh_hz(display: str) -> float:
     return 0.0
 
 
+# Unity Hub の実行ファイルの置き場。ここを前方一致で見るので、配信用の
+# Unity Editor（UNITY_EXE = ~/Unity/Hub/Editor/<版>/Editor/Unity）には当たらない
+UNITY_HUB_PREFIX = "/opt/unityhub/"
+
+
+def close_unity_hub(grace_sec: float = 5.0) -> int:
+    """起動しっぱなしの Unity Hub を閉じる。閉じた数を返す。
+
+    Hub は配信にも収録にも要らない。run_live.sh が起こすのは Editor の実体
+    （UNITY_EXE）で、Hub 経由ではない。にもかかわらず Electron + Chromium の
+    プロセス群が常駐して RAM を掴み続ける。
+
+    2026-09-09 の配信では開いたままだった。この日はホストの commit が
+    RAM+swap の 110% に達し、swap への書き出しが 1320ページ/秒まで跳ねて
+    OBS の送出が止まり、YouTube に配信を切られている。README のメモリの節が
+    「配信中は Unity Hub と chrome を落としておくこと」と書いていたが、
+    人の手に任せている限り忘れる。ここで機械的に落とす。
+
+    **Editor を巻き添えにしないこと。** 収録側の shorts/core.py が
+    `pkill -9 -f "Unity -projectPath"` で Unity を無差別に殺して事故に
+    なった前例がある（run_live.sh の flock の説明を参照）。ここは
+    /opt/unityhub/ で始まるコマンドラインだけを見る。
+    """
+    pids = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            cmdline = (proc / "cmdline").read_bytes().split(b"\0")[0].decode()
+        except (OSError, UnicodeDecodeError):
+            continue          # 見ている間に消えたプロセス
+        if cmdline.startswith(UNITY_HUB_PREFIX):
+            try:
+                pids.append(int(proc.name))
+            except ValueError:
+                continue
+    if not pids:
+        return 0
+
+    print(f"[Unity] Unity Hub が起動しています。閉じます（{len(pids)}プロセス）")
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    # Electron は親を落とすと子も畳まれる。少し待ってから残りを見る
+    deadline = time.time() + grace_sec
+    while time.time() < deadline:
+        alive = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
+        if not alive:
+            return len(pids)
+        time.sleep(0.2)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    print("[Unity] SIGTERM で閉じなかったぶんを強制終了しました")
+    return len(pids)
+
+
 class UnityLive:
     """配信中ずっと生きている Unity プロセス。"""
 
