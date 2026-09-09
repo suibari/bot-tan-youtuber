@@ -30,11 +30,13 @@ from config import (OBS_HOST, OBS_PORT, OBS_PASSWORD, OBS_LAUNCH, OBS_COMMAND,
                     OBS_COLLECTION, OBS_PROFILE, LIVE_DISPLAY,
                     STREAM_VIDEO_KBPS, STREAM_AUDIO_KBPS,
                     OBS_START_TIMEOUT, OBS_MIN_AVAIL_GB,
+                    OBS_MAX_SWAP_RATIO, OBS_MAX_COMMIT_RATIO,
                     SUBTITLE_JA, SUBTITLE_EN)
 
 # **config より後に置くこと。** リポジトリのルートを sys.path へ足しているのは
 # config（live/config.py:17-18）なので、先に書くと単体起動で import に失敗する
 from common import ardy  # noqa: E402
+from common.env import host_pressure, meminfo_kb  # noqa: E402
 
 # 字幕の送信を何回続けて失敗したらファイル経路へ戻すか。
 # 一時的な取りこぼしで戻すと、以後ずっと1秒遅れの字幕になってしまう
@@ -267,24 +269,64 @@ def _top_swappers(limit: int = 4) -> str:
     return ", ".join(f"{name} {kb / 1024:.0f}MB" for kb, name in rows[:limit])
 
 
+def _commit_ratio() -> float:
+    """Committed_AS ÷ (RAM + スワップ)。読めなければ 0.0。
+
+    カーネルが約束した総量が実在のメモリを超えているかどうか。1.0 を超えた
+    状態は「全員が確保したぶんを実際に触ったら swap に落ちる」ことを意味する。
+    2026-09-09 の配信中は 110〜115% で、その通りに落ちた。
+    """
+    info = meminfo_kb()
+    capacity = info.get("MemTotal", 0) + info.get("SwapTotal", 0)
+    if not capacity:
+        return 0.0
+    return info.get("Committed_AS", 0) / capacity
+
+
 def memory_note() -> str:
     """今のメモリ事情を1〜2行で。失敗メッセージと配信前の点検の両方で使う。"""
     used, total = _swap_gb()
+    ratio = used / total if total else 0.0
     note = (f"  空き RAM {ardy.mem_available_gb():.1f}GB / "
             f"空き VRAM {ardy.vram_free_gb():.1f}GB / "
-            f"スワップ {used:.1f}/{total:.1f}GB")
+            f"スワップ {used:.1f}/{total:.1f}GB ({ratio * 100:.0f}%) / "
+            f"commit {_commit_ratio() * 100:.0f}%")
+    pressure = host_pressure()
+    if pressure:
+        note += f" / {pressure}"
     top = _top_swappers()
     return f"{note}\n  スワップ上位: {top}" if top else note
 
 
 def check_memory() -> str | None:
-    """空き RAM が足りなければ警告文を返す。足りていれば None。"""
+    """メモリが苦しければ警告文を返す。余裕があれば None。
+
+    **空き RAM だけを見てはいけない。** `MemAvailable` は回収できるページ
+    キャッシュを含むので、匿名ページで RAM が埋まっていても大きい値が出る。
+    2026-09-09 の配信は MemAvailable が 15.3GB あったのでこの点検を素通りし、
+    その裏では swap が既に 6.2GB 使われ commit は 110% だった。配信開始と同時に
+    swap への書き出しが 1320ページ/秒まで跳ね、%iowait 28.8% で OBS の送出が
+    止まり、YouTube に配信を切られた。swap の使用率と commit 比を併せて見る。
+
+    止めはしない。枠はもう作ってあるので、ここで落とすほうが損失が大きい。
+    """
+    reasons = []
     avail = ardy.mem_available_gb()
-    if avail >= OBS_MIN_AVAIL_GB:
+    if avail < OBS_MIN_AVAIL_GB:
+        reasons.append(f"空き RAM が {avail:.1f}GB しかありません"
+                       f"（目安 {OBS_MIN_AVAIL_GB:.1f}GB）")
+    used, total = _swap_gb()
+    if total and used / total > OBS_MAX_SWAP_RATIO:
+        reasons.append(f"スワップを {used:.1f}/{total:.1f}GB 使っています"
+                       f"（目安 {OBS_MAX_SWAP_RATIO * 100:.0f}%）")
+    commit = _commit_ratio()
+    if commit > OBS_MAX_COMMIT_RATIO:
+        reasons.append(f"commit が RAM+スワップの {commit * 100:.0f}% です"
+                       f"（目安 {OBS_MAX_COMMIT_RATIO * 100:.0f}%）")
+    if not reasons:
         return None
-    return (f"空き RAM が {avail:.1f}GB しかありません"
-            f"（目安 {OBS_MIN_AVAIL_GB:.1f}GB）。OBS がスワップで詰まると、"
-            f"配信は始まってもフレームがほとんど出ません:\n" + memory_note())
+    return ("、".join(reasons) + "。OBS がスワップで詰まると、配信は始まっても"
+            "フレームが出ず、YouTube に切られます:\n" + memory_note())
 
 
 def _clear_crash_sentinel() -> None:

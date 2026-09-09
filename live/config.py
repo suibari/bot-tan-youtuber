@@ -199,6 +199,22 @@ OBS_START_TIMEOUT = env_float("OBS_START_TIMEOUT", 60.0)
 # 実測: 起動時の空きが 503MB の回は lagged frames 96.7%、
 # 1.6〜1.8GB の回は 0.1〜0.3% だった
 OBS_MIN_AVAIL_GB = env_float("OBS_MIN_AVAIL_GB", 3.0)
+# 空き RAM だけでは足りない。2026-09-09 の配信は MemAvailable が 15.3GB
+# あったのに素通りし、その裏で swap は既に 6.2GB 使われ Committed_AS は
+# RAM+swap の 110% だった。MemAvailable は**回収できるページキャッシュを
+# 含む**ので、ollama・ARDY・Unity・OBS が匿名ページで RAM を埋めるこの構成
+# では警告として働かない。swap の使用率と commit 比を併せて見る。
+# どちらも「越えたら警告」で、配信は止めない。
+#
+# swap の使用率はこのホストでは常に高い。21時台の実測は
+# 09/06 33%（完走）/ 09/07 31%（完走）/ 09/08 42〜54%（完走）/
+# 09/09 33→48%（21:08 に切られた）。**単独では良し悪しを分けられない**ので、
+# 線は「さすがに苦しい」ところに置いてある。効くのは下の commit 比のほう。
+OBS_MAX_SWAP_RATIO = env_float("OBS_MAX_SWAP_RATIO", 0.55)
+# Committed_AS ÷ (RAM + swap)。カーネルが約束した総量が実在のメモリを
+# 超えている状態で、「全員が確保したぶんを触ったら swap に落ちる」ことを意味する。
+# 09/09 は 21:00 の時点で既に 110% あり、その通りに落ちた
+OBS_MAX_COMMIT_RATIO = env_float("OBS_MAX_COMMIT_RATIO", 1.0)
 
 # ── 字幕（OBS のテキストソースが読むファイル） ──────
 SUBTITLE_DIR = Path(os.getenv("SUBTITLE_DIR", DATA_DIR / "obs"))
@@ -224,6 +240,23 @@ ENERGY_REFRESH_SEC = env_int("ENERGY_REFRESH_SEC", 30)
 # Unity の fps をログへ残す間隔[秒]。0 以下で無効。
 # Editor 常駐のメモリ増加と、モーション投入によるフレーム落ちの監視を兼ねる
 FPS_LOG_SEC = env_float("FPS_LOG_SEC", 60.0)
+
+# 配信がまだ生きているかを確かめる間隔[秒]。0 以下で無効。
+# 2026-09-09 は 21:08 に YouTube が enableAutoStop で枠を閉じたのに、
+# こちらは 23分間それに気づかず喋り続けた。run_loop の終了条件は時刻と
+# _stopping だけで、_stopping が立つのは SIGTERM と「Unity プロセスが死んで
+# 復旧上限に達した」ときしかない。Unity はプロセスとしては生きていた。
+# 見るのは YouTube の lifeCycleStatus（1回1ユニット。60分で60ユニットなので
+# クォータに響かない）と OBS の出力フレーム数の2つ。
+LIVE_HEALTH_CHECK_SEC = env_float("LIVE_HEALTH_CHECK_SEC", 60.0)
+# OBS の総フレーム数が増えないまま何秒続いたら送出が止まったとみなすか。
+# 一時的な輻輳で切らないよう、点検間隔より十分長くとる
+LIVE_HEALTH_STALL_SEC = env_float("LIVE_HEALTH_STALL_SEC", 120.0)
+
+# 配信中にメモリ事情をログへ残す間隔[秒]。0 以下で無効。
+# 2026-09-09 はメモリの記録が開始時の1行しかなく、swap がいつ膨らんだかを
+# リポジトリのログからは追えなかった（sar が別にあったから分かった）
+MEMORY_LOG_SEC = env_float("MEMORY_LOG_SEC", 300.0)
 
 # botたんの状態（気分・行動・energy）を DB から引き直す間隔[秒]。
 # コメント返信のたびに引くと、DB が詰まったときにメインループごと止まる。

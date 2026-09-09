@@ -4,6 +4,13 @@ Description=botたん YouTube ライブ配信 (21:00-22:00)
 Requires=bottan-live-xorg.service
 After=bottan-live-xorg.service network-online.target
 Wants=network-online.target
+# 画像生成サイドカー（bot-tan-imagegen）は配信中に使わないので退かす。
+# あちらは常駐でアイドル時に解放しても RSS 約1.9GB を掴んだままで、
+# 2026-09-09 の配信では 543MB＋swap 1.0GB を占めていた。ホストは 31GB しか
+# 無く、ollama(9.4GB)・ARDY・Unity・OBS・VOICEVOX が同居して commit が
+# RAM+swap の 110% に達し、OBS の送出が止まって YouTube に配信を切られた。
+# Conflicts= は「こちらが起動したら向こうを止める」。戻すのは ExecStopPost。
+Conflicts=imagegen.service
 
 [Service]
 Type=oneshot
@@ -22,6 +29,15 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/__UID__/bus
 TimeoutStartSec=6000
 # 配信が落ちたら自動で上げ直さない。中途半端な時刻に配信枠が増えるほうが困る
 Restart=no
+# Conflicts= で止めた画像生成サイドカーを戻す。`+` を付けると User= に関係なく
+# root で走るので、suibari に systemctl の sudoers を書かなくて済む。
+# 配信の成否によらず動くよう ExecStopPost に置く（ExecStop では異常終了時に
+# 走らない経路がある）。
+# `-` は失敗を無視する指定。**これを外さないこと。** imagegen を入れていない
+# 環境（dev の worktree など）ではこの systemctl が失敗し、Type=oneshot だと
+# ExecStopPost の失敗がユニット全体の failed になる。配信そのものは終わって
+# いるのに「配信が落ちた」ことになってしまう
+ExecStopPost=-+/usr/bin/systemctl start --no-block imagegen.service
 StandardOutput=journal
 StandardError=journal
 

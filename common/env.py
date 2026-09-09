@@ -64,5 +64,58 @@ def env_float_opt(name: str):
         return None
 
 
+def host_pressure() -> str:
+    """そのときのホストの詰まり具合を1行で返す。読めなければ空文字。
+
+    VOICEVOX 自体は速い（99字で約2秒、CPU を6コア占有されても3.2秒）。それが
+    15秒返らないのは ollama がモデル（11GB, mmap）を読み直して I/O を飽和させ、
+    同居プロセスが道連れになるとき（2026-09-01 の配信で iowait 39%、
+    load_tensors 128回、ARDY も 300秒タイムアウト）。PSI の io/some avg10 が
+    その状態を直接示す——平常時は 1 前後、あの日なら数十——ので、遅かったとき
+    と落ちたときのログに必ず添える。エンジンが遅いのかホストが詰まったのかは
+    これが無いと切り分けられない。
+
+    2026-09-09 の配信でも同じ数字が出た（io avg10 が 72〜76、load 15.6）。
+    このときは ollama のモデル再読込ではなく swap への書き出しが原因で、
+    OBS の送出まで止まって YouTube に配信を切られた。**合成の失敗だけでなく
+    配信前の点検と配信中のメモリ記録からも同じものを見たい**ので、
+    common/voice.py の私物からここへ移した。
+    """
+    parts = []
+    try:
+        with open("/proc/pressure/io") as f:
+            # "some avg10=39.21 avg60=... avg300=... total=..."
+            parts.append("io " + f.readline().split()[1])
+    except (OSError, IndexError):
+        pass          # PSI の無い環境。診断が欠けるだけで呼び出し元は止めない
+    try:
+        parts.append(f"load {os.getloadavg()[0]:.1f}")
+    except OSError:
+        pass
+    return " ".join(parts)
+
+
+def meminfo_kb() -> dict:
+    """/proc/meminfo を {キー: KB} で返す。読めなければ空の辞書。
+
+    空き RAM だけを見ても足りない。`MemAvailable` は**回収できるページ
+    キャッシュを含む**ので、匿名ページで RAM が埋まっていても大きい値が出る。
+    2026-09-09 の配信は MemAvailable が 15.3GB あるまま swap を 2.7GB 吐き、
+    OBS が固まった。`SwapFree` と `Committed_AS` を併せて見るために足した。
+    """
+    values = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                try:
+                    values[key] = int(rest.split()[0])
+                except (IndexError, ValueError):
+                    continue
+    except OSError:
+        return {}
+    return values
+
+
 def ensure_dirs() -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)

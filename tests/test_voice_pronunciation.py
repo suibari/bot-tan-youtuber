@@ -30,6 +30,11 @@ env_stub = types.ModuleType("common.env")
 env_stub.env_flag = lambda _name, default=False: default
 env_stub.env_float = lambda _name, default: default
 env_stub.env_int = lambda _name, default: default
+# common/voice.py が I/O PSI とロードアベレージを添えるのに使う。
+# 実装は common/env.py にある（合成の失敗ログ・配信前の点検・配信中の
+# メモリ記録の3か所から呼ぶので、voice.py の私物ではなくなった）
+env_stub.host_pressure = lambda: ""
+env_stub.meminfo_kb = lambda: {}
 pronunciation_module = load_with_stubs(
     "pronunciation_test_module",
     ROOT / "common" / "pronunciation.py",

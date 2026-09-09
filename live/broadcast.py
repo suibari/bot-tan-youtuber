@@ -356,4 +356,14 @@ class Broadcast:
             print("[YouTube] live まで行っていないので complete への遷移は行いません"
                   f"（枠は残ります: {self.url}）")
             return False
+        # YouTube が enableAutoStop で先に閉じていることがある。2026-09-09 は
+        # 送出が止まって 21:08 に向こうから complete にされた。そこへ complete を
+        # 投げると invalidTransition の 403 になり、片付けのログがエラーで埋まる
+        try:
+            already = self.lifecycle_status()
+        except Exception:
+            already = "unknown"
+        if already in ("complete", "revoked"):
+            print(f"[YouTube] 配信枠はすでに {already} です（遷移は行いません）")
+            return True
         return self.transition("complete")

@@ -37,6 +37,8 @@ def load_live():
         LIVE_GO_LIVE_RETRY_SEC=300, LIVE_START_HHMM="21:00",
         LIVE_TESTING_LEAD_SEC=120, BOT_CONTEXT_TTL_SEC=20.0,
         BOT_MOOD_SERVE_LIMIT=1, FPS_LOG_SEC=60.0,
+        LIVE_HEALTH_CHECK_SEC=60.0, LIVE_HEALTH_STALL_SEC=120.0,
+        MEMORY_LOG_SEC=300.0,
         LIVE_HISTORY_TURNS=6, LIVE_HISTORY_USER_TURNS=3, SKIP_ARDY=True,
         SUBTITLE_LEAD_SEC=0.0, UNITY_PROJECT="/tmp/unity",
         UNITY_RESTART_MAX=2, UNITY_RESTART_TIMEOUT_SEC=120.0,
@@ -111,6 +113,13 @@ def bare_session():
     session.last_speech_at = time.monotonic()
     session.planner = FakePlanner()
     session._mood_state = {"text": "", "served": 0}
+    session._stopping = False
+    session._broadcast_dead = False
+    session._last_frames = -1
+    session._frames_at = time.monotonic()
+    session._inactive_count = 0
+    session.broadcast = None
+    session.obs = None
     return session
 
 
@@ -299,6 +308,156 @@ class UnityRecoveryTest(unittest.TestCase):
             self.assertFalse(session._recover_unity(force=True))
         self.assertFalse(session._recover_unity(force=True))
         self.assertEqual(len(session.unity.started), live.UNITY_RESTART_MAX)
+
+
+class FakeBroadcast:
+    def __init__(self, status="live"):
+        self.status = status
+
+    def lifecycle_status(self):
+        if isinstance(self.status, Exception):
+            raise self.status
+        return self.status
+
+
+class FakeStreamObs:
+    def __init__(self, **stats):
+        self.stats = {"active": True, "reconnecting": False,
+                      "total_frames": 1000}
+        self.stats.update(stats)
+
+    def stream_stats(self):
+        return dict(self.stats)
+
+
+class BroadcastWatchdogTest(unittest.TestCase):
+    """配信が途切れたことに気づいて畳む。
+
+    2026-09-09 は 21:08 に YouTube が enableAutoStop で枠を閉じたのに、
+    こちらは 23分間それに気づかず喋り続けた。ホストが swap で詰まって OBS の
+    送出が止まったのが元で、Unity はプロセスとしては生きていたので既存の
+    死活監視（_housekeeping の unity.is_alive）には何も掛からなかった。
+    """
+
+    def make_session(self, broadcast=None, obs=None):
+        session = bare_session()
+        session.broadcast = broadcast
+        session.obs = obs
+        return session
+
+    def test_a_completed_broadcast_stops_the_stream(self):
+        session = self.make_session(FakeBroadcast("complete"), FakeStreamObs())
+        session._check_broadcast()
+        self.assertTrue(session._broadcast_dead)
+        self.assertTrue(session._stopping)
+
+    def test_a_revoked_broadcast_stops_the_stream(self):
+        session = self.make_session(FakeBroadcast("revoked"), FakeStreamObs())
+        session._check_broadcast()
+        self.assertTrue(session._stopping)
+
+    def test_a_live_broadcast_keeps_going(self):
+        session = self.make_session(FakeBroadcast("live"), FakeStreamObs())
+        session._check_broadcast()
+        self.assertFalse(session._broadcast_dead)
+        self.assertFalse(session._stopping)
+
+    def test_a_youtube_api_failure_does_not_end_the_stream(self):
+        """点検が転んだくらいで配信を畳まない。次の点検で見直せばよい。"""
+        session = self.make_session(
+            FakeBroadcast(RuntimeError("quota")), FakeStreamObs())
+        session._check_broadcast()
+        self.assertFalse(session._stopping)
+
+    def test_obs_going_inactive_stops_the_stream(self):
+        session = self.make_session(FakeBroadcast("live"),
+                                    FakeStreamObs(active=False))
+        session._check_broadcast()
+        self.assertFalse(session._stopping, "1回では畳まない")
+        session._check_broadcast()
+        self.assertTrue(session._broadcast_dead)
+
+    def test_one_odd_sample_does_not_end_the_stream(self):
+        """配信を早く終わらせてしまう損のほうが、気づくのが遅れる損より大きい。"""
+        obs = FakeStreamObs(active=False)
+        session = self.make_session(FakeBroadcast("live"), obs)
+        session._check_broadcast()
+        obs.stats["active"] = True
+        obs.stats["total_frames"] = 2000
+        session._check_broadcast()
+        session._check_broadcast()
+        self.assertFalse(session._stopping)
+
+    def test_frozen_frames_stop_the_stream_after_the_grace_period(self):
+        obs = FakeStreamObs(total_frames=1000)
+        session = self.make_session(FakeBroadcast("live"), obs)
+        session._check_broadcast()                 # 1回目は基準を取るだけ
+        self.assertFalse(session._stopping)
+        session._frames_at -= live.LIVE_HEALTH_STALL_SEC + 1
+        session._check_broadcast()
+        self.assertTrue(session._broadcast_dead)
+
+    def test_advancing_frames_reset_the_grace_period(self):
+        obs = FakeStreamObs(total_frames=1000)
+        session = self.make_session(FakeBroadcast("live"), obs)
+        session._check_broadcast()
+        session._frames_at -= live.LIVE_HEALTH_STALL_SEC + 1
+        obs.stats["total_frames"] = 1900           # 出ている
+        session._check_broadcast()
+        self.assertFalse(session._stopping)
+
+    def test_reconnecting_gets_twice_the_grace_period(self):
+        """OBS が自分で戻そうとしている間は待つ。"""
+        obs = FakeStreamObs(total_frames=1000, reconnecting=True)
+        session = self.make_session(FakeBroadcast("live"), obs)
+        session._check_broadcast()
+        session._frames_at -= live.LIVE_HEALTH_STALL_SEC + 1
+        session._check_broadcast()
+        self.assertFalse(session._stopping)
+        session._frames_at -= live.LIVE_HEALTH_STALL_SEC
+        session._check_broadcast()
+        self.assertTrue(session._broadcast_dead)
+
+    def test_an_unreachable_obs_does_not_end_the_stream(self):
+        class Broken:
+            def stream_stats(self):
+                return {"error": "websocket is closed"}
+
+        session = self.make_session(FakeBroadcast("live"), Broken())
+        session._check_broadcast()
+        self.assertFalse(session._stopping)
+
+
+class ClosingSkipTest(unittest.TestCase):
+    """配信が途切れているならクロージングは喋らない。
+
+    聞いている人は居らず、そこが呼ばれるときは VOICEVOX と Unity も詰まって
+    いる。締めの合成を試みても1文ごとにタイムアウトを待つだけで、teardown が
+    数分伸びる。
+    """
+
+    def source(self):
+        return (LIVE / "live.py").read_text(encoding="utf-8")
+
+    def test_an_in_flight_speech_is_cut_short(self):
+        """途切れたあとの残りの文を合成しない。
+
+        そのときは VOICEVOX も詰まっているので、1文につき最大32秒
+        （読み取り15秒 × 2回 + 待ち1秒）待たされて片付けが伸びる。
+        """
+        source = self.source()
+        loop = source.index("for i, line in enumerate(lines):")
+        guard = source.index("if self._broadcast_dead:", loop)
+        synth = source.index("voice.synthesize_lines(", loop)
+        self.assertLess(guard, synth)
+
+    def test_the_guard_sits_before_the_closing_speech(self):
+        source = self.source()
+        guard = source.index("if self._broadcast_dead:")
+        closing = source.index('"配信のクロージングです。')
+        self.assertLess(guard, closing)
+        # ガードから発話までのあいだに return があること
+        self.assertIn("return", source[guard:closing])
 
 
 if __name__ == "__main__":

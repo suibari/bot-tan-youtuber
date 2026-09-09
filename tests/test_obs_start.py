@@ -242,5 +242,90 @@ class LastOutputErrorTest(unittest.TestCase):
         self.assertIn("ログを1行も書いていません", report)
 
 
+class CheckMemoryTest(unittest.TestCase):
+    """配信前の点検が「空き RAM だけ」で素通りしないこと。
+
+    2026-09-09 の配信は MemAvailable が 15.3GB あったのでこの点検を素通りし、
+    その裏では swap が既に 6.2GB（33%）使われ Committed_AS は RAM+swap の
+    110% だった。配信開始と同時に swap への書き出しが 1320ページ/秒まで跳ね、
+    %iowait 28.8% で OBS の送出が止まり、YouTube に配信を切られた。
+    MemAvailable は**回収できるページキャッシュを含む**ので、匿名ページで
+    RAM が埋まっていても大きい値が出る。単独では警告として働かない。
+    """
+
+    def patch_host(self, avail_gb, swap_used_gb, swap_total_gb, commit_ratio):
+        mem_total_kb = 31 * 1024 * 1024
+        swap_total_kb = int(swap_total_gb * 1024 * 1024)
+        swap_free_kb = int((swap_total_gb - swap_used_gb) * 1024 * 1024)
+        info = {
+            "MemTotal": mem_total_kb,
+            "SwapTotal": swap_total_kb,
+            "SwapFree": swap_free_kb,
+            "Committed_AS": int((mem_total_kb + swap_total_kb) * commit_ratio),
+        }
+        for target, name, value in (
+                (obs_mod.ardy, "mem_available_gb", lambda: avail_gb),
+                (obs_mod.ardy, "vram_free_gb", lambda: 5.6),
+                (obs_mod, "meminfo_kb", lambda: info),
+                (obs_mod, "_swap_gb", lambda: (swap_used_gb, swap_total_gb)),
+                (obs_mod, "_top_swappers", lambda *a, **k: ""),
+                (obs_mod, "host_pressure", lambda: "io 72.69 load 7.8")):
+            patcher = unittest.mock.patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_a_healthy_host_passes(self):
+        self.patch_host(avail_gb=15.3, swap_used_gb=1.0,
+                        swap_total_gb=18.0, commit_ratio=0.6)
+        self.assertIsNone(obs_mod.check_memory())
+
+    def test_plenty_of_available_ram_is_not_enough(self):
+        """2026-09-09 の実測値そのもの。ここが素通りしたのが見落としの入口。"""
+        self.patch_host(avail_gb=15.3, swap_used_gb=6.2,
+                        swap_total_gb=18.0, commit_ratio=1.10)
+        warning = obs_mod.check_memory()
+        self.assertIsNotNone(warning)
+        self.assertIn("commit", warning)
+
+    def test_ordinary_swap_use_alone_does_not_warn(self):
+        """swap 単独では良し悪しを分けられない。
+
+        21時台の実測は 09/06 33%・09/07 31%・09/08 42〜54% で、どれも完走して
+        いる。09/09 の 33% だけを咎めると毎晩鳴る警告になり、誰も読まなくなる。
+        """
+        self.patch_host(avail_gb=15.3, swap_used_gb=6.2,
+                        swap_total_gb=18.0, commit_ratio=0.6)
+        self.assertIsNone(obs_mod.check_memory())
+
+    def test_commit_over_capacity_is_what_catches_it(self):
+        """09/09 を拾えたのは commit 比。swap は 33% で平常どおりだった。"""
+        self.patch_host(avail_gb=15.3, swap_used_gb=6.2,
+                        swap_total_gb=18.0, commit_ratio=1.10)
+        warning = obs_mod.check_memory()
+        self.assertIn("commit", warning)
+
+    def test_swap_nearly_full_warns_on_its_own(self):
+        self.patch_host(avail_gb=15.3, swap_used_gb=16.0,
+                        swap_total_gb=18.0, commit_ratio=0.6)
+        self.assertIn("スワップ", obs_mod.check_memory())
+
+    def test_low_free_ram_still_warns(self):
+        self.patch_host(avail_gb=0.5, swap_used_gb=0.0,
+                        swap_total_gb=18.0, commit_ratio=0.5)
+        warning = obs_mod.check_memory()
+        self.assertIn("空き RAM", warning)
+
+    def test_a_host_without_swap_does_not_divide_by_zero(self):
+        self.patch_host(avail_gb=15.3, swap_used_gb=0.0,
+                        swap_total_gb=0.0, commit_ratio=0.5)
+        self.assertIsNone(obs_mod.check_memory())
+
+    def test_the_note_carries_the_pressure_reading(self):
+        """通知を見た時点で I/O 起因かどうかが分かること。"""
+        self.patch_host(avail_gb=15.3, swap_used_gb=6.2,
+                        swap_total_gb=18.0, commit_ratio=1.10)
+        self.assertIn("io 72.69", obs_mod.memory_note())
+
+
 if __name__ == "__main__":
     unittest.main()

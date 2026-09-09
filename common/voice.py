@@ -17,7 +17,7 @@ from pathlib import Path
 
 import requests
 
-from common.env import env_float, env_int
+from common.env import env_float, env_int, host_pressure
 from common.pronunciation import apply_pronunciations, preload_pronunciations  # noqa: F401
 
 VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
@@ -60,31 +60,6 @@ _RETRY = env_int("VOICEVOX_RETRY", 1)
 _SLOW_SEC = _TIMEOUT[1] / 3
 
 
-def _host_pressure() -> str:
-    """そのときのホストの詰まり具合を1行で返す。読めなければ空文字。
-
-    VOICEVOX 自体は速い（99字で約2秒、CPU を6コア占有されても3.2秒）。それが
-    15秒返らないのは ollama がモデル（11GB, mmap）を読み直して I/O を飽和させ、
-    同居プロセスが道連れになるとき（2026-09-01 の配信で iowait 39%、
-    load_tensors 128回、ARDY も 300秒タイムアウト）。PSI の io/some avg10 が
-    その状態を直接示す——平常時は 1 前後、あの日なら数十——ので、遅かったとき
-    と落ちたときのログに必ず添える。エンジンが遅いのかホストが詰まったのかは
-    これが無いと切り分けられない。
-    """
-    parts = []
-    try:
-        with open("/proc/pressure/io") as f:
-            # "some avg10=39.21 avg60=... avg300=... total=..."
-            parts.append("io " + f.readline().split()[1])
-    except (OSError, IndexError):
-        pass          # PSI の無い環境。診断が欠けるだけで合成は止めない
-    try:
-        parts.append(f"load {os.getloadavg()[0]:.1f}")
-    except OSError:
-        pass
-    return " ".join(parts)
-
-
 class VoicevoxError(RuntimeError):
     pass
 
@@ -113,7 +88,7 @@ def _post_with_retry(url: str, what: str, **kwargs):
                 if elapsed >= _SLOW_SEC:
                     # 落ちてはいないが落ちる手前。次に全滅するときの前触れなので
                     # 拾っておく。閾値未満は無言（毎回出すと配信ログが埋まる）
-                    pressure = _host_pressure()
+                    pressure = host_pressure()
                     print(f"[VOICEVOX] {what} に {elapsed:.1f}秒かかりました"
                           + (f"（{pressure}）" if pressure else ""))
                 return res
@@ -126,7 +101,7 @@ def _post_with_retry(url: str, what: str, **kwargs):
         # そのときのホストの状態が分からず、エンジンが遅いのか I/O が詰まった
         # のかを journal と sar を突き合わせて後から推定する羽目になった
         elapsed = time.monotonic() - started
-        pressure = _host_pressure()
+        pressure = host_pressure()
         detail = f"{reason} / {elapsed:.1f}秒" + (f" / {pressure}" if pressure else "")
         if attempt == _RETRY:
             break
