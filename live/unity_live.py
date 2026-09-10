@@ -39,7 +39,14 @@ def _start_xvfb() -> tuple:
 
 
 def _display_refresh_hz(display: str) -> float:
-    """xrandr が示す現在モードのリフレッシュレート。取得不能なら0。"""
+    """xrandr が示す現在モードのリフレッシュレート。取得不能なら0。
+
+    **これは「絵が出ている」ことの保証にはならない。** 返るのはモードの
+    公称値で、実際のスキャンアウトが止まっていても 59.95 と答える。
+    2026-09-10 の配信ではこの点検が 59.95Hz で素通りしたまま、同じ
+    ディスプレイの glxgears が 1.0〜1.4fps しか出ていなかった。
+    実際に描けているかは UnityLive.measure_fps で実測すること。
+    """
     try:
         out = subprocess.run(
             ["xrandr", "--current"], env={**os.environ, "DISPLAY": display},
@@ -56,6 +63,30 @@ def _display_refresh_hz(display: str) -> float:
             except ValueError:
                 continue
     return 0.0
+
+
+# CPU ラスタライザの名前。glxinfo のレンダラ文字列にこれが出たら GPU ではない
+SOFTWARE_RENDERERS = ("llvmpipe", "softpipe", "swrast", "zink")
+
+
+def _display_renderer(display: str) -> str:
+    """そのディスプレイの GL レンダラ名。取得不能なら空文字。"""
+    try:
+        out = subprocess.run(
+            ["glxinfo", "-B"], env={**os.environ, "DISPLAY": display},
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in out.splitlines():
+        if "renderer string" in line.lower():
+            return line.split(":", 1)[-1].strip()
+    return ""
+
+
+def _is_software_renderer(renderer: str) -> bool:
+    low = renderer.lower()
+    return any(name in low for name in SOFTWARE_RENDERERS)
 
 
 # Unity Hub の実行ファイルの置き場。ここを前方一致で見るので、配信用の
@@ -161,10 +192,28 @@ class UnityLive:
                     f"Unity が約1fpsになりクラッシュします。"
                     f"`sudo bash setup/install_xorg.sh` を再実行してください"
                 )
+            # **ソケットがあるだけでは GPU の Xorg とは限らない。**
+            # :99 はこのサービスの予約番号だが、番号を予約する仕組みは無い。
+            # 2026-09-10 22:39 には Orca IDE が
+            # `Xvfb :99 -screen 0 1280x1024x24` を起こして先に取っており、
+            # glxgears は 5694fps（llvmpipe = CPU 描画）を返していた。
+            # このまま配信すると URP + VRM は 1.7fps しか出ない。
+            renderer = _display_renderer(LIVE_DISPLAY)
+            if _is_software_renderer(renderer):
+                raise RuntimeError(
+                    f"ディスプレイ {LIVE_DISPLAY} が CPU 描画です（{renderer}）。"
+                    f"GPU の Xorg ではなく Xvfb などが先に {LIVE_DISPLAY} を"
+                    f"取っています。`fuser -v /tmp/.X11-unix/X"
+                    f"{LIVE_DISPLAY.lstrip(':')}` で掴んでいるプロセスを確かめ、"
+                    f"それを止めてから "
+                    f"`sudo systemctl restart bottan-live-xorg` してください"
+                    f"（配信用の Xorg はデスクトップのセッションが GPU を"
+                    f"握っていると起動できません。その場合は再起動が要ります）")
             self.display = LIVE_DISPLAY
             self._cleanup_stale(remove_x_locks=False)
             print(f"[Unity] 既存ディスプレイを使います: "
-                  f"DISPLAY={self.display} refresh={refresh:.2f}Hz")
+                  f"DISPLAY={self.display} refresh={refresh:.2f}Hz "
+                  f"renderer={renderer or '不明'}")
         else:
             print("[Unity] 警告: Xvfb で起動します。GPU が使われないため配信品質は出ません")
             self._cleanup_stale(remove_x_locks=True)
@@ -233,6 +282,28 @@ class UnityLive:
         self.stop()
         raise RuntimeError(f"{ready_timeout:.0f}秒待っても LiveController が応答しません。"
                            f"ログ: {current_log_path}")
+
+    def measure_fps(self, probe_sec: float = 12.0) -> float:
+        """しばらく /status を叩いて、観測できた最大の fps を返す。0 なら測れていない。
+
+        **最大を採ること。** LiveController の fps は1秒窓の実測値で、
+        モーションの .vrma をメインスレッドでパースした直後などは一時的に
+        落ちる。平均や最小を見ると健全なホストでも閾値を割ってしまう。
+        ここで見分けたいのは「たまに落ちる」ではなく「そもそも出ていない」で、
+        絵が出ていないホストでは最大でも 2fps に届かない（2026-09-10 の実測）。
+
+        窓が閉じるまで fps は 0 のままなので、起動直後の1サンプルでは判定
+        できない。probe_sec のあいだ何度も見る。
+        """
+        best = 0.0
+        deadline = time.time() + probe_sec
+        while time.time() < deadline:
+            try:
+                best = max(best, float(unity_client.status().get("fps", 0.0)))
+            except (unity_client.UnityError, TypeError, ValueError):
+                pass
+            time.sleep(1.0)
+        return best
 
     def _cleanup_stale(self, remove_x_locks: bool = True) -> None:
         """前回の残骸を片付ける。

@@ -39,9 +39,11 @@ def load_live():
         BOT_MOOD_SERVE_LIMIT=1, FPS_LOG_SEC=60.0,
         LIVE_HEALTH_CHECK_SEC=60.0, LIVE_HEALTH_STALL_SEC=120.0,
         MEMORY_LOG_SEC=300.0,
+        LIVE_MIN_FPS=20.0, LIVE_FPS_PROBE_SEC=12.0,
+        LIVE_FPS_GATE=True, LIVE_FPS_STALL_SEC=180.0,
         LIVE_HISTORY_TURNS=6, LIVE_HISTORY_USER_TURNS=3, SKIP_ARDY=True,
         SUBTITLE_LEAD_SEC=0.0, UNITY_PROJECT="/tmp/unity",
-        UNITY_RESTART_MAX=2, UNITY_RESTART_TIMEOUT_SEC=120.0,
+        UNITY_RESTART_MAX=2, UNITY_RESTART_TIMEOUT_SEC=300.0,
         UNITY_RESTART_COOLDOWN_SEC=30.0,
         WORK_DIR=Path("/tmp/bottan-live-test"), ensure_dirs=lambda: None,
     )
@@ -78,6 +80,8 @@ def load_live():
             needs_lookup=lambda _text: False,
             lookup=lambda _q: {"status": "skip", "facts": "", "queries": []},
             warmup=lambda: None),
+        # log_gpu_state は nvidia-smi と ollama を叩く
+        "common.ardy": _stub("common.ardy", log_gpu_state=lambda *a: None),
     }
     previous = {key: sys.modules.get(key) for key in stubs}
     try:
@@ -308,6 +312,83 @@ class UnityRecoveryTest(unittest.TestCase):
             self.assertFalse(session._recover_unity(force=True))
         self.assertFalse(session._recover_unity(force=True))
         self.assertEqual(len(session.unity.started), live.UNITY_RESTART_MAX)
+
+
+class RenderGateTest(unittest.TestCase):
+    """絵が動いていないホストで live へ入らないこと。
+
+    2026-09-10 は 0.1〜1.9fps のまま14分配信した。unity.is_alive() も
+    xrandr のリフレッシュレートも OBS の出力フレーム数も素通りしている
+    （tests/test_render_gate.py の冒頭を参照）。
+    """
+
+    class FakeUnity:
+        def __init__(self, fps):
+            self.fps = fps
+            self.probed = []
+
+        def measure_fps(self, probe_sec):
+            self.probed.append(probe_sec)
+            return self.fps
+
+    def make_session(self, fps):
+        session = bare_session()
+        session.unity = self.FakeUnity(fps)
+        return session
+
+    def test_a_healthy_host_passes(self):
+        session = self.make_session(60.0)
+        self.assertEqual(session.check_render(), 60.0)
+        self.assertEqual(session.unity.probed, [live.LIVE_FPS_PROBE_SEC])
+
+    def test_a_stalled_host_stops_the_stream(self):
+        session = self.make_session(1.0)
+        with self.assertRaises(RuntimeError) as caught:
+            session.check_render()
+        # 復旧手順まで通知に載せる。人が見るのは Discord の1行だけ
+        self.assertIn("bottan-live-xorg", str(caught.exception))
+
+    def test_the_gate_can_be_turned_off(self):
+        session = self.make_session(1.0)
+        original = live.LIVE_FPS_GATE
+        live.LIVE_FPS_GATE = False
+        try:
+            self.assertEqual(session.check_render(), 1.0)
+        finally:
+            live.LIVE_FPS_GATE = original
+
+
+class LowFpsNoticeTest(unittest.TestCase):
+    """ゲートを抜けたあとに絵が止まったら、一度だけ知らせること。"""
+
+    def make_session(self):
+        session = bare_session()
+        session._fps_low_since = 0.0
+        session._fps_low_warned = False
+        return session
+
+    def test_a_brief_dip_is_not_reported(self):
+        session = self.make_session()
+        session._note_fps(1.0)
+        session._note_fps(60.0)
+        session._note_fps(1.0)
+        self.assertFalse(session._fps_low_warned)
+
+    def test_a_sustained_stall_is_reported_once(self):
+        session = self.make_session()
+        session._note_fps(1.0)
+        # 最初の記録から LIVE_FPS_STALL_SEC 経ったことにする
+        session._fps_low_since -= live.LIVE_FPS_STALL_SEC + 1
+        session._note_fps(1.0)
+        self.assertTrue(session._fps_low_warned)
+        session._note_fps(1.0)
+        self.assertTrue(session._fps_low_warned)
+
+    def test_recovery_clears_the_countdown(self):
+        session = self.make_session()
+        session._note_fps(1.0)
+        session._note_fps(60.0)
+        self.assertEqual(session._fps_low_since, 0.0)
 
 
 class FakeBroadcast:

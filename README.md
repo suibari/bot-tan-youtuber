@@ -127,11 +127,88 @@ sudo bash setup/install_xorg.sh
 確認:
 ```sh
 DISPLAY=:99 glxinfo -B | grep -i renderer   # NVIDIA GeForce ... と出れば成功
+DISPLAY=:99 glxgears                        # 60fps 前後が出れば成功
 ```
+
+**`glxinfo` が NVIDIA と答えても、絵が出ているとは限らない。** 表示経路だけが
+止まって、GL クライアントが全部 1fps に落ちることがある。2026-09-10 の配信は
+これで、最初から最後まで 0.1〜1.9fps の止まった絵を14分流している。
+
+このとき何が正常に見えていたか:
+
+| 見たもの | 出た値 | 実態 |
+|---|---|---|
+| `glxinfo -B` のレンダラ | NVIDIA GeForce RTX 5070 Ti | GL 自体は GPU に載っている |
+| `xrandr --current` | 59.95Hz | モードの公称値。スキャンアウトは止まっている |
+| `nvidia-smi` | Xid なし・クロック定格・スロットリングなし | GPU の計算は正常（ollama は普段どおり応答した） |
+| OBS の出力フレーム数 | 30fps・skip 89 | 止まった窓を正しくキャプチャし続ける |
+| Unity のプロセス | 生存 | `is_alive()` は真を返す |
+
+**切り分けは `glxgears` で行う。** `:99` でも `:0`（デスクトップ）でも 1〜2fps
+なら、Unity でも配信スクリプトでもなくホスト側の表示経路が停止している。
+
+```sh
+sudo systemctl restart bottan-live-xorg   # まずこれ。直らなければ再起動
+```
+
+この状態の Unity は `PresentContextGL` の中で abort する（`WindowGLES::EndRendering`
+→ NVIDIA ドライバ内で `SIGABRT`）。2026-09-10 は同じスタックで2回落ちた。
+配信スクリプト側は `LIVE_MIN_FPS` で live へ入る前に実測して止める。
 
 **`:99` はこのサービスの予約番号。** 他のプロセスに先に取られると Xorg が起動できず、
 `Restart=always` で永久にリトライする状態になる（実際に踏んだ）。
 `unity_live._start_xvfb` のフォールバック用 Xvfb は 120 番以降から探すようにしてある。
+
+**ただし番号を予約する仕組みは無い。** 2026-09-10 22:39 には Orca IDE が
+`Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp -terminate` を起こして先に取り、
+`bottan-live-xorg` が上がれなくなった。このとき `glxgears` は **5694fps** を返す。
+速い値が出るので一見よさそうに見えるが llvmpipe（CPU 描画）で、配信の
+URP + VRM では 1.7fps しか出ない。**レンダラ名まで見ること。**
+
+```sh
+fuser -v /tmp/.X11-unix/X99            # 誰が :99 を掴んでいるか
+DISPLAY=:99 glxinfo -B | grep -i renderer
+```
+
+`unity_live.start()` は llvmpipe / softpipe / swrast / zink を見つけたら起動を断る。
+
+**Orca IDE 側の対処。** `orca-ide serve` の表示番号 99 はバンドルに焼き込まれた
+定数で、環境変数でもフラグでも変えられない（`app.asar` 内の `M4=99`）。ただし
+**`DISPLAY` が設定されていて、その番号が生きていれば、Orca はそれを使って
+`:99` には一切触らない。** 逃げ道はここだけなので、専用の Xvfb を別番号で
+先に上げておく。
+
+```ini
+# ~/.config/systemd/user/orca-xvfb.service
+[Service]
+ExecStart=/usr/bin/Xvfb :97 -screen 0 1280x1024x24 -nolisten tcp
+Restart=always
+```
+
+```ini
+# ~/.config/systemd/user/orca-serve.service
+[Unit]
+Requires=orca-xvfb.service
+After=orca-xvfb.service
+[Service]
+Environment=DISPLAY=:97
+ExecStart=%h/.local/bin/orca-ide serve --pairing-address <アドレス>
+Restart=always
+```
+
+`-terminate` は付けないこと。Orca が自前で起こす Xvfb には付いているが、
+それだと Orca を再起動するたびに Xvfb が落ちて番号が空き、次の起動で
+`:99` を取りに行く余地ができる。ログインしていない間も走らせるなら
+`loginctl enable-linger suibari` も要る。
+
+**`DISPLAY` を渡さない場合、Orca は `:99` が生きていればそのクライアントとして
+入り込む。** Xvfb を起こさないので配信は 1fps にはならないが、Electron の窓が
+配信用ディスプレイに乗る。`:99` から追い出しておくほうが安全。
+
+**配信用の Xorg はデスクトップのセッションが動いている間は起動し直せない。**
+NVIDIA の X ドライバが `(EE) Failed to acquire modesetting permission` で
+初期化に失敗する。`:99` が上がれるのは GDM の Xorg より先に走る起動時だけなので、
+落ちたときの復旧手段は `systemctl restart` ではなく**再起動**。
 
 ### 3. OBS
 
@@ -501,6 +578,14 @@ curl localhost:2338/status
 | VOICEVOX | その回の発話を諦めて次へ。Discord に通知 |
 | Unity | 配信を終了する（映像が無いので続ける意味がない） |
 | 配信そのもの | **クロージングを省いて終了する。** YouTube の `lifeCycleStatus` が `complete`/`revoked` になるか、OBS の出力フレームが `LIVE_HEALTH_STALL_SEC` ぶん増えないと `LIVE_HEALTH_CHECK_SEC` ごとの点検が気づく |
+
+**live へ入る前だけは、絵が出ていなければ配信そのものを出さない。**
+`session.check_render()` が Unity の fps を `LIVE_FPS_PROBE_SEC` ぶん実測し、
+`LIVE_MIN_FPS`（既定20）に届かなければ例外を投げて枠を畳む。走り出したあとで
+止めない方針とは逆だが、まだ live へ入っていない枠に `complete` は飛ばないので
+損失は無く、止まった人形が1時間喋る配信を出すよりよい、という判断
+（`LIVE_FPS_GATE=false` で警告だけにできる）。live に入ったあとで落ちた場合は
+`LIVE_FPS_STALL_SEC` ぶん続いた時点で一度だけ Discord に流し、配信は続ける。
 
 配信そのものの死活を見ているのは 2026-09-09 の失敗を受けたもの。この日は
 21:08 に YouTube が配信を切ったのに、`run_loop` の終了条件が時刻と `_stopping`
