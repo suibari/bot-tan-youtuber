@@ -43,6 +43,7 @@ from config import (
     LIVE_END_HHMM, LIVE_GO_LIVE_RETRY_SEC, LIVE_START_HHMM, LIVE_TESTING_LEAD_SEC,
     BOT_CONTEXT_TTL_SEC, BOT_MOOD_SERVE_LIMIT, FPS_LOG_SEC,
     LIVE_HEALTH_CHECK_SEC, LIVE_HEALTH_STALL_SEC, MEMORY_LOG_SEC,
+    LIVE_MIN_FPS, LIVE_FPS_PROBE_SEC, LIVE_FPS_GATE, LIVE_FPS_STALL_SEC,
     LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
     SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT, UNITY_RESTART_MAX,
     UNITY_RESTART_TIMEOUT_SEC, UNITY_RESTART_COOLDOWN_SEC,
@@ -53,6 +54,9 @@ from config import (
 # **config より後に置くこと。** `python live/live.py` だと sys.path[0] が live/ に
 # なり、リポジトリのルートを sys.path へ足しているのは config（live/config.py:17-18）
 from common import grounding  # noqa: E402
+# live/motion.py が ArdyWorker として包んでいるのとは別の、素の共通モジュール。
+# GPU の様子を1行残す log_gpu_state を使う（_check_memory 参照）
+from common import ardy as common_ardy  # noqa: E402
 
 # LLM が落ちたときに使う定型。無言になるよりはよい
 FALLBACK_LINES = [
@@ -68,11 +72,31 @@ def _today_at(hhmm: str) -> datetime:
     return datetime.now().replace(hour=h, minute=m, second=0, microsecond=0)
 
 
-def _sleep_until(when: datetime, label: str) -> None:
+def _sleep_until(when: datetime, label: str, tick=None) -> None:
+    """指定時刻まで待つ。tick を渡すと数秒ごとに呼び、False を返したら打ち切る。
+
+    以前はここが素の time.sleep で、testing の15分前から丸ごと待っていた。
+    2026-09-10 は Unity が 20:58 に落ちたのに、この sleep が明けるまでの
+    3分間、死活監視も fps の記録も一切動いていない（ログにもその3分は
+    /emotion の接続拒否だけが並ぶ）。待っている間も雑務は回すこと。
+    """
     wait = (when - datetime.now()).total_seconds()
-    if wait > 0:
-        print(f"[live] {label} {wait:.0f} 秒待ちます")
+    if wait <= 0:
+        return
+    print(f"[live] {label} {wait:.0f} 秒待ちます")
+    if tick is None:
         time.sleep(wait)
+        return
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        time.sleep(max(0.0, min(2.0, deadline - time.monotonic())))
+        try:
+            if tick() is False:
+                print(f"[live] {label} の待機を打ち切ります")
+                return
+        except Exception as e:
+            # 待機中の雑務で配信の準備を止めない
+            print(f"[live] 待機中の点検に失敗（続行します）: {e}")
 
 
 class LiveSession:
@@ -113,6 +137,9 @@ class LiveSession:
         self._speech_started_at = 0.0
         # fps を最後に出した時刻
         self._fps_at = 0.0
+        # fps が LIVE_MIN_FPS を割り込んだ時刻と、通知済みか（_note_fps 参照）
+        self._fps_low_since = 0.0
+        self._fps_low_warned = False
         # botたんの状態のキャッシュ（_bot_context 参照）
         self._bot_cache = None
         self._bot_cache_at = 0.0
@@ -264,6 +291,10 @@ class LiveSession:
         """
         import obs as obs_mod
         print(f"[OBS] メモリ:\n{obs_mod.memory_note()}")
+        # GPU 側の同居相手も名指しで残す。common/ardy.py に前からある関数だが
+        # どこからも呼ばれておらず、2026-09-10 の配信ログには VRAM を誰が
+        # 使っているかの手掛かりが1行も無かった
+        common_ardy.log_gpu_state("[OBS]")
         warning = obs_mod.check_memory()
         if not warning:
             return
@@ -1082,10 +1113,12 @@ class LiveSession:
             self._fps_at = time.monotonic()
             try:
                 st = unity_client.status()
-                print(f"[Unity] fps={st.get('fps', 0):.1f} "
+                fps = float(st.get("fps", 0) or 0.0)
+                print(f"[Unity] fps={fps:.1f} "
                       f"motion={st.get('motion_queue', 0)} "
                       f"rss={self.unity.rss_mb():.0f}MB")
-            except unity_client.UnityError:
+                self._note_fps(fps)
+            except (unity_client.UnityError, TypeError, ValueError):
                 pass
 
         if not self.unity.is_alive():
@@ -1093,6 +1126,54 @@ class LiveSession:
             if not self._recover_unity() and self._unity_restart_count >= UNITY_RESTART_MAX:
                 notify.error("Unity", "自動復旧回数を使い切ったため配信を終了します")
                 self._stopping = True
+
+    def _note_fps(self, fps: float) -> None:
+        """fps の記録を受けて、絵が止まりっぱなしなら一度だけ通知する。
+
+        止めはしない。ここまで来ていれば枠は live に入っていて、視聴者から
+        見れば止まった絵でも配信は続いている。**この状態を止めるのは
+        配信前のゲート（run_live 前の check_render）の役目。** ここは
+        「ゲートを抜けたあとに落ちた」場合に人へ知らせるためだけにある。
+        """
+        if LIVE_MIN_FPS <= 0:
+            return
+        now = time.monotonic()
+        if fps >= LIVE_MIN_FPS:
+            self._fps_low_since = 0.0
+            return
+        if self._fps_low_since == 0.0:
+            self._fps_low_since = now
+            return
+        if self._fps_low_warned or now - self._fps_low_since < LIVE_FPS_STALL_SEC:
+            return
+        self._fps_low_warned = True
+        notify.error("描画", f"Unity の描画が {now - self._fps_low_since:.0f}秒 "
+                             f"{fps:.1f}fps のままです（目安 {LIVE_MIN_FPS:.0f}fps）。"
+                             f"止まった絵が配信に出ています。"
+                             f"ホストの表示経路が停止している可能性があります"
+                             f"（`DISPLAY=:99 glxgears` で確認、"
+                             f"`sudo systemctl restart bottan-live-xorg` で復旧）")
+
+    def check_render(self) -> float:
+        """絵が実際に動いているかを実測し、fps を返す。
+
+        LIVE_FPS_GATE が真で閾値に届かなければ例外を投げる。呼び出し側が
+        go_live の前に呼ぶこと。teardown は live へ行っていない枠に
+        complete を投げないので、ここで落とせば枠は畳まれる。
+        """
+        fps = self.unity.measure_fps(LIVE_FPS_PROBE_SEC)
+        print(f"[Unity] 描画の実測: {fps:.1f}fps（目安 {LIVE_MIN_FPS:.0f}fps）")
+        if LIVE_MIN_FPS <= 0 or fps >= LIVE_MIN_FPS:
+            return fps
+        msg = (f"Unity の描画が {fps:.1f}fps しか出ていません"
+               f"（目安 {LIVE_MIN_FPS:.0f}fps）。ホストの表示経路が停止しています。"
+               f"`DISPLAY=:99 glxgears` で1〜2fps なら "
+               f"`sudo systemctl restart bottan-live-xorg` で復旧してください")
+        if not LIVE_FPS_GATE:
+            print(f"[Unity] 警告: {msg}")
+            notify.warn(msg)
+            return fps
+        raise RuntimeError(msg)
 
     def _recover_unity(self, force: bool = False) -> bool:
         """落ちた Unity を再起動し、OBS のキャプチャ先も新しい窓へ張り直す。"""
@@ -1180,6 +1261,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
+    def waiting_tick():
+        """待機中の雑務。復旧の見込みが無くなったら False を返して待機を切る。"""
+        session._housekeeping()
+        return not session._stopping
+
     try:
         session.prepare()
         session.connect_obs()
@@ -1188,11 +1274,18 @@ def main() -> int:
         # 開始の少し前に testing まで入れておき、21:00 ちょうどに live へ入る
         start_at = _today_at(LIVE_START_HHMM)
         _sleep_until(start_at - timedelta(seconds=LIVE_TESTING_LEAD_SEC),
-                     "testing へ入るまで")
+                     "testing へ入るまで", tick=waiting_tick)
         # 準備完了から開始までの待機中にも Unity は落ち得る。
         if not session._recover_unity(force=True):
             raise RuntimeError("配信開始前に Unity を復旧できません")
         session.start_testing()
+
+        # 絵が動いているかを実測する。ここまでの点検は「Unity のプロセスが
+        # 居るか」と「xrandr が 60Hz と答えるか」しか見ておらず、2026-09-10 は
+        # 両方素通りしたうえで 0.1〜1.9fps の止まった絵を14分流している
+        # （LIVE_MIN_FPS の解説を参照）。実測には LIVE_FPS_PROBE_SEC かかるので、
+        # go_live の直前ではなく余裕のある testing のうちに済ませる
+        session.check_render()
 
         # health_check() は ARDY・Unity の読み込み前なうえ /speakers しか
         # 叩かない。その後に VOICEVOX が swap へ追い出されると、第一声の
@@ -1204,7 +1297,7 @@ def main() -> int:
             # ウォームアップ失敗だけで配信を中止しない。詳細は
             # _post_with_retry が I/O PSI とともに残す。
             print(f"[VOICEVOX] 配信前ウォームアップ失敗（続行します）: {e}")
-        _sleep_until(start_at, "配信開始まで")
+        _sleep_until(start_at, "配信開始まで", tick=waiting_tick)
 
         if not session._recover_unity(force=True):
             raise RuntimeError("live 遷移直前に Unity を復旧できません")

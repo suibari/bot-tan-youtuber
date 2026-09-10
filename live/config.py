@@ -69,7 +69,11 @@ LIVE_PORT     = env_int("LIVE_PORT", 2338)
 UNITY_URL     = f"http://127.0.0.1:{LIVE_PORT}"
 # Editor が配信中に落ちても YouTube/OBS まで終了させず、同じ配信の中で起こし直す。
 UNITY_RESTART_MAX = env_int("UNITY_RESTART_MAX", 2)
-UNITY_RESTART_TIMEOUT_SEC = env_float("UNITY_RESTART_TIMEOUT_SEC", 120.0)
+# 初回の起動は ready_timeout=420 で待つのに、復旧だけ 120 だった。
+# 2026-09-10 の3回目の復旧は Editor がシーンを読み終えた直後に打ち切られている
+# （ログには "Loaded scene 'Assets/Scenes/SampleScene.unity'" まで出ていた）。
+# ホストが swap で重いときほど復旧が要るのに、そのときほど起動は遅い。
+UNITY_RESTART_TIMEOUT_SEC = env_float("UNITY_RESTART_TIMEOUT_SEC", 300.0)
 UNITY_RESTART_COOLDOWN_SEC = env_float("UNITY_RESTART_COOLDOWN_SEC", 30.0)
 
 # ── 音声の経路 ────────────────────────────────────
@@ -240,6 +244,33 @@ ENERGY_REFRESH_SEC = env_int("ENERGY_REFRESH_SEC", 30)
 # Unity の fps をログへ残す間隔[秒]。0 以下で無効。
 # Editor 常駐のメモリ増加と、モーション投入によるフレーム落ちの監視を兼ねる
 FPS_LOG_SEC = env_float("FPS_LOG_SEC", 60.0)
+
+# ── 描画が出ているかの判定 ────────────────────────
+# これを下回ったら「絵が動いていない」とみなす[fps]。
+#
+# 2026-09-10 の配信は最初から最後まで 0.1〜1.9fps で、視聴者からは
+# 止まった人形が喋っているだけに見えていた。fps は FPS_LOG_SEC ごとに
+# ログへ出ていたが、それを見て何かする経路がどこにも無かった。
+#
+# 原因は Unity でも配信スクリプトでもなく、ホストの NVIDIA ドライバの
+# 表示経路が停止していたこと。同時刻に :99 でも :0 でも glxgears が
+# 1.0〜1.4fps しか出ず、GPU 使用率は 0%、GPU の計算そのものは正常だった。
+# この状態の Unity は PresentContextGL で abort する（同じスタックで2回）。
+#
+# **xrandr のリフレッシュレートではこれを検出できない。** モードの公称値を
+# 返すだけなので、実際のスキャンアウトが止まっていても 59.95Hz と答える
+# （_display_refresh_hz の点検は当日も素通りしている）。実測するしかない。
+LIVE_MIN_FPS = env_float("LIVE_MIN_FPS", 20.0)
+# 配信前に fps を実測する時間[秒]。Unity の fps は1秒窓の実測値なので、
+# 窓が数回閉じるだけの長さを取る
+LIVE_FPS_PROBE_SEC = env_float("LIVE_FPS_PROBE_SEC", 12.0)
+# 実測が LIVE_MIN_FPS に届かないとき live へ遷移せず配信を中止する。
+# 止まった絵を1時間流すより出さないほうがよい、という判断。
+# false にすると警告だけ出して配信する
+LIVE_FPS_GATE = env_flag("LIVE_FPS_GATE", True)
+# 配信中に fps が LIVE_MIN_FPS を下回ったまま何秒続いたら通知するか。
+# モーションを投げた直後の一時的な落ち込みで鳴らさないよう長めに取る
+LIVE_FPS_STALL_SEC = env_float("LIVE_FPS_STALL_SEC", 180.0)
 
 # 配信がまだ生きているかを確かめる間隔[秒]。0 以下で無効。
 # 2026-09-09 は 21:08 に YouTube が enableAutoStop で枠を閉じたのに、
