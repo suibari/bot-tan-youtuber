@@ -53,9 +53,14 @@ install_unit() {
 for u in bottan-pipeline.service bottan-pipeline.timer \
          bottan-quiz.service bottan-quiz.timer \
          bottan-live-prepare.service bottan-live-prepare.timer \
+         bottan-live-display.service \
          bottan-live.service bottan-live.timer; do
     install_unit "$u"
 done
+
+# 準備ユニットが呼ぶ。リポジトリの中に置いたまま実行するので、実行ビットが
+# 落ちていると配信が始まらない（git は実行ビットを持つが、zip 展開などで落ちる）
+chmod 0755 "$INSTALL_DIR/setup/reset_display.sh"
 
 systemctl daemon-reload
 
@@ -84,7 +89,9 @@ if [ ! -f "$SYSCTL_DROPIN" ] || ! diff -q "$HERE/99-bottan-live.conf" "$SYSCTL_D
     echo "  配置: $(basename "$SYSCTL_DROPIN")"
 fi
 
-# ライブ配信は GPU 仮想ディスプレイが要る。入っていなければ警告だけ出す
+# ライブ配信は GPU 仮想ディスプレイが要る。入っていなければ警告だけ出す。
+# bottan-live.service は bottan-live-display.service を Requires= しており、
+# あちらが Xorg を作り直すので、Xorg のユニットが無いと配信は始まらない
 if [ ! -f /etc/systemd/system/bottan-live-xorg.service ]; then
     echo
     echo "警告: bottan-live-xorg.service がありません。" >&2

@@ -44,7 +44,8 @@ def _display_refresh_hz(display: str) -> float:
     **これは「絵が出ている」ことの保証にはならない。** 返るのはモードの
     公称値で、実際のスキャンアウトが止まっていても 59.95 と答える。
     2026-09-10 の配信ではこの点検が 59.95Hz で素通りしたまま、同じ
-    ディスプレイの glxgears が 1.0〜1.4fps しか出ていなかった。
+    ディスプレイの glxgears が 1.0〜1.4fps しか出ていなかった
+    （:99 が gdm より先に起動していて、描画から締め出されていた）。
     実際に描けているかは UnityLive.measure_fps で実測すること。
     """
     try:
@@ -173,6 +174,15 @@ class UnityLive:
         env = os.environ.copy()
         env.pop("XAUTHORITY", None)          # 仮想ディスプレイには不要
 
+        # **配信用ディスプレイには表示クロックが無い（NoScanout）。**
+        # vblank を待たせると、GPU が描けていても待ちっぱなしで 1fps に見える。
+        # 8/31 の a109cff はこの 1fps を「NoScanout では描けない」と読んで
+        # ダミーEDIDの実スキャンアウトへ切り替えたが、それはデスクトップの
+        # Xorg と DRM master を奪い合う構成で、9/10 と 9/11 の配信事故を生んだ。
+        # スキャンアウトを持たないまま vsync を切るほうが、GPU も1枚で足りる。
+        # 詳細は setup/xorg-bottan-live.conf の Screen セクション。
+        env["__GL_SYNC_TO_VBLANK"] = "0"
+
         if LIVE_DISPLAY:
             # setup/install_xorg.sh が用意した GPU 付き仮想ディスプレイに相乗りする。
             # 自分で起こしたものではないので、停止時に後始末してはいけない
@@ -184,14 +194,13 @@ class UnityLive:
                     f"LIVE_DISPLAY='' にして Xvfb にフォールバックしてください"
                     f"（Xvfb は GPU を使えないため 1.7fps しか出ません）"
                 )
+            # 表示クロックはログに残すだけで、門にはしない。
+            # NoScanout の :99 には現在モードが無いのが正常で、ここは 0.00Hz に
+            # なる。そもそも xrandr が返すのはモードの公称値で、絵が出ている
+            # 保証にならない（_display_refresh_hz の docstring 参照）。
+            # 実際に描けているかは live 遷移前の measure_fps と LIVE_MIN_FPS、
+            # および setup/reset_display.sh の glxgears 実測で見る。
             refresh = _display_refresh_hz(LIVE_DISPLAY)
-            if refresh < 30.0:
-                raise RuntimeError(
-                    f"ディスプレイ {LIVE_DISPLAY} に有効な表示クロックがありません "
-                    f"({refresh:.2f}Hz)。NoScanout/CurrentMetaMode=NULL のままでは "
-                    f"Unity が約1fpsになりクラッシュします。"
-                    f"`sudo bash setup/install_xorg.sh` を再実行してください"
-                )
             # **ソケットがあるだけでは GPU の Xorg とは限らない。**
             # :99 はこのサービスの予約番号だが、番号を予約する仕組みは無い。
             # 2026-09-10 22:39 には Orca IDE が

@@ -1,8 +1,18 @@
 [Unit]
 Description=botたん YouTube ライブ配信 (21:00-22:00)
-# 映像は GPU 仮想ディスプレイの上に出すので、先に上がっている必要がある
-Requires=bottan-live-xorg.service
-After=bottan-live-xorg.service network-online.target
+# 映像は GPU 仮想ディスプレイの上に出すので、先に上がっている必要がある。
+# 引くのは Xorg そのものではなく bottan-live-display.service のほう。あちらが
+# 毎晩 Xorg を作り直し、glxgears で実際に描けることを確かめてから通す。
+#
+# **bottan-live-xorg.service を直接 Requires= しないこと。** 準備ユニットが
+# その Xorg を restart するので、依存として宣言していると systemd が
+# 「依存先が明示的に停止された」とみなして配信ユニットごと巻き添えで落とす。
+#
+# 長く上げっぱなしの Xorg は、あるとき表示経路だけが止まる（2026-09-10 の配信は
+# 0.1〜1.9fps の止まった絵を14分流した）。原因は未特定なので作り直しで避ける。
+# 準備が通らなければ配信は始まらない。詳細は setup/reset_display.sh
+Requires=bottan-live-display.service
+After=bottan-live-display.service network-online.target
 Wants=network-online.target
 # 画像生成サイドカー（bot-tan-imagegen）は配信中に使わないので退かす。
 # あちらは常駐でアイドル時に解放しても RSS 約1.9GB を掴んだままで、

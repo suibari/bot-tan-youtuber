@@ -33,28 +33,13 @@ if [ ! -f /usr/lib/x86_64-linux-gnu/nvidia/xorg/nvidia_drv.so ]; then
     exit 1
 fi
 
-# NoScanout (UseDisplayDevice=None) では NVIDIA 595.84 + RTX 5070 Ti の
-# Unity Editor が約1fpsになり、OpenGL present 中に abort した。接続中の実モニタから
-# EDIDを保存し、xorg-bottan-live.conf が未使用端子 DFP-1 のダミー表示として読む。
-# /sys の card番号は起動ごとに変わり得るので決め打ちしない。
-EDID_SOURCE=""
-for STATUS_FILE in /sys/class/drm/card*-*/status; do
-    [ -r "$STATUS_FILE" ] || continue
-    [ "$(tr -d '\n' < "$STATUS_FILE")" = "connected" ] || continue
-    CANDIDATE="$(dirname "$STATUS_FILE")/edid"
-    [ -r "$CANDIDATE" ] || continue
-    EDID_SIZE="$(wc -c < "$CANDIDATE")"
-    if [ "$EDID_SIZE" -ge 128 ]; then
-        EDID_SOURCE="$CANDIDATE"
-        break
-    fi
-done
-if [ -z "$EDID_SOURCE" ]; then
-    echo "接続中モニターのEDIDを取得できません。モニターを接続して再実行してください。" >&2
-    exit 1
-fi
-install -m 0644 "$EDID_SOURCE" /etc/X11/bottan-live.edid
-echo "EDIDを保存しました: $EDID_SOURCE -> /etc/X11/bottan-live.edid"
+# 8/31〜9/11 はここで実モニタの EDID を保存し、未使用端子 DFP-1 のダミー表示として
+# 読ませていた。5070 Ti の NoScanout が約1fpsになるのを避けるためだったが、
+# 実スキャンアウトを持つと :99 が DRM master を要求するようになり、同じ GPU を
+# 使うデスクトップの Xorg と奪い合って配信事故になった（9/10・9/11）。
+# 1fps の正体は vsync 待ちで、NoScanout のまま __GL_SYNC_TO_VBLANK=0 を渡せば
+# 済む。EDID はもう要らない。残っていても読まれないが、掃除しておく
+rm -f /etc/X11/bottan-live.edid
 
 install -m 0644 "$HERE/xorg-bottan-live.conf" /etc/X11/xorg-bottan-live.conf
 install -m 0644 "$HERE/bottan-live-xorg.service" /etc/systemd/system/bottan-live-xorg.service
@@ -71,14 +56,26 @@ for i in $(seq 1 20); do
         echo "OK: DISPLAY=:99 が使えます"
         DISPLAY=:99 glxinfo -B 2>/dev/null | grep -i "renderer" || true
 
-        # ソケットがあっても CurrentMetaMode=NULL の NoScanout では表示クロックがなく、
-        # Unity Editor は約1fpsになる。実際に現在モードへ * が付いていることを確認する。
-        if ! DISPLAY=:99 xrandr --current | grep -Eq '[0-9]+\.[0-9]+\*'; then
-            echo "DISPLAY=:99 に有効なリフレッシュレートがありません。" >&2
-            echo "Xorgログで CustomEDID / MetaModes を確認してください。" >&2
+        # **xrandr では確かめない。** NoScanout の :99 に現在モードが無いのは正常で、
+        # そもそも xrandr が返すのはモードの公称値だから絵が出ている保証にならない
+        # （9/10 の配信では 59.95Hz と答えたまま 1.9fps だった）。実測する。
+        #
+        # __GL_SYNC_TO_VBLANK=0 を落とさないこと。表示クロックが無いので、
+        # vblank を待つと描けていても 1fps を返す。配信の Unity にも
+        # live/unity_live.py が同じ値を渡している
+        PROBE_LOG="$(mktemp)"
+        runuser -u "${SUDO_USER:-$USER}" -- \
+            env DISPLAY=:99 __GL_SYNC_TO_VBLANK=0 \
+            timeout 12 stdbuf -o0 glxgears > "$PROBE_LOG" 2>/dev/null || true
+        FPS="$(awk '/FPS/ { v = $(NF-1) } END { printf "%.1f", v + 0 }' "$PROBE_LOG")"
+        rm -f "$PROBE_LOG"
+        if awk "BEGIN { exit !($FPS < 20) }"; then
+            echo "DISPLAY=:99 の描画が ${FPS}fps しか出ていません（目安 20fps）。" >&2
+            echo "  /var/log/Xorg.99.log に Failed to acquire modesetting permission が" >&2
+            echo "  出ていれば、デスクトップの Xorg と GPU を奪い合っています。" >&2
             exit 1
         fi
-        DISPLAY=:99 xrandr --current | grep -E '[0-9]+x[0-9]+.*\*' | head -1
+        echo "OK: 描画の実測 ${FPS}fps"
 
         # ウィンドウマネージャ。OBS の XComposite ウィンドウキャプチャは
         # EWMH 準拠の WM が居ないとプラグインごと無効化される（ソース追加の

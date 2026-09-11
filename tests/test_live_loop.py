@@ -40,7 +40,7 @@ def load_live():
         LIVE_HEALTH_CHECK_SEC=60.0, LIVE_HEALTH_STALL_SEC=120.0,
         MEMORY_LOG_SEC=300.0,
         LIVE_MIN_FPS=20.0, LIVE_FPS_PROBE_SEC=12.0,
-        LIVE_FPS_GATE=True, LIVE_FPS_STALL_SEC=180.0,
+        LIVE_FPS_GATE=True, LIVE_FPS_STALL_SEC=180.0, LIVE_DISPLAY=":99",
         LIVE_HISTORY_TURNS=6, LIVE_HISTORY_USER_TURNS=3, SKIP_ARDY=True,
         SUBTITLE_LEAD_SEC=0.0, UNITY_PROJECT="/tmp/unity",
         UNITY_RESTART_MAX=2, UNITY_RESTART_TIMEOUT_SEC=300.0,
@@ -345,8 +345,13 @@ class RenderGateTest(unittest.TestCase):
         session = self.make_session(1.0)
         with self.assertRaises(RuntimeError) as caught:
             session.check_render()
-        # 復旧手順まで通知に載せる。人が見るのは Discord の1行だけ
-        self.assertIn("bottan-live-xorg", str(caught.exception))
+        # 復旧手順まで通知に載せる。人が見るのは Discord の1行だけ。
+        # 復旧は :99 の作り直しで、その係は reset_display.sh（Xorg と openbox の
+        # 両方を入れ直し、実測まで見る）。__GL_SYNC_TO_VBLANK も必ず添えること。
+        # これを落として測ると健全なホストでも 1fps に見え、切り分けが振り出しに戻る
+        message = str(caught.exception)
+        self.assertIn("reset_display.sh", message)
+        self.assertIn("__GL_SYNC_TO_VBLANK=0", message)
 
     def test_the_gate_can_be_turned_off(self):
         session = self.make_session(1.0)

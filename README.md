@@ -127,29 +127,62 @@ sudo bash setup/install_xorg.sh
 確認:
 ```sh
 DISPLAY=:99 glxinfo -B | grep -i renderer   # NVIDIA GeForce ... と出れば成功
-DISPLAY=:99 glxgears                        # 60fps 前後が出れば成功
+# 数千〜数万 fps 出れば成功。__GL_SYNC_TO_VBLANK=0 を落とすと 1fps に見える
+DISPLAY=:99 __GL_SYNC_TO_VBLANK=0 timeout 12 stdbuf -o0 glxgears
 ```
 
-**`glxinfo` が NVIDIA と答えても、絵が出ているとは限らない。** 表示経路だけが
-止まって、GL クライアントが全部 1fps に落ちることがある。2026-09-10 の配信は
-これで、最初から最後まで 0.1〜1.9fps の止まった絵を14分流している。
+**`glxinfo` が NVIDIA と答えても、絵が出ているとは限らない。** レンダラも GL
+コンテキストも正常なまま、GL クライアントだけが 1fps に落ちることがある。
+2026-09-10 の配信はこれで、最初から最後まで 0.1〜1.9fps の止まった絵を14分流している。
 
 このとき何が正常に見えていたか:
 
 | 見たもの | 出た値 | 実態 |
 |---|---|---|
 | `glxinfo -B` のレンダラ | NVIDIA GeForce RTX 5070 Ti | GL 自体は GPU に載っている |
-| `xrandr --current` | 59.95Hz | モードの公称値。スキャンアウトは止まっている |
-| `nvidia-smi` | Xid なし・クロック定格・スロットリングなし | GPU の計算は正常（ollama は普段どおり応答した） |
+| `xrandr --current` | 59.95Hz | モードの公称値。絵が出ている保証にならない |
+| `nvidia-smi` | Xid なし・クロック定格・スロットリングなし | GPU の計算は正常 |
 | OBS の出力フレーム数 | 30fps・skip 89 | 止まった窓を正しくキャプチャし続ける |
 | Unity のプロセス | 生存 | `is_alive()` は真を返す |
 
-**切り分けは `glxgears` で行う。** `:99` でも `:0`（デスクトップ）でも 1〜2fps
-なら、Unity でも配信スクリプトでもなくホスト側の表示経路が停止している。
+**原因は「GPU が1枚しかないのに X サーバが2つある」こと。** `:99` は gdm より後に
+起動していないと描画を締め出され、GPU が空いていても 1.0fps に張り付く。
+2026-09-11 の実測:
+
+| 条件 | `:99` の glxgears |
+|---|---|
+| gdm 停止 | 56,142fps |
+| gdm 起動・`:99` は gdm より前に起動 | 1.0fps |
+| gdm 起動・`:99` を gdm の後に作り直す | 59,485fps |
+
+起動順は保証できない（`bottan-live-xorg` も gdm も `multi-user.target`）。だから
+配信の直前に必ず作り直す。`bottan-live-display.service` が `setup/reset_display.sh` を
+呼び、`:99` を入れ直して実測してから配信へ通す。手で直すときも同じ。
 
 ```sh
-sudo systemctl restart bottan-live-xorg   # まずこれ。直らなければ再起動
+sudo bash setup/reset_display.sh          # 作り直して実測まで見る
+sudo systemctl restart bottan-live-xorg   # 最小限でよければこれだけ
 ```
+
+**`__GL_SYNC_TO_VBLANK=0` を落とさないこと。** `:99` は NoScanout で表示クロックを
+持たないので、vblank を待つ GL クライアントは描けていても 1fps を返す。手で測るときも
+必ず渡す。Unity には `live/unity_live.py` が渡している。
+
+```sh
+DISPLAY=:99 __GL_SYNC_TO_VBLANK=0 timeout 12 stdbuf -o0 glxgears
+```
+
+**`:0`（デスクトップ）の fps は判定に使わないこと。** ロックされた X11 セッションの
+GL は正常時も進まない。`:99` が 60fps で健全なときに `:0` は13秒で1フレームも
+進まず、`loginctl` は `Active=no LockedHint=yes` を返していた。無人運用の 21:00 に
+画面はロックされているので、`:0` は常に遅く出る。
+
+**`nvidia-smi` の瞬間値ではなく `nvidia-smi pmon` で見ること。** ollama が SM を
+87〜92% 使っている時間帯があり、そのあいだは描画が本当に締め出される。
+`utilization.gpu` の1サンプルでは掴めない。
+
+切り分けの全文と、潰した仮説の一覧は
+`docs/investigations/2026-09-11-display-starvation.md`。
 
 この状態の Unity は `PresentContextGL` の中で abort する（`WindowGLES::EndRendering`
 → NVIDIA ドライバ内で `SIGABRT`）。2026-09-10 は同じスタックで2回落ちた。

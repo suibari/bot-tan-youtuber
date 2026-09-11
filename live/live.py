@@ -44,6 +44,7 @@ from config import (
     BOT_CONTEXT_TTL_SEC, BOT_MOOD_SERVE_LIMIT, FPS_LOG_SEC,
     LIVE_HEALTH_CHECK_SEC, LIVE_HEALTH_STALL_SEC, MEMORY_LOG_SEC,
     LIVE_MIN_FPS, LIVE_FPS_PROBE_SEC, LIVE_FPS_GATE, LIVE_FPS_STALL_SEC,
+    LIVE_DISPLAY,
     LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
     SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT, UNITY_RESTART_MAX,
     UNITY_RESTART_TIMEOUT_SEC, UNITY_RESTART_COOLDOWN_SEC,
@@ -1150,9 +1151,11 @@ class LiveSession:
         notify.error("描画", f"Unity の描画が {now - self._fps_low_since:.0f}秒 "
                              f"{fps:.1f}fps のままです（目安 {LIVE_MIN_FPS:.0f}fps）。"
                              f"止まった絵が配信に出ています。"
-                             f"ホストの表示経路が停止している可能性があります"
-                             f"（`DISPLAY=:99 glxgears` で確認、"
-                             f"`sudo systemctl restart bottan-live-xorg` で復旧）")
+                             f"{LIVE_DISPLAY or ':99'} が描画から締め出された可能性が"
+                             f"あります（確認: "
+                             f"`DISPLAY={LIVE_DISPLAY or ':99'} __GL_SYNC_TO_VBLANK=0 "
+                             f"timeout 12 stdbuf -o0 glxgears`、"
+                             f"復旧: `sudo bash setup/reset_display.sh`）")
 
     def check_render(self) -> float:
         """絵が実際に動いているかを実測し、fps を返す。
@@ -1166,9 +1169,12 @@ class LiveSession:
         if LIVE_MIN_FPS <= 0 or fps >= LIVE_MIN_FPS:
             return fps
         msg = (f"Unity の描画が {fps:.1f}fps しか出ていません"
-               f"（目安 {LIVE_MIN_FPS:.0f}fps）。ホストの表示経路が停止しています。"
-               f"`DISPLAY=:99 glxgears` で1〜2fps なら "
-               f"`sudo systemctl restart bottan-live-xorg` で復旧してください")
+               f"（目安 {LIVE_MIN_FPS:.0f}fps）。"
+               f"{LIVE_DISPLAY or ':99'} が描画から締め出されています。"
+               f"`sudo bash setup/reset_display.sh` で作り直してください。"
+               f"手で測るときは `DISPLAY={LIVE_DISPLAY or ':99'} "
+               f"__GL_SYNC_TO_VBLANK=0 timeout 12 stdbuf -o0 glxgears`"
+               f"（この環境変数を落とすと健全でも 1fps に見えます）")
         if not LIVE_FPS_GATE:
             print(f"[Unity] 警告: {msg}")
             notify.warn(msg)

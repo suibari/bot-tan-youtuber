@@ -1,0 +1,27 @@
+[Unit]
+Description=botたんライブ配信用 仮想ディスプレイの作り直しと点検
+Documentation=https://github.com/suibari
+# 配信の直前に走らせる。bottan-live.service からは Requires= で引かれるので、
+# ここが失敗すれば配信は始まらない（止まった絵を1時間流すより出さないほうがよい）
+Before=bottan-live.service
+
+# **bottan-live-xorg.service への Requires= も After= も書かないこと。**
+# このユニットは Xorg を自分で restart する。依存として宣言してしまうと、
+# systemd が「依存先が明示的に停止された」とみなして、こちらの起動ジョブごと
+# 巻き添えで落とす経路がある。起動の保証は restart そのものが与える
+# （restart は止まっているユニットも起動する）。
+
+[Service]
+Type=oneshot
+# Xorg と openbox を systemctl で入れ直すので root で走る。
+# 配信本体は User=__USER__ のままで、こちらに sudoers は要らない
+User=root
+WorkingDirectory=__INSTALL_DIR__
+# 点検の glxinfo / glxgears は配信と同じユーザーで走らせる（runuser）。
+# root で X に繋げても Unity が繋げるとは限らない
+Environment=BOTTAN_USER=__USER__
+ExecStart=__INSTALL_DIR__/setup/reset_display.sh
+# Xorg の再起動 30秒 + openbox + 点検 12秒 に余裕を足す
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
