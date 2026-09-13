@@ -14,19 +14,27 @@ Description=botたん YouTube ライブ配信 (21:00-22:00)
 Requires=bottan-live-display.service
 After=bottan-live-display.service network-online.target
 Wants=network-online.target
-# 画像生成サイドカー（bot-tan-imagegen）は配信中に使わないので退かす。
-# あちらは常駐でアイドル時に解放しても RSS 約1.9GB を掴んだままで、
-# 2026-09-09 の配信では 543MB＋swap 1.0GB を占めていた。ホストは 31GB しか
-# 無く、ollama(9.4GB)・ARDY・Unity・OBS・VOICEVOX が同居して commit が
-# RAM+swap の 110% に達し、OBS の送出が止まって YouTube に配信を切られた。
-# Conflicts= は「こちらが起動したら向こうを止める」。戻すのは ExecStopPost。
-Conflicts=imagegen.service
+# 画像生成サイドカー（bot-tan-imagegen）の退避は ExecStartPre/ExecStopPost で行う。
+#
+# **Conflicts=imagegen.service を書かないこと。** Conflicts は「起動ジョブが入った
+# 時点」で相手を止めるのに、戻す ExecStopPost は「サービスが実際に動いて終わったとき」
+# にしか走らない。依存が失敗して start がキャンセルされると、止めただけで戻らない。
+# 2026-09-13、残留 OBS で bottan-live-display.service が落ちて配信は始まらなかったのに
+# サイドカーだけ止まり、23:05 のおやすみポストが ECONNREFUSED で絵なしになった。
+# ExecStartPre なら依存を満たした後にしか走らないので、この経路が消える。
 
 [Service]
 Type=oneshot
 User=__USER__
 Group=__USER__
 WorkingDirectory=__INSTALL_DIR__
+# 配信中はサイドカーを退かす。あちらは常駐でアイドル時に解放しても RSS 約1.9GB を
+# 掴んだままで、2026-09-09 の配信では 543MB＋swap 1.0GB を占めていた。ホストは 31GB
+# しか無く、ollama(9.4GB)・ARDY・Unity・OBS・VOICEVOX が同居して commit が RAM+swap の
+# 110% に達し、OBS の送出が止まって YouTube に配信を切られた。
+# `+` は root 実行、`-` は失敗を無視。imagegen を入れていない環境（dev の worktree
+# など）でこの systemctl が失敗しても、配信そのものは止めない。
+ExecStartPre=-+/usr/bin/systemctl stop imagegen.service
 ExecStart=__INSTALL_DIR__/run_live.sh
 # flatpak の OBS は、セッションバス越しでないと PulseAudio へ橋を架けられない。
 # systemd から起動すると DBUS_SESSION_BUS_ADDRESS が無いので
@@ -39,8 +47,16 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/__UID__/bus
 TimeoutStartSec=6000
 # 配信が落ちたら自動で上げ直さない。中途半端な時刻に配信枠が増えるほうが困る
 Restart=no
-# Conflicts= で止めた画像生成サイドカーを戻す。`+` を付けると User= に関係なく
-# root で走るので、suibari に systemctl の sudoers を書かなくて済む。
+# ExecStopPost は ExecStartPre が失敗したときも走る。止めたサイドカーを戻す経路が
+# ここに揃っているので、途中でどう転んでも復帰する。
+#
+# 配信で立てた OBS と Unity を先に落とす。flatpak の OBS はセッションバス越しに
+# 起動するのでこのユニットの cgroup の外に出る。放っておくと翌晩まで残り、
+# reset_display.sh のガードに引っかかって配信が始まらない（詳細はスクリプト側）。
+# メモリを返してからサイドカーを戻したいので、順序もこちらが先。
+ExecStopPost=-__INSTALL_DIR__/setup/stop_live_processes.sh
+# 退かした画像生成サイドカーを戻す。`+` を付けると User= に関係なく root で走るので、
+# __USER__ に systemctl の sudoers を書かなくて済む。
 # 配信の成否によらず動くよう ExecStopPost に置く（ExecStop では異常終了時に
 # 走らない経路がある）。
 # `-` は失敗を無視する指定。**これを外さないこと。** imagegen を入れていない

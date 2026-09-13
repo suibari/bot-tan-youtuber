@@ -61,6 +61,9 @@ done
 # 準備ユニットが呼ぶ。リポジトリの中に置いたまま実行するので、実行ビットが
 # 落ちていると配信が始まらない（git は実行ビットを持つが、zip 展開などで落ちる）
 chmod 0755 "$INSTALL_DIR/setup/reset_display.sh"
+# bottan-live.service の ExecStopPost が呼ぶ。落ちていると配信後に OBS が残り、
+# 翌晩の reset_display.sh のガードに引っかかって配信が始まらない
+chmod 0755 "$INSTALL_DIR/setup/stop_live_processes.sh"
 
 systemctl daemon-reload
 
