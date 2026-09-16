@@ -21,7 +21,7 @@ botたん動画パイプライン 共通処理
   VOICEVOX_SPEAKER    : VOICEVOXのスピーカーID (デフォルト: 8)
   UNITY_EXE           : Unityエディタのパス
   UNITY_PROJECT       : Unityプロジェクトのパス
-  UNITY_RECORD_TIMEOUT_SEC : Unity録画の待機上限秒 (デフォルト: 600)
+  UNITY_RECORD_TIMEOUT_SEC : Unity録画の待機上限秒 (デフォルト: 3600。実際は伸びが止まったら UNITY_RECORD_STALL_SEC で落ちる)
   VRMA_MOTION_DIR     : AI生成モーション(.vrma)の出力先 (省略時は従来のMixamoモーションのみ)
   ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /mnt/data/ardy-engine)
   ARDY_MERGED_BASE    : テキストエンコーダ(15GB)の置き場。読み込み速度が
@@ -89,7 +89,15 @@ VOICEVOX_SPEAKER  = _voice.VOICEVOX_SPEAKER
 HOOK_VOICE_PARAMS = _voice.HOOK_VOICE_PARAMS
 UNITY_EXE        = os.getenv("UNITY_EXE", "/home/suibari/Unity/Hub/Editor/6000.0.76f1/Editor/Unity")
 UNITY_PROJECT    = os.getenv("UNITY_PROJECT", "/home/suibari/bottan-video")
-UNITY_RECORD_TIMEOUT_SEC = max(60, env_int("UNITY_RECORD_TIMEOUT_SEC", 600))
+# 録画は llvmpipe（CPU描画）なので速さが日によって倍近く変わる。カメラが寄ったままの回
+# （生成モーション無し）は特に遅く、2026-09-16 は 600秒で9割強まで書いたところで打ち切られた。
+# なので「一定時間で打ち切る」のではなく「ファイルが伸びなくなったら失敗」で判定し、
+# 全体の上限は暴走止めとして大きく取る。
+UNITY_RECORD_TIMEOUT_SEC = max(60, env_int("UNITY_RECORD_TIMEOUT_SEC", 3600))
+# 起動してから録画ファイルが現れるまでの上限。ここで固まる Unity に1時間待たない
+UNITY_RECORD_START_TIMEOUT_SEC = max(60, env_int("UNITY_RECORD_START_TIMEOUT_SEC", 600))
+# 録画ファイルのサイズがこれだけ変わらず、尺も足りていなければ止まったとみなす
+UNITY_RECORD_STALL_SEC = max(10, env_int("UNITY_RECORD_STALL_SEC", 120))
 # 指定するとUnityへ -vrmaMotionDir が渡り、VrmaMotionPlayer が該当モーションを差し替える。
 # 未指定なら Unity 側は完全な no-op で、従来のMixamoモーションのまま。
 VRMA_MOTION_DIR  = os.getenv("VRMA_MOTION_DIR", "")
@@ -656,7 +664,8 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
         # 「書き込み完了を確認してから自分でkillした」= 録画は成功、を表すフラグ。
         # この経路を通った場合、Unityの終了コードは我々がkillした結果でしかなく、判定に使えない。
         write_completed = False
-        deadline = time.time() + UNITY_RECORD_TIMEOUT_SEC
+        started = time.time()
+        deadline = started + UNITY_RECORD_TIMEOUT_SEC
         while time.time() < deadline:
             if Path(output_webm).exists() and os.path.getsize(output_webm) > 0:
                 print(f"[Unity] ファイル検出: {output_webm}")
@@ -665,28 +674,42 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
                 # 2秒止まることがあり、サイズだけを見るとヘッダだけのファイルを
                 # 完成品と誤認して Unity を終了させてしまう。
                 prev_size = 0
+                last_grew = time.time()
+                stalled = False
                 while True:
                     time.sleep(2)
                     if unity_proc.poll() is not None:
                         break
                     current_size = os.path.getsize(output_webm)
                     print(f"[Unity] ファイルサイズ: {current_size} bytes")
-                    if current_size == prev_size and current_size > 0:
+                    if current_size != prev_size:
+                        last_grew = time.time()
+                    elif current_size > 0:
                         actual_duration = probe_media_duration(output_webm)
                         if actual_duration >= max(1.0, expected_duration - 0.5):
                             print(f"[Unity] 書き込み完了を確認 "
-                                  f"(尺 {actual_duration:.3f}秒)")
+                                  f"(尺 {actual_duration:.3f}秒, "
+                                  f"起動から{time.time() - started:.0f}秒)")
                             break
                         print(f"[Unity] サイズは一時停止中ですが未完成です "
                               f"(尺 {actual_duration:.3f}/{expected_duration:.3f}秒)")
+                        if time.time() - last_grew >= UNITY_RECORD_STALL_SEC:
+                            stalled = True
+                            break
                     prev_size = current_size
                     if time.time() >= deadline:
                         break
                 actual_duration = probe_media_duration(output_webm)
                 if actual_duration < max(1.0, expected_duration - 0.5):
+                    if stalled:
+                        why = f"{UNITY_RECORD_STALL_SEC}秒間ファイルが伸びていません"
+                    elif unity_proc.poll() is not None:
+                        why = f"Unityが途中で終了しました (returncode: {unity_proc.returncode})"
+                    else:
+                        why = f"全体の上限 {UNITY_RECORD_TIMEOUT_SEC}秒に達しました"
                     raise RuntimeError(
                         f"Unity録画が不完全です "
-                        f"(尺 {actual_duration:.3f}/{expected_duration:.3f}秒)"
+                        f"(尺 {actual_duration:.3f}/{expected_duration:.3f}秒, {why})"
                     )
                 try:
                     os.killpg(os.getpgid(unity_proc.pid), signal.SIGTERM)
@@ -707,6 +730,9 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
                 break
             if unity_proc.poll() is not None:
                 break
+            if time.time() - started >= UNITY_RECORD_START_TIMEOUT_SEC:
+                deadline = time.time()   # 下の else（タイムアウト処理）へ落とす
+                continue
             time.sleep(2)
         else:
             try:
@@ -727,7 +753,8 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
                 for _line in _lines[-50:]:
                     print(f"  {_line}")
             raise TimeoutError(
-                f"Unity録画タイムアウト ({UNITY_RECORD_TIMEOUT_SEC}秒)"
+                f"Unity録画タイムアウト (録画ファイルが現れない: "
+                f"{UNITY_RECORD_START_TIMEOUT_SEC}秒 / 全体 {UNITY_RECORD_TIMEOUT_SEC}秒)"
             )
 
         # 判定は終了コードではなく成果物で行う。
