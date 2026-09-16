@@ -95,6 +95,15 @@ ARDY_MEM_WAIT_SEC = float(os.getenv("ARDY_MEM_WAIT_SEC", "360"))
 ARDY_FREE_OLLAMA = env_flag("ARDY_FREE_OLLAMA")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 
+# 画像生成サイドカー（bot-tan-imagegen）。空きメモリが足りないときだけ /unload で
+# SDXL を捨てさせる。空文字にすると触らない。
+#
+# サイドカーは最後の生成から IDLE_UNLOAD_SEC(900秒) モデルを抱えたままにする。
+# 2026-09-16 は 17:56 の壁紙生成が 18:11 まで RAM を握り、18:00 の Shorts で
+# 空きが 10GB しかなく ARDY がスキップされた。ARDY_MEM_WAIT_SEC(360秒) では
+# 自然解放に間に合わない。捨てても次の生成で読み直されるだけで、画像生成は止まらない
+IMAGEGEN_URL = os.getenv("IMAGEGEN_URL", "http://127.0.0.1:7998").rstrip("/")
+
 # エンジンが使えないときに何が起きるかは呼び出し側で違うので、文面を差し替えられるようにする
 FALLBACK_MSG_SHORTS = "生成モーションはスキップします"
 FALLBACK_MSG_LIVE = "プールのモーションだけで配信します"
@@ -179,10 +188,37 @@ def _free_ollama() -> None:
         print(f"[ARDY] ollama の解放をスキップ（無視）: {e}")
 
 
+def _free_imagegen() -> bool:
+    """画像生成サイドカーにモデルを捨てさせる。捨てさせたら True。失敗しても無視する。
+
+    サイドカーの /unload は生成ロックを取らないので、生成中に叩くと生成を壊す。
+    busy のときは触らず False を返し、呼び出し側の次の周回に任せる。
+    """
+    if not IMAGEGEN_URL:
+        return False
+    try:
+        h = requests.get(f"{IMAGEGEN_URL}/health", timeout=5).json()
+    except Exception:
+        return False   # サイドカーが居ない
+    if h.get("busy"):
+        print("[ARDY] 画像生成サイドカーが生成中のため、解放は次の周回に回します")
+        return False
+    try:
+        r = requests.post(f"{IMAGEGEN_URL}/unload", timeout=60).json()
+    except Exception as e:
+        print(f"[ARDY] 画像生成サイドカーの解放をスキップ（無視）: {e}")
+        return False
+    if r.get("unloaded"):
+        print(f"[ARDY] 画像生成サイドカーのモデルを解放しました ({r['unloaded']}本) "
+              f"— 次の生成で自動的に読み直されます")
+    return True
+
+
 def wait_memory(timeout: float = None, fallback_msg: str = FALLBACK_MSG_SHORTS) -> bool:
     """空きメモリが閾値を超えるまで待つ。超えたら True。
 
     timeout=0 を渡すと待たずに1回だけ判定する（統合前のライブ配信の振る舞い）。
+    足りないときは画像生成サイドカーにモデルを捨てさせてから測り直す。
     """
     if ARDY_FREE_OLLAMA:
         _free_ollama()
@@ -190,8 +226,13 @@ def wait_memory(timeout: float = None, fallback_msg: str = FALLBACK_MSG_SHORTS) 
     limit = ARDY_MEM_WAIT_SEC if timeout is None else timeout
     deadline = time.time() + limit
     warned = False
+    imagegen_freed = False
     while True:
         avail = mem_available_gb()
+        if avail < ARDY_MIN_AVAIL_GB and not imagegen_freed:
+            imagegen_freed = _free_imagegen()
+            if imagegen_freed:
+                avail = mem_available_gb()
         if avail >= ARDY_MIN_AVAIL_GB:
             return True
         if time.time() >= deadline:
