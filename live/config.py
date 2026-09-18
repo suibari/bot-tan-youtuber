@@ -204,21 +204,37 @@ OBS_START_TIMEOUT = env_float("OBS_START_TIMEOUT", 60.0)
 # 1.6〜1.8GB の回は 0.1〜0.3% だった
 OBS_MIN_AVAIL_GB = env_float("OBS_MIN_AVAIL_GB", 3.0)
 # 空き RAM だけでは足りない。2026-09-09 の配信は MemAvailable が 15.3GB
-# あったのに素通りし、その裏で swap は既に 6.2GB 使われ Committed_AS は
-# RAM+swap の 110% だった。MemAvailable は**回収できるページキャッシュを
-# 含む**ので、ollama・ARDY・Unity・OBS が匿名ページで RAM を埋めるこの構成
-# では警告として働かない。swap の使用率と commit 比を併せて見る。
+# あったのに素通りした。MemAvailable は**回収できるページキャッシュを含む**
+# ので、ollama・ARDY・Unity・OBS が匿名ページで RAM を埋めるこの構成では
+# 単独の警告として働かない。swap の使用率と io の詰まりを併せて見る。
 # どちらも「越えたら警告」で、配信は止めない。
 #
 # swap の使用率はこのホストでは常に高い。21時台の実測は
 # 09/06 33%（完走）/ 09/07 31%（完走）/ 09/08 42〜54%（完走）/
-# 09/09 33→48%（21:08 に切られた）。**単独では良し悪しを分けられない**ので、
-# 線は「さすがに苦しい」ところに置いてある。効くのは下の commit 比のほう。
+# 09/09 33→48%（21:08 に切られた）/ 09/17 48%（完走）/ 09/18 36〜50%（完走）。
+# **単独では良し悪しを分けられない**ので、線は「さすがに苦しい」ところに置く。
 OBS_MAX_SWAP_RATIO = env_float("OBS_MAX_SWAP_RATIO", 0.55)
-# Committed_AS ÷ (RAM + swap)。カーネルが約束した総量が実在のメモリを
-# 超えている状態で、「全員が確保したぶんを触ったら swap に落ちる」ことを意味する。
-# 09/09 は 21:00 の時点で既に 110% あり、その通りに落ちた
-OBS_MAX_COMMIT_RATIO = env_float("OBS_MAX_COMMIT_RATIO", 1.0)
+# PSI の io/some avg10。**スワップの「量」ではなく「詰まり」を見る。**
+#
+# ここは以前 Committed_AS ÷ (RAM+swap) の commit 比（目安 100%）だった。
+# やめた理由は、実測で良し悪しの順序が逆転していたから:
+#
+#   09/09 commit 110% → 21:08 に YouTube に切られた
+#   09/17 commit 130〜133% → skipped_frames 0 / 131,157 で完走
+#   09/18 commit 125〜132% → skipped_frames 0 / 131,036 で完走
+#
+# commit が**低かった**日が落ちて高い日が完走している。Committed_AS は
+# 触られもしない予約を全部数えるので、claude・codex・chrome といった配信と
+# 無関係な作業環境が同居しているだけで十数GB 積まれ、常時 100% を超える。
+# 閾値を上げても黙るだけで判別力は戻らないため、条件から外した
+# （memory_note には診断用に残してある）。
+#
+# 09/09 の真因は commit ではなくスワップの**レイテンシ**で、当時 9.1GB のうち
+# 7GB が 5400rpm の HDD に乗っていた（setup/move_swap_to_ssd.sh の冒頭に経緯）。
+# SSD へ寄せた今は同じ swap 使用率でも詰まらない。詰まりそのものを見るのが
+# PSI で、平常時は 1 前後、09/09 の最中は 72〜76 まで振れていた。
+# 完走した 09/18 の最悪値が 33.04 なので、線はその上に置く。
+OBS_MAX_IO_PRESSURE = env_float("OBS_MAX_IO_PRESSURE", 50.0)
 
 # ── 字幕（OBS のテキストソースが読むファイル） ──────
 SUBTITLE_DIR = Path(os.getenv("SUBTITLE_DIR", DATA_DIR / "obs"))

@@ -30,7 +30,7 @@ from config import (OBS_HOST, OBS_PORT, OBS_PASSWORD, OBS_LAUNCH, OBS_COMMAND,
                     OBS_COLLECTION, OBS_PROFILE, LIVE_DISPLAY,
                     STREAM_VIDEO_KBPS, STREAM_AUDIO_KBPS,
                     OBS_START_TIMEOUT, OBS_MIN_AVAIL_GB,
-                    OBS_MAX_SWAP_RATIO, OBS_MAX_COMMIT_RATIO,
+                    OBS_MAX_SWAP_RATIO, OBS_MAX_IO_PRESSURE,
                     SUBTITLE_JA, SUBTITLE_EN)
 
 # **config より後に置くこと。** リポジトリのルートを sys.path へ足しているのは
@@ -272,15 +272,33 @@ def _top_swappers(limit: int = 4) -> str:
 def _commit_ratio() -> float:
     """Committed_AS ÷ (RAM + スワップ)。読めなければ 0.0。
 
-    カーネルが約束した総量が実在のメモリを超えているかどうか。1.0 を超えた
-    状態は「全員が確保したぶんを実際に触ったら swap に落ちる」ことを意味する。
-    2026-09-09 の配信中は 110〜115% で、その通りに落ちた。
+    **点検の判定には使わない。** memory_note に載せる診断用の数字。
+    触られもしない予約まで数えるので、配信と無関係な作業環境（claude・codex・
+    chrome）が同居しているだけでこのホストでは常時 100% を超える。実測でも
+    09/09（110%）が落ちて 09/17〜18（130%超）が完走しており、良し悪しの順序が
+    逆転している。経緯は config.py の OBS_MAX_IO_PRESSURE のコメントに。
+    それでも事後に「何が積まれていたか」を追うには効くので残してある。
     """
     info = meminfo_kb()
     capacity = info.get("MemTotal", 0) + info.get("SwapTotal", 0)
     if not capacity:
         return 0.0
     return info.get("Committed_AS", 0) / capacity
+
+
+def _io_pressure() -> float:
+    """PSI の io/some avg10。読めなければ 0.0。
+
+    スワップの「量」ではなく「詰まり」。平常時は 1 前後で、2026-09-09 に
+    OBS の送出が止まった最中は 72〜76 まで振れていた。host_pressure() が
+    同じ値を表示用の文字列で返すが、こちらは閾値と比べるために数値で取る。
+    """
+    try:
+        with open("/proc/pressure/io") as f:
+            # "some avg10=39.21 avg60=... avg300=... total=..."
+            return float(f.readline().split()[1].split("=")[1])
+    except (OSError, ValueError, IndexError):
+        return 0.0   # PSI の無い環境。点検が1項目減るだけで呼び出し元は止めない
 
 
 def memory_note() -> str:
@@ -304,9 +322,16 @@ def check_memory() -> str | None:
     **空き RAM だけを見てはいけない。** `MemAvailable` は回収できるページ
     キャッシュを含むので、匿名ページで RAM が埋まっていても大きい値が出る。
     2026-09-09 の配信は MemAvailable が 15.3GB あったのでこの点検を素通りし、
-    その裏では swap が既に 6.2GB 使われ commit は 110% だった。配信開始と同時に
-    swap への書き出しが 1320ページ/秒まで跳ね、%iowait 28.8% で OBS の送出が
-    止まり、YouTube に配信を切られた。swap の使用率と commit 比を併せて見る。
+    その裏では swap が既に 6.2GB 使われていた。配信開始と同時に swap への
+    書き出しが 1320ページ/秒まで跳ね、%iowait 28.8% で OBS の送出が止まり、
+    YouTube に配信を切られた。
+
+    **見るのはスワップの量ではなく詰まり。** 当時のスワップは 9.1GB のうち
+    7GB が 5400rpm の HDD 上にあり、落ちたのは総量ではなくランダム読みの
+    レイテンシのせいだった（setup/move_swap_to_ssd.sh）。SSD へ寄せた今は
+    同じ使用率でも詰まらない。実際 09/17・09/18 はスワップ 48〜50% のまま
+    skipped_frames 0 で完走している。だから swap 使用率は「さすがに苦しい」
+    線だけ残し、判定の主役は PSI の io/some avg10 に置く。
 
     止めはしない。枠はもう作ってあるので、ここで落とすほうが損失が大きい。
     """
@@ -319,10 +344,10 @@ def check_memory() -> str | None:
     if total and used / total > OBS_MAX_SWAP_RATIO:
         reasons.append(f"スワップを {used:.1f}/{total:.1f}GB 使っています"
                        f"（目安 {OBS_MAX_SWAP_RATIO * 100:.0f}%）")
-    commit = _commit_ratio()
-    if commit > OBS_MAX_COMMIT_RATIO:
-        reasons.append(f"commit が RAM+スワップの {commit * 100:.0f}% です"
-                       f"（目安 {OBS_MAX_COMMIT_RATIO * 100:.0f}%）")
+    io = _io_pressure()
+    if io > OBS_MAX_IO_PRESSURE:
+        reasons.append(f"io が詰まっています（PSI avg10={io:.1f}、"
+                       f"目安 {OBS_MAX_IO_PRESSURE:.0f}）")
     if not reasons:
         return None
     return ("、".join(reasons) + "。OBS がスワップで詰まると、配信は始まっても"
