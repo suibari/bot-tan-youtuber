@@ -2,7 +2,7 @@
 Description=botたん YouTube ライブ配信 (21:00-22:00)
 # 映像は GPU 仮想ディスプレイの上に出すので、先に上がっている必要がある。
 # 引くのは Xorg そのものではなく bottan-live-display.service のほう。あちらが
-# 毎晩 Xorg を作り直し、glxgears で実際に描けることを確かめてから通す。
+# 配信前に Xorg を作り直し、glxgears で実際に描けることを確かめてから通す。
 #
 # **bottan-live-xorg.service を直接 Requires= しないこと。** 準備ユニットが
 # その Xorg を restart するので、依存として宣言していると systemd が

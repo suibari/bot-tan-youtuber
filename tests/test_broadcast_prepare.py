@@ -63,8 +63,8 @@ class BroadcastPrepareTest(unittest.TestCase):
                 return outer.found
 
             def create_event(self, title, _description, _scheduled_start):
-                self.broadcast_id = "created-id"
-                self.url = "https://www.youtube.com/watch?v=created-id"
+                self.broadcast_id = "created-id" if not outer.created else "created-id-2"
+                self.url = f"https://www.youtube.com/watch?v={self.broadcast_id}"
                 self.title = title
                 outer.created.append(self.broadcast_id)
                 return self
@@ -77,6 +77,8 @@ class BroadcastPrepareTest(unittest.TestCase):
         memory_stub.ensure_schema = lambda: None
         memory_stub.get_prepared_broadcast = lambda _start: self.db_row
         memory_stub.save_prepared_broadcast = lambda *args: self.saved.append(args)
+        memory_stub.retire_other_prepared_broadcasts = lambda ids: self.retired.append(ids)
+        self.retired = []
 
         schedule_stub = types.ModuleType("schedule")
         schedule_stub.today_schedule = lambda _now=None: (
@@ -84,6 +86,10 @@ class BroadcastPrepareTest(unittest.TestCase):
             datetime(2026, 8, 22, 22, tzinfo=JST),
         )
         schedule_stub.broadcast_text = lambda _start: ("today title", "description")
+        schedule_stub.upcoming_schedules = lambda _now=None: [
+            (datetime(2026, 8, 22, 21, tzinfo=JST), datetime(2026, 8, 22, 22, tzinfo=JST)),
+            (datetime(2026, 8, 29, 21, tzinfo=JST), datetime(2026, 8, 29, 22, tzinfo=JST)),
+        ]
 
         self.module = load_module(
             "prepare_broadcast_test_module",
@@ -105,6 +111,14 @@ class BroadcastPrepareTest(unittest.TestCase):
         self.assertEqual(self.created, ["created-id"])
         self.assertEqual(self.saved[0][0], "created-id")
         self.assertEqual(self.cleaned, [["created-id"]])
+
+    def test_daily_prepare_keeps_current_and_next_live(self):
+        events = self.module.prepare_upcoming()
+        self.assertEqual([event.broadcast_id for event in events],
+                         ["created-id", "created-id-2"])
+        self.assertEqual(len(self.saved), 2)
+        self.assertEqual(self.retired, [["created-id", "created-id-2"]])
+        self.assertEqual(self.cleaned, [["created-id", "created-id-2"]])
 
     def test_second_run_reuses_database_event(self):
         self.db_row = {"broadcast_id": "db-id"}
