@@ -7,8 +7,8 @@
 |---|---|---|---|
 | `shorts/` | 夜の Shorts（Nagi のポスト紹介）| `run.sh` | 毎日 18:00 JST |
 | `shorts/` | 朝の勘違いクイズ Shorts | `run_quiz.sh` | 毎日 06:00 JST |
-| `live/` | 当日ライブの配信枠だけを先行作成 | `live/prepare_broadcast.py` | 毎日 04:00 JST |
-| `live/` | YouTube ライブ配信（AITuber）| `run_live.sh` | 毎日 20:40 起動 / 21:00–22:00 配信 |
+| `live/` | 次の2回の配信枠を先行作成 | `live/prepare_broadcast.py` | 毎日 04:00 JST |
+| `live/` | YouTube ライブ配信（AITuber）| `run_live.sh` | 毎週土曜 20:40 起動 / 21:00–22:00 配信 |
 | `common/` | 上記が共有する処理 | — | — |
 
 ## ディレクトリ構成
@@ -584,7 +584,7 @@ curl -X POST 127.0.0.1:2338/camera -d '{"x":-0.25,"y":1.35,"z":0.7}'
 sudo bash setup/install_units.sh
 ```
 
-04:00 に当日21時の配信枠と視聴URLだけを作成し、20:40 の本配信が同じ枠へ
+毎日04:00に次の2回の配信枠と視聴URLを用意する。毎週土曜20:40の本配信が当日の枠へ
 ストリームを紐づける。OBS・Unity・RTMP送出は20:40まで起動しない。
 20:40 起動 → 21:00 live → 21:55 クロージング → 22:00 complete。
 `Persistent=false` にしてあるので、起動に失敗した日を後から取り返さない

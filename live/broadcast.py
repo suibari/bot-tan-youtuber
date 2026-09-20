@@ -32,7 +32,7 @@ def cleanup_stale(title_mark: str = TITLE_MARK,
     """一度も live まで行かなかった自分の配信枠を消す。
 
     配信開始に失敗すると枠だけが `ready` のまま YouTube に残る。放っておくと
-    毎晩ぶん溜まっていくので、新しい枠を作る前に掃除する。
+    未使用の枠が溜まっていくので、新しい枠を作る前に掃除する。
 
     消すのは lifeCycleStatus が STALE_STATUSES のものだけ。live や complete、
     つまり実際に配信した枠には触らない。タイトルも見て、このパイプラインが

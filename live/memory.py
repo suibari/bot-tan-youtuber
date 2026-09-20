@@ -378,6 +378,22 @@ def get_prepared_broadcast(scheduled_start) -> dict | None:
             return dict(row) if row else None
 
 
+def retire_other_prepared_broadcasts(keep_ids: list[str]) -> None:
+    """曜日変更で予定から外れた未開始枠を告知対象から外す。"""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE {LIVE_SCHEMA}.broadcasts
+                SET ended_at = now()
+                WHERE prepared_at IS NOT NULL
+                  AND started_at IS NULL
+                  AND ended_at IS NULL
+                  AND scheduled_start_at > now()
+                  AND NOT (broadcast_id = ANY(%s))
+            """, (keep_ids,))
+        conn.commit()
+
+
 def start_broadcast(broadcast_id: str, url: str, title: str) -> None:
     with connect() as conn:
         with conn.cursor() as cur:
