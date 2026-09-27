@@ -1,4 +1,4 @@
-"""VOICEVOX による音声合成。
+"""Irodori-TTS による音声合成（失敗時は VOICEVOX）。
 
 Shorts の収録とライブ配信で共有する。以前は shorts/core.py と live/voice.py に
 同じ実装が2つあった。
@@ -8,8 +8,10 @@ Shorts の収録とライブ配信で共有する。以前は shorts/core.py と
 発話のたびに ffmpeg のプロセスを起こす必要がない。
 """
 
+import io
 import json
 import os
+import struct
 import tempfile
 import time
 import wave
@@ -22,6 +24,18 @@ from common.pronunciation import apply_pronunciations, preload_pronunciations  #
 
 VOICEVOX_URL     = os.getenv("VOICEVOX_URL", "http://localhost:10101")
 VOICEVOX_SPEAKER = env_int("VOICEVOX_SPEAKER", 8)   # VOICEVOX: 春日部つむぎ ノーマル
+
+# VOICEVOX はフォールバックと字幕のモーラ時刻に使う。
+TTS_ENGINE = os.getenv("TTS_ENGINE", "irodori").lower()
+if TTS_ENGINE not in {"irodori", "voicevox"}:
+    raise ValueError(f"未対応の TTS_ENGINE: {TTS_ENGINE}")
+IRODORI_URL = os.getenv("IRODORI_URL", "http://localhost:10110").rstrip("/")
+IRODORI_VOICE = os.getenv("IRODORI_VOICE", "tsumugi")
+IRODORI_HOOK_VOICE = os.getenv("IRODORI_HOOK_VOICE", IRODORI_VOICE)
+# 5.4字/秒 × 1.2 で既存の台本見積もり（6.5字/秒）に合わせる。
+IRODORI_SPEED = env_float("IRODORI_SPEED", 1.2)
+IRODORI_TIMEOUT = (env_float("IRODORI_CONNECT_TIMEOUT_SEC", 3),
+                   env_float("IRODORI_READ_TIMEOUT_SEC", 30))
 
 # VOICEVOX の出力フォーマット。無音WAVを作って結合するため一致させること
 WAV_RATE     = 24000
@@ -129,12 +143,23 @@ def health_check() -> str:
     for speaker in res.json():
         for style in speaker.get("styles", []):
             if style.get("id") == VOICEVOX_SPEAKER:
-                return f"{speaker.get('name')} / {style.get('name')}"
+                fallback = f"{speaker.get('name')} / {style.get('name')}"
+                if TTS_ENGINE == "irodori":
+                    try:
+                        response = requests.get(f"{IRODORI_URL}/health", timeout=IRODORI_TIMEOUT)
+                        response.raise_for_status()
+                        info = response.json()
+                        if IRODORI_VOICE not in info.get("voices", []):
+                            raise ValueError(f"参照音声がありません: {IRODORI_VOICE}")
+                        return f"Irodori / {IRODORI_VOICE} (loaded={info.get('loaded')}; fallback={fallback})"
+                    except (requests.RequestException, ValueError) as error:
+                        print(f"[TTS] Irodori の確認失敗。VOICEVOX で継続: {error}")
+                return fallback
     raise VoicevoxError(f"話者ID {VOICEVOX_SPEAKER} がエンジンに存在しません")
 
 
 def warmup() -> float:
-    """実際の合成まで通し、VOICEVOX の作業ページを RAM へ戻す。
+    """実際の合成まで通し、Irodoriのモデルロードも待つ。
 
     /speakers だけでは音声モデルや推論経路に触れない。配信準備中に ARDY・
     Unity を読んだ後、CPU 版 VOICEVOX が swap へ追い出され、21:00 の
@@ -144,9 +169,9 @@ def warmup() -> float:
     output = Path(tempfile.gettempdir()) / f"voicevox_warmup_{os.getpid()}.wav"
     started = time.monotonic()
     try:
-        synthesize("今日もよろしくね。", output)
+        synthesize("今日もよろしくね。", output, wait_load=True)
         elapsed = time.monotonic() - started
-        print(f"[VOICEVOX] 実合成のウォームアップ完了: {elapsed:.1f}秒")
+        print(f"[TTS] 実合成のウォームアップ完了: {elapsed:.1f}秒")
         return elapsed
     finally:
         output.unlink(missing_ok=True)
@@ -167,7 +192,7 @@ def audio_query(text: str) -> dict:
     return res.json()
 
 
-def synthesize(text: str, output_path, extra_params: dict = None) -> None:
+def _synthesize_voicevox(text: str, output_path, extra_params: dict = None) -> None:
     """テキストを1本のWAVに合成する。"""
     query = audio_query(text)
     if extra_params:
@@ -180,6 +205,74 @@ def synthesize(text: str, output_path, extra_params: dict = None) -> None:
         data=json.dumps(query),
     )
     Path(output_path).write_bytes(synth_res.content)
+
+
+def _irodori_wav(text: str, extra_params: dict, wait_load: bool) -> bytes:
+    """読み補正後に300字以内へ分割し、同形式のPCMを結合する。"""
+    spoken = apply_pronunciations(text)
+    if not spoken.strip():
+        raise ValueError("合成するテキストが空です")
+    chunks = []
+    while spoken:
+        end = min(300, len(spoken))
+        if len(spoken) > 300:
+            boundary = max(spoken.rfind(mark, 0, 300) for mark in "。！？、\n")
+            if boundary >= 0:
+                end = boundary + 1
+        chunks.append(spoken[:end])
+        spoken = spoken[end:]
+    frames = bytearray()
+    for chunk in chunks:
+        response = requests.post(
+            f"{IRODORI_URL}/synthesize", timeout=IRODORI_TIMEOUT,
+            json={"text": chunk,
+                  "voice": IRODORI_HOOK_VOICE if extra_params == HOOK_VOICE_PARAMS else IRODORI_VOICE,
+                  "speed": IRODORI_SPEED * extra_params.get("speedScale", 1.0),
+                  "wait_load": wait_load},
+        )
+        response.raise_for_status()  # 503も再試行せず、VOICEVOXへ
+        with wave.open(io.BytesIO(response.content), "rb") as wav:
+            format_ = (wav.getframerate(), wav.getnchannels(),
+                       wav.getsampwidth(), wav.getcomptype())
+            if format_ != (WAV_RATE, WAV_CHANNELS, 2, "NONE"):
+                raise ValueError("Irodori の WAV 形式が不正です")
+            pcm = wav.readframes(wav.getnframes())
+            if not pcm or len(pcm) != wav.getnframes() * WAV_CHANNELS * 2:
+                raise ValueError("Irodori の WAV が空または途切れています")
+            frames.extend(pcm)
+    volume = extra_params.get("volumeScale", 1.0)
+    if volume != 1.0:
+        frames = b"".join(struct.pack("<h", max(-32768, min(32767, round(sample * volume))))
+                          for (sample,) in struct.iter_unpack("<h", frames))
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setparams((WAV_CHANNELS, 2, WAV_RATE, 0, "NONE", "not compressed"))
+        wav.writeframes(frames)
+    return output.getvalue()
+
+
+def synthesize(text: str, output_path, extra_params: dict = None,
+               *, wait_load: bool = True) -> None:
+    """Irodoriで合成し、失敗時はその文をVOICEVOXで読む。"""
+    if TTS_ENGINE == "irodori":
+        try:
+            audio = _irodori_wav(text, extra_params or {}, wait_load)
+        except (requests.RequestException, ValueError, wave.Error, EOFError) as error:
+            print(f"[TTS] Irodori で読めず VOICEVOX で読む: {error}")
+        else:
+            Path(output_path).write_bytes(audio)
+            return
+    _synthesize_voicevox(text, output_path, extra_params)
+
+
+def unload_irodori() -> None:
+    """GPUを大きく使う処理の前にVRAMを返す。失敗しても処理は続ける。"""
+    if TTS_ENGINE == "irodori":
+        try:
+            response = requests.post(f"{IRODORI_URL}/unload", timeout=IRODORI_TIMEOUT)
+            response.raise_for_status()
+        except requests.RequestException as error:
+            print(f"[TTS] Irodori の解放失敗: {error}")
 
 
 def concat_wavs(paths: list, output_path) -> None:
@@ -263,14 +356,14 @@ def synthesize_sentences(sentences: list, out_dir, prefix: str,
 
 
 def generate_voice(sentences: list, output_path: str, intro_text: str = "") -> list:
-    """VOICEVOXで文ごとに音声合成し結合する。intro_textがある場合は冒頭一言を先頭に付ける。
+    """選択したエンジンで文ごとに音声合成し結合する。intro_textがある場合は冒頭一言を先頭に付ける。
     sentences: [{"text": str, "valence": float, "arousal": float}, ...]
     戻り値: 各文の実測尺[秒]（intro は含まない）。
 
     生成モーションを文に紐づけるのに使う。文字数比で割り当てると、漢字とかなで
     読み上げ速度が違うぶんズレて、話している内容と動きが合わなくなる
     """
-    print(f"[VOICEVOX] 文ごと音声生成中... (speaker: {VOICEVOX_SPEAKER})")
+    print(f"[TTS] 文ごと音声生成中... (engine: {TTS_ENGINE})")
     tmp_dir = Path(tempfile.gettempdir())
     part_paths = []
     intro_wav = output_path.replace(".wav", "_intro.wav")
@@ -288,7 +381,7 @@ def generate_voice(sentences: list, output_path: str, intro_text: str = "") -> l
             durations.append(get_wav_duration(part_path))
 
         concat_wavs(part_paths, output_path)
-        print(f"[VOICEVOX] 音声生成完了: {output_path} ({len(sentences)}文)")
+        print(f"[TTS] 音声生成完了: {output_path} ({len(sentences)}文)")
         return durations
 
     finally:
@@ -333,7 +426,8 @@ def synthesize_lines(lines: list, out_dir, prefix: str,
             continue
         part = out_dir / f"{prefix}_{i:03d}.wav"
         # 掴みの声色は第一声にだけ当てる
-        synthesize(text, part, HOOK_VOICE_PARAMS if (hook and i == 0) else None)
+        synthesize(text, part, HOOK_VOICE_PARAMS if (hook and i == 0) else None,
+                   wait_load=False)
         dur = get_wav_duration(part)
         parts.append(str(part))
 

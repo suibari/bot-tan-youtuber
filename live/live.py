@@ -182,7 +182,7 @@ class LiveSession:
         # 始めると、最初の数コメントだけ判定に3秒前後かかる（common/grounding.py）
         print("[準備] 調べもの判定モデルを温めます")
         grounding.warmup()
-        print("[準備] VOICEVOX を確認します")
+        print("[準備] 音声合成エンジンを確認します")
         speaker = voice.health_check()
         print(f"[準備] 話者: {speaker}")
 
@@ -1302,7 +1302,7 @@ def main() -> int:
         except Exception as e:
             # ウォームアップ失敗だけで配信を中止しない。詳細は
             # _post_with_retry が I/O PSI とともに残す。
-            print(f"[VOICEVOX] 配信前ウォームアップ失敗（続行します）: {e}")
+            print(f"[TTS] 配信前ウォームアップ失敗（続行します）: {e}")
         _sleep_until(start_at, "配信開始まで", tick=waiting_tick)
 
         if not session._recover_unity(force=True):

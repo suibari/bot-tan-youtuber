@@ -18,7 +18,7 @@ common/           両方から呼ばれるもの。ここを直すと両方に�
   env.py            パス解決（ROOT/DATA_DIR/LOGS_DIR）と環境変数の読み取り
   llm.py            LLM クライアント・モデルのフォールバック・JSON 取得
   grounding.py      配信で聞かれたことを Google 検索で調べる（native REST）
-  voice.py          VOICEVOX 合成・結合・無音・モーラタイミング
+  voice.py          Irodori 合成・VOICEVOX フォールバック・結合・モーラタイミング
   ardy.py           ARDY サーバの起動/待機/停止と .vrma 生成
   motion_safety.py  モーション指示文の禁止語・主語の正規化・待機動作
   db.py             PostgreSQL 接続
@@ -50,7 +50,8 @@ logs/             pipeline_* quiz_* live_* ardy_*
                    ↑ HTTP :2338      │
                    └──────────┬──────┘
                        [live/live.py]
-                              ├→ VOICEVOX      localhost:10101 (speaker=8, CPU)
+                              ├→ Irodori-TTS   localhost:10110 (bot-tan-tts)
+                              ├→ VOICEVOX      localhost:10101 (フォールバック・字幕時刻, CPU)
                               ├→ ollama        localhost:11434 /api/chat（返答生成）
                               ├→ Gemini        native REST + googleSearch（調べもの）
                               ├→ ollama        localhost:11434（調べるか否かの判定）
@@ -1136,3 +1137,30 @@ pnpm tts-pronunciation -- list
 ## ライセンス
 
 本ソフトウェアは MIT License の下で公開されています。詳細は [LICENSE](./LICENSE) を参照してください。
+
+
+## 音声合成（Irodori-TTS）
+
+Shorts・クイズ・ライブは既定で `~/work/bot-tan-tts` の Irodori を使う。
+サーバの構築・API仕様は同リポジトリの README を参照。
+`TTS_ENGINE=voicevox` で従来の合成へ戻せる。設定一覧は `.env.example`。
+
+- `IRODORI_URL` は既定 `http://localhost:10110`、参照音声は `IRODORI_VOICE=tsumugi`。
+- 読み辞書を適用した後、300字以内に分割して `/synthesize` に送る。
+  HTTPエラー・接続失敗・不正なWAVでは、その文全体をVOICEVOXで読み直す。
+- `IRODORI_SPEED=1.2` で従来の台本見積もり（約6.5字/秒）に近づける。
+  実際の字幕・モーションの尺はこれまでどおりWAVから測る。
+- Shortsはモデルロードを待つ。ライブは `wait_load=false` とし、
+  配信直前の `warmup()` だけロードを待つ。Irodoriの読み取りタイムアウトは既定30秒。
+- フックやクイズの `speedScale` は基準速度へ掛け、`volumeScale` はWAVへ適用する。
+  `pitchScale` / `intonationScale` はIrodoriには送れない。
+  フック用の参照音声を別途作った場合は `IRODORI_HOOK_VOICE` で選べる
+  （省略時は通常の声）。VOICEVOXへのフォールバックでは従来の全パラメータを使う。
+- 字幕内のモーラ時刻は引き続きVOICEVOXから取得し、Irodoriの実測尺へ伸縮する。
+  文内のタイミングには誤差がありうるため、VOICEVOXも稼働させておく。
+- ARDY起動前に `/unload` でIrodoriのVRAMを解放する。
+  配信中に両方載らない場合はIrodori側の503でVOICEVOXに切り替わる。
+
+公開時の声・クレジットの確認事項は `bot-tan-tts/README.md` の「ライセンス」を参照。
+同READMEでは、参照音声を使ったYouTube公開の扱いが未確認とされている。
+現在の `VOICEVOX:春日部つむぎ` 表記は維持している。

@@ -192,7 +192,7 @@ class VoiceAudioQueryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(voice.tempfile, "gettempdir", return_value=tmp), \
                 patch.object(voice, "synthesize") as synthesize:
-            synthesize.side_effect = lambda _text, path: Path(path).write_bytes(b"wav")
+            synthesize.side_effect = lambda _text, path, **kwargs: Path(path).write_bytes(b"wav")
             elapsed = voice.warmup()
             output = Path(synthesize.call_args.args[1])
             self.assertFalse(output.exists())
