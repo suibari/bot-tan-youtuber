@@ -344,6 +344,10 @@ def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
     if not available(fallback_msg):
         return None
 
+    # 起動時のGPUメモリを確保する。解放後も音声はVOICEVOXで継続できる。
+    from common.voice import unload_irodori
+    unload_irodori()
+
     # サーバーは約15GB必要。足りないまま起動すると読み込み自体がスワップで
     # 10分以上かかる（実測: 600秒待っても準備完了にならず）ので、空くまで待つ
     if not wait_memory(mem_wait_sec, fallback_msg):
