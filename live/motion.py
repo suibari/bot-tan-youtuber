@@ -46,7 +46,7 @@ def start_server(log_dir=None):
     モデル読み込みに4〜5分かかるので、配信の準備フェーズ（20:40）で先に呼ぶこと。
     """
     return ardy.start(mem_wait_sec=0, reuse=False, log_dir=log_dir,
-                      fallback_msg=_FALLBACK)
+                      fallback_msg=_FALLBACK, release_tts=False)
 
 
 def wait_ready(timeout: float = None) -> bool:
@@ -254,10 +254,18 @@ class ArdyWorker:
         self._done = queue.Queue()
         self._thread = None
         self._stop = threading.Event()
+        self._failure_lock = threading.Lock()
+        self._oom_disabled = False
 
     def start(self, wait: bool = True) -> bool:
         """サーバを起動してワーカースレッドを回す。使えなければ False。"""
+        if self._oom_disabled:
+            return False
         self._proc = start_server()
+        if self._oom_disabled:
+            stop_server(self._proc)
+            self._proc = None
+            return False
         if self._proc is None and health() is None:
             return False
         if wait and not wait_ready():
@@ -319,8 +327,10 @@ class ArdyWorker:
             text, category = item
             out = self.pool.path_for(category, text)
             started = time.time()
+            if self._stop.is_set():
+                break
             made = generate_vrma(text, out, category=category)
-            if made:
+            if made and not self._stop.is_set():
                 self.pool.write_duration(out, made)
                 print(f"[ARDY] {category} に追加 ({time.time() - started:.1f}秒 / "
                       f"{made:.1f}秒のクリップ): {out.name}")
@@ -351,10 +361,39 @@ class ArdyWorker:
             print(f"[ARDY] プール補充を {queued} 件予約しました（空き時間に作ります）")
         return queued
 
+    def disable_for_oom(self, reason: str, *, deadline: float | None = None) -> None:
+        # 期限は音声側の30秒と共有する。停止後にこの配信で再起動しない。
+        remaining = lambda: max(0, deadline - time.monotonic()) if deadline else 8.0
+        if not self._failure_lock.acquire(timeout=remaining()):
+            return  # 別スレッドが既に停止中
+        try:
+            if self._oom_disabled:
+                return
+            self._oom_disabled = True
+            self.enabled = False
+            self._stop.set()
+            print(f"[ARDY] この配信では停止します: {reason}")
+            if remaining() > 1:
+                print(f"[ARDY 停止前] VRAM空き={ardy.vram_free_gb(timeout=1):.2f}GiB")
+            grace = min(5, max(0, remaining() - 1))
+            ardy.stop(self._proc, timeout=grace, kill_timeout=min(1, max(0, remaining() - grace)))
+            self._proc = None
+            for pending in (self._queue, self._prewarm):
+                while True:
+                    try:
+                        pending.get_nowait()
+                    except queue.Empty:
+                        break
+            if remaining() > 1:
+                print(f"[ARDY 停止後] VRAM空き={ardy.vram_free_gb(timeout=1):.2f}GiB")
+        finally:
+            self._failure_lock.release()
+
     def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=5)
-        stop_server(self._proc)
-        self._proc = None
         self.enabled = False
+        self._stop.set()
+        with self._failure_lock:
+            stop_server(self._proc)
+            self._proc = None
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=5)

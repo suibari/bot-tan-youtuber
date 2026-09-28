@@ -15,6 +15,9 @@ import struct
 import tempfile
 import time
 import wave
+from contextvars import ContextVar
+
+from common import gpu_recovery
 from pathlib import Path
 
 import requests
@@ -34,6 +37,8 @@ IRODORI_VOICE = os.getenv("IRODORI_VOICE", "tsumugi")
 IRODORI_HOOK_VOICE = os.getenv("IRODORI_HOOK_VOICE", IRODORI_VOICE)
 # 聞き取りやすさを優先し、標準速度で合成する。
 IRODORI_SPEED = env_float("IRODORI_SPEED", 1.0)
+_deadline = ContextVar("irodori_deadline", default=None)
+
 IRODORI_TIMEOUT = (env_float("IRODORI_CONNECT_TIMEOUT_SEC", 3),
                    env_float("IRODORI_READ_TIMEOUT_SEC", 30))
 
@@ -158,7 +163,7 @@ def health_check() -> str:
     raise VoicevoxError(f"話者ID {VOICEVOX_SPEAKER} がエンジンに存在しません")
 
 
-def warmup() -> float:
+def warmup(*, require_irodori: bool = False, recovery_timeout: float = 30) -> float:
     """実際の合成まで通し、Irodoriのモデルロードも待つ。
 
     /speakers だけでは音声モデルや推論経路に触れない。配信準備中に ARDY・
@@ -169,9 +174,12 @@ def warmup() -> float:
     output = Path(tempfile.gettempdir()) / f"voicevox_warmup_{os.getpid()}.wav"
     started = time.monotonic()
     try:
-        synthesize("今日もよろしくね。", output, wait_load=True)
+        engine = synthesize("今日もよろしくね。", output, wait_load=True,
+                            recovery_timeout=recovery_timeout)
+        if require_irodori and engine != "irodori":
+            raise RuntimeError("Irodori の実合成を確認できませんでした")
         elapsed = time.monotonic() - started
-        print(f"[TTS] 実合成のウォームアップ完了: {elapsed:.1f}秒")
+        print(f"[TTS] 実合成のウォームアップ完了: engine={engine} {elapsed:.1f}秒")
         return elapsed
     finally:
         output.unlink(missing_ok=True)
@@ -224,7 +232,7 @@ def _irodori_wav(text: str, extra_params: dict, wait_load: bool) -> bytes:
     frames = bytearray()
     for chunk in chunks:
         response = requests.post(
-            f"{IRODORI_URL}/synthesize", timeout=IRODORI_TIMEOUT,
+            f"{IRODORI_URL}/synthesize", timeout=_request_timeout(),
             json={"text": chunk,
                   "voice": IRODORI_HOOK_VOICE if extra_params == HOOK_VOICE_PARAMS else IRODORI_VOICE,
                   "speed": IRODORI_SPEED * extra_params.get("speedScale", 1.0),
@@ -251,28 +259,70 @@ def _irodori_wav(text: str, extra_params: dict, wait_load: bool) -> bytes:
     return output.getvalue()
 
 
+def _request_timeout():
+    deadline = _deadline.get()
+    if deadline is None:
+        return IRODORI_TIMEOUT
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise requests.Timeout("Irodori の復旧期限を超えました")
+    from urllib3.util import Timeout
+    return Timeout(total=remaining, connect=min(IRODORI_TIMEOUT[0], remaining),
+                   read=remaining)
+
+
+def _failure_detail(error):
+    response = getattr(error, "response", None)
+    return response.text if response is not None else str(error)
+
+
 def synthesize(text: str, output_path, extra_params: dict = None,
-               *, wait_load: bool = True) -> None:
-    """Irodoriで合成し、失敗時はその文をVOICEVOXで読む。"""
-    if TTS_ENGINE == "irodori":
-        try:
-            audio = _irodori_wav(text, extra_params or {}, wait_load)
-        except (requests.RequestException, ValueError, wave.Error, EOFError) as error:
-            print(f"[TTS] Irodori で読めず VOICEVOX で読む: {error}")
-        else:
-            Path(output_path).write_bytes(audio)
-            return
-    _synthesize_voicevox(text, output_path, extra_params)
+               *, wait_load: bool = True, recovery_timeout: float = 30) -> str:
+    """Irodoriを優先。Liveは復旧を最大30秒待ち、その文全体だけフォールバックする。"""
+    live = gpu_recovery.active()
+    token = _deadline.set(time.monotonic() + recovery_timeout if live else None)
+    try:
+        if TTS_ENGINE == "irodori":
+            recovered = False
+            while True:
+                try:
+                    audio = _irodori_wav(text, extra_params or {}, wait_load)
+                except (requests.RequestException, ValueError, wave.Error, EOFError) as error:
+                    detail = _failure_detail(error)
+                    loading = '"loading"' in detail or "読み込み中" in detail
+                    if live and not recovered and gpu_recovery.is_oom(detail):
+                        recovered = True
+                        gpu_recovery.recover("Irodori", detail, deadline=_deadline.get())
+                        wait_load = True
+                        continue
+                    if live and loading and time.monotonic() < _deadline.get():
+                        time.sleep(min(0.25, max(0, _deadline.get() - time.monotonic())))
+                        continue
+                    print(f"[TTS] engine=voicevox fallback={detail} text={text[:40]!r}")
+                    break
+                else:
+                    Path(output_path).write_bytes(audio)
+                    print(f"[TTS] engine=irodori text={text[:40]!r}")
+                    return "irodori"
+        _synthesize_voicevox(text, output_path, extra_params)
+        return "voicevox"
+    finally:
+        _deadline.reset(token)
 
 
-def unload_irodori() -> None:
-    """GPUを大きく使う処理の前にVRAMを返す。失敗しても処理は続ける。"""
-    if TTS_ENGINE == "irodori":
-        try:
-            response = requests.post(f"{IRODORI_URL}/unload", timeout=IRODORI_TIMEOUT)
-            response.raise_for_status()
-        except requests.RequestException as error:
-            print(f"[TTS] Irodori の解放失敗: {error}")
+def unload_irodori() -> bool:
+    """GPU処理前に解放し、未ロードになったことまで確認する。"""
+    if TTS_ENGINE != "irodori":
+        return True
+    try:
+        response = requests.post(f"{IRODORI_URL}/unload", timeout=IRODORI_TIMEOUT)
+        response.raise_for_status()
+        response = requests.get(f"{IRODORI_URL}/health", timeout=IRODORI_TIMEOUT)
+        response.raise_for_status()
+        return response.json().get("loaded") is False
+    except (requests.RequestException, ValueError) as error:
+        print(f"[TTS] Irodori の解放失敗: {error}")
+        return False
 
 
 def concat_wavs(paths: list, output_path) -> None:

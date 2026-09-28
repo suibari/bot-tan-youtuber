@@ -125,7 +125,7 @@ def mem_available_gb() -> float:
     return float("inf")   # 読めないなら判定しない
 
 
-def vram_free_gb() -> float:
+def vram_free_gb(timeout: float = 5) -> float:
     """GPU の空き VRAM[GB]。読めなければ inf（＝判定しない）。
 
     wait_memory() が見ているのはシステム RAM だけで、GPU 側は誰も見ていなかった。
@@ -135,7 +135,7 @@ def vram_free_gb() -> float:
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=memory.free",
                             "--format=csv,noheader,nounits"],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=timeout)
         if r.returncode == 0:
             return int(r.stdout.split()[0]) / 1024
     except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
@@ -330,7 +330,7 @@ def kill_stray_server() -> None:
 
 
 def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
-          fallback_msg: str = FALLBACK_MSG_SHORTS, low_priority: bool = False):
+          fallback_msg: str = FALLBACK_MSG_SHORTS, low_priority: bool = False, release_tts: bool = True):
     """ARDYサーバーを起動する。
 
     既に起動済みで reuse=True ならそれを再利用し None を返す
@@ -346,7 +346,9 @@ def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
 
     # 起動時のGPUメモリを確保する。解放後も音声はVOICEVOXで継続できる。
     from common.voice import unload_irodori
-    unload_irodori()
+    if release_tts and not unload_irodori():
+        print("[ARDY] Irodori を解放できないため起動を見送ります")
+        return None
 
     # サーバーは約15GB必要。足りないまま起動すると読み込み自体がスワップで
     # 10分以上かかる（実測: 600秒待っても準備完了にならず）ので、空くまで待つ
@@ -420,6 +422,8 @@ def wait_ready(timeout: float = None, fallback_msg: str = FALLBACK_MSG_SHORTS) -
                 print(f"[ARDY] 準備完了 (model={h.get('model')} device={h.get('device')})")
                 return True
             if status == "error":
+                from common import gpu_recovery
+                gpu_recovery.recover("ARDY boot", h.get("error"))
                 print(f"[ARDY] 起動に失敗しました: {h.get('error')}")
                 return False
             cur = (h.get("stage"), round(h.get("progress") or 0, 2))
@@ -431,17 +435,17 @@ def wait_ready(timeout: float = None, fallback_msg: str = FALLBACK_MSG_SHORTS) -
     return False
 
 
-def stop(proc) -> None:
+def stop(proc, timeout: float = 5, kill_timeout: float = 1) -> None:
     """start() が起動したサーバーを落とす。None（再利用時）なら何もしない。"""
     if proc is None:
         return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=20)
+        proc.wait(timeout=timeout)
     except (ProcessLookupError, subprocess.TimeoutExpired):
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=5)
+            proc.wait(timeout=kill_timeout)
         except Exception:
             pass
     except Exception as e:
@@ -485,6 +489,8 @@ def generate_spec(out_json, text: str = None, duration: float = None,
         return None
 
     if "tracks" not in spec:
+        from common import gpu_recovery
+        gpu_recovery.recover("ARDY generate", spec)
         print(f"[ARDY] 生成結果が不正です: {str(spec)[:200]}")
         return None
 

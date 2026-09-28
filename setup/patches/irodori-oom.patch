@@ -1,0 +1,149 @@
+--- a/server.py
++++ b/server.py
+@@ -11,11 +11,12 @@
+ ほぼ埋まっている。モデルを常駐させると約 3.7GB を持ち続け、壁紙の生成が OOM で落ちた（2026-09-27）。
+ そこで、呼ばれたときに読み込み（約 8 秒）、TTS_IDLE_UNLOAD_S 使われなければ下ろす。下ろすと
+ CUDA の土台の約 320MiB だけが残る。空きが TTS_MIN_FREE_MIB に足りないときは読み込まず 503 を返す。
+-**ほかを押し出して読み込むより、呼ぶ側に VOICEVOX で読んでもらうほうがいい。**
++GPU不足は構造化エラーで返す。Live側はARDYを停止して再試行し、復旧できないときだけVOICEVOXを使う。
+ """
+ from __future__ import annotations
+ 
+ import gc
++from functools import wraps
+ import io
+ import os
+ import threading
+@@ -147,27 +148,52 @@
+     return buffer.getvalue()
+ 
+ 
++def oom_safe(method):
++    @wraps(method)
++    def wrapped(self, *args, **kwargs):
++        try:
++            return method(self, *args, **kwargs)
++        except RuntimeError as error:
++            message = str(error).lower()
++            if not isinstance(error, torch.cuda.OutOfMemoryError) and not (
++                "cuda" in message and "out of memory" in message
++            ):
++                raise
++            with self._lock:
++                self._clear_locked()
++            raise HTTPException(status_code=503, detail={
++                "code": "cuda_oom", "message": str(error),
++            }) from error
++    return wrapped
++
++
+ class Engine:
+     def __init__(self, settings: Settings) -> None:
+         self.settings = settings
+         self.runtime: InferenceRuntime | None = None
+         # 合成・読み込み・下ろしを 1 本ずつにする
+-        self._lock = threading.Lock()
++        self._lock = threading.RLock()
+         self._loading = False
++        self._load_error: HTTPException | None = None
+         self.last_used = time.monotonic()
+ 
+     @property
+     def loaded(self) -> bool:
+         return self.runtime is not None
+ 
++    @oom_safe
+     def _load_locked(self) -> None:
+         if self.runtime is not None:
+             return
++        # 前のOOMの例外フレームが解放された後のキャッシュもここで返す。
++        gc.collect()
++        torch.cuda.empty_cache()
+         free_mib = torch.cuda.mem_get_info()[0] // 2**20
+         if free_mib < self.settings.min_free_mib:
+             raise HTTPException(
+                 status_code=503,
+-                detail=f"GPU の空きが {free_mib} MiB しかない（{self.settings.min_free_mib} MiB 要る）",
++                detail={"code": "insufficient_vram",
++                        "message": f"GPU の空きが {free_mib} MiB しかない（{self.settings.min_free_mib} MiB 要る）"},
+             )
+         started = time.monotonic()
+         runtime = InferenceRuntime.from_key(
+@@ -179,6 +205,7 @@
+                 codec_precision="bf16",
+             )
+         )
++        self.runtime = runtime
+         # 初回だけ CUDA の準備で遅いので、読み込みのうちに 1 本通しておく
+         runtime.synthesize(
+             SamplingRequest(text="今日もよろしくね。", ref_wav=str(self.voice_path(None))), log_fn=None
+@@ -191,28 +218,43 @@
+         if self._loading or self.loaded:
+             return
+         self._loading = True
++        self._load_error = None
+ 
+         def run() -> None:
+             try:
+                 with self._lock:
+                     self._load_locked()
+             except Exception as error:  # noqa: BLE001 - 次に呼ばれたときにまた試す
++                self._load_error = error if isinstance(error, HTTPException) else HTTPException(
++                    status_code=500, detail={"code": "load_failed", "message": str(error)})
+                 print(f"[TTS] 読み込めなかった: {error}", flush=True)
+             finally:
+                 self._loading = False
+ 
+         threading.Thread(target=run, daemon=True).start()
+ 
++    def _clear_locked(self) -> None:
++        runtime, self.runtime = self.runtime, None
++        if runtime is not None:
++            try:
++                runtime.unload()
++            except Exception as error:
++                print(f"[TTS] モデル解放中のエラー: {error}", flush=True)
++            finally:
++                del runtime
++                gc.collect()
++                torch.cuda.empty_cache()
++        else:
++            gc.collect()
++            torch.cuda.empty_cache()
++
+     def unload(self) -> bool:
+         with self._lock:
+-            if self.runtime is None:
+-                return False
+-            self.runtime.unload()
+-            self.runtime = None
+-            gc.collect()
+-            torch.cuda.empty_cache()
+-        print("[TTS] モデルを下ろした", flush=True)
+-        return True
++            was_loaded = self.loaded
++            self._clear_locked()
++        if was_loaded:
++            print("[TTS] モデルを下ろした", flush=True)
++        return was_loaded
+ 
+     def unload_when_idle(self) -> None:
+         while True:
+@@ -233,12 +275,16 @@
+     def voices(self) -> list[str]:
+         return sorted(p.stem for p in self.settings.voices_dir.glob("*.wav"))
+ 
++    @oom_safe
+     def synthesize(self, text: str, voice: str | None = None, speed: float = 1.0,
+                    seed: int | None = None, wait_load: bool = True) -> bytes:
+         ref = self.voice_path(voice)
+         if not wait_load and not self.loaded:
++            if self._load_error is not None:
++                error, self._load_error = self._load_error, None
++                raise error
+             self.load_in_background()
+-            raise HTTPException(status_code=503, detail="読み込み中")
++            raise HTTPException(status_code=503, detail={"code": "loading", "message": "読み込み中"})
+         speech_s = voicevox_speech_seconds(text, self.settings)
+         with self._lock:
+             self._load_locked()

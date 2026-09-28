@@ -406,13 +406,8 @@ def main():
         # 使うことがある（README「他人の投稿を自分の体験にしない」）
         closing_mood = pick_closing_mood(data["moods"], corner_context)
 
-        # ARDYサーバーを先に起動しておく。
-        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる。
-        # 裏で走るぶん優先度は下げる。CPU 版 VOICEVOX と食い合うと合成が数十秒に
-        # 伸びて Step3 で落ちる（2026-08-31）。読み込みは遅れても待てる
+        # 音声が完成してから ARDY を起動する。
         ardy_proc = None
-        if VRMA_MOTION_DIR:
-            ardy_proc = ardy_start(low_priority=True)
 
         # Step 2: 台本生成
         script_cache = os.getenv("SCRIPT_CACHE", "")
@@ -499,7 +494,9 @@ def main():
             try:
                 blocks = build_vrma_blocks(main_sentences, sentence_durations,
                                            intro_duration, vrma_end)
-                if blocks and ardy_wait_ready():
+                if blocks:
+                    ardy_proc = ardy_start(reuse=False)
+                if ardy_proc is not None and ardy_wait_ready():
                     vrma_motions = _timed(
                         "Step3.8 モーション生成", build_vrma_motions,
                         blocks, VRMA_MOTION_DIR, datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d"))

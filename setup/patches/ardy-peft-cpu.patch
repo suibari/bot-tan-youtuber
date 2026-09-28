@@ -1,0 +1,18 @@
+--- a/ardy/model/llm2vec/llm2vec.py
++++ b/ardy/model/llm2vec/llm2vec.py
+@@ -143,6 +143,7 @@
+             model = PeftModel.from_pretrained(
+                 model,
+                 base_model_name_or_path,
++                torch_device=os.environ.get("TEXT_ENCODER_DEVICE"),
+             )
+             model = model.merge_and_unload()
+ 
+@@ -150,6 +151,7 @@
+             model = PeftModel.from_pretrained(
+                 model,
+                 peft_model_name_or_path,
++                torch_device=os.environ.get("TEXT_ENCODER_DEVICE"),
+             )
+             if merge_peft:
+                 model = model.merge_and_unload()

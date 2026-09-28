@@ -1147,19 +1147,28 @@ Shorts・クイズ・ライブは既定で `~/work/bot-tan-tts` の Irodori を�
 
 - `IRODORI_URL` は既定 `http://localhost:10110`、参照音声は `IRODORI_VOICE=tsumugi`。
 - 読み辞書を適用した後、300字以内に分割して `/synthesize` に送る。
-  HTTPエラー・接続失敗・不正なWAVでは、その文全体をVOICEVOXで読み直す。
+  復旧できないHTTPエラー・接続失敗・不正なWAVでは、その文全体をVOICEVOXで読み直す。
 - `IRODORI_SPEED=1.0` を既定とし、聞き取りやすさを優先して標準速度で合成する。
   実際の字幕・モーションの尺はこれまでどおりWAVから測る。
-- Shortsはモデルロードを待つ。ライブは `wait_load=false` とし、
-  配信直前の `warmup()` だけロードを待つ。Irodoriの読み取りタイムアウトは既定30秒。
+- Shortsの起動スクリプトはIrodoriの読み込みを180秒まで待つ。
+- Liveは準備時にOllama→Irodori（最大180秒）→ARDYの順に読み込む。
+  配信中のIrodori未ロード・GPUメモリ不足は、停止・再試行を含め最大30秒復旧を待つ。
+  期限を超えた発話だけVOICEVOXへ切り替える。
 - フックやクイズの `speedScale` は基準速度へ掛け、`volumeScale` はWAVへ適用する。
   `pitchScale` / `intonationScale` はIrodoriには送れない。
   フック用の参照音声を別途作った場合は `IRODORI_HOOK_VOICE` で選べる
   （省略時は通常の声）。VOICEVOXへのフォールバックでは従来の全パラメータを使う。
 - 字幕内のモーラ時刻は引き続きVOICEVOXから取得し、Irodoriの実測尺へ伸縮する。
   文内のタイミングには誤差がありうるため、VOICEVOXも稼働させておく。
-- ARDY起動前に `/unload` でIrodoriのVRAMを解放する。
-  配信中に両方載らない場合はIrodori側の503でVOICEVOXに切り替わる。
+- 朝・夜Shortsは全音声生成→Irodori解放確認→ARDY生成→ARDY停止→収録の順。
+  解放失敗時はARDYを起動しない。
+- LiveはOllama・Irodori・ARDYを同時稼働させる。いずれかのGPU OOM、または
+  Irodoriの読み込み容量不足で、そのセッションのARDYを停止する。
+  保存済みモーションで続行し、同じ配信中は再起動しない。通常の503や通信障害では停止しない。
+- Irodoriサーバーの構造化エラー対応と、ARDYのPEFT CPU読み込み指定が必要。
+  他リポジトリの変更は `setup/patches/` の差分を参照。
+- 発話ごとの `engine=irodori` / `engine=voicevox fallback=...` と
+  ARDY停止理由・停止前後の空きVRAMをログに残す。
 
 公開時の声・クレジットの確認事項は `bot-tan-tts/README.md` の「ライセンス」を参照。
 同READMEでは、参照音声を使ったYouTube公開の扱いが未確認とされている。

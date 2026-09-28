@@ -105,6 +105,8 @@ class LiveSession:
         self.unity = unity_live.UnityLive(log_path=WORK_DIR / "unity.log")
         self.pool = motion_mod.MotionPool()
         self.ardy = motion_mod.ArdyWorker(self.pool)
+        from common import gpu_recovery
+        gpu_recovery.set_handler(self.ardy.disable_for_oom)
         self.queue = chat.CommentQueue()
         self.planner = filler.FillerPlanner()
         self.subs = subtitle.SubtitleScheduler()
@@ -186,10 +188,19 @@ class LiveSession:
         speaker = voice.health_check()
         print(f"[準備] 話者: {speaker}")
 
-        # ARDY は読み込みに4〜5分かかる。待っている間に他を進めたいので
-        # ここで投げて、Unity の起動と並行させる
-        if SKIP_ARDY:
-            print("[準備] SKIP_ARDY のため ARDY は起動しません")
+        # 主モデルも先に載せ、Ollamaと音声の両方を確保してからARDYを起動する。
+        from common import llm as shared_llm
+        shared_llm.create(messages=[{"role": "user", "content": "はい、とだけ答えて。"}],
+                          max_tokens=1)
+        # 音声を先に確保し、その後 ARDY の読み込み完了まで待つ。
+        voice_ready = False
+        try:
+            voice.warmup(require_irodori=True, recovery_timeout=180)
+            voice_ready = True
+        except Exception as error:
+            print(f"[準備] Irodori 未準備のため ARDY を見送ります: {error}")
+        if SKIP_ARDY or not voice_ready:
+            print("[準備] ARDY は起動しません（無効設定またはIrodori未準備）")
             ardy_ok = False
         else:
             print("[準備] ARDY を起動します（読み込みに4〜5分かかります）")
@@ -1249,6 +1260,8 @@ class LiveSession:
 
         self.unity.stop()
         self.ardy.stop()
+        from common import gpu_recovery
+        gpu_recovery.set_handler(None)
 
         if self.broadcast is not None and self.started_at:
             notify.live_ended(self.broadcast.url, self.replied_count,
@@ -1298,7 +1311,7 @@ def main() -> int:
         # synthesis で低速 HDD からの swap-in が集中する。testing の2分間で
         # 実合成まで済ませ、放送中ではなくここで復帰コストを払う。
         try:
-            voice.warmup()
+            voice.warmup(recovery_timeout=180)
         except Exception as e:
             # ウォームアップ失敗だけで配信を中止しない。詳細は
             # _post_with_retry が I/O PSI とともに残す。

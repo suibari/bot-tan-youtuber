@@ -180,6 +180,9 @@ def _call_ollama(model: str, **kwargs):
                              timeout=LLM_TIMEOUT_SEC)
     if response.status_code == 400:
         raise OllamaBadRequest(response.text[:300])
+    if response.status_code >= 400:
+        from common import gpu_recovery
+        gpu_recovery.recover("Ollama", response.text)
     response.raise_for_status()
     data = response.json()
     content = ((data.get("message") or {}).get("content") or "").strip()

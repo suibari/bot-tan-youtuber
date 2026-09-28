@@ -532,13 +532,8 @@ def main(argv=None):
         quiz = core._timed("Step1 クイズ選択", quiz_data.next_quiz, quiz_id=args.quiz_id)
         print(f"[クイズ] id={quiz['id']} 「{quiz['問題']}」 正解={quiz['正解']}")
 
-        # ── ARDYサーバーを先に起動しておく。
-        # モデル読み込みに4〜5分かかるので、台本生成と音声合成の裏でロードさせる。
-        # 裏で走るぶん優先度は下げる。CPU 版 VOICEVOX と食い合うと合成が数十秒に
-        # 伸びて Step3 で落ちる（2026-08-31）。読み込みは遅れても待てる
+        # 音声が完成してから ARDY を起動する。
         ardy_proc = None
-        if core.VRMA_MOTION_DIR and not args.preview:
-            ardy_proc = core.ardy_start(low_priority=True)
 
         # ── Step 2: 台本生成
         script = core._timed("Step2 台本生成", generate_quiz_script, quiz)
@@ -575,7 +570,9 @@ def main(argv=None):
         if core.VRMA_MOTION_DIR and not args.preview:
             try:
                 blocks = build_vrma_blocks(segments, script)
-                if blocks and core.ardy_wait_ready():
+                if blocks:
+                    ardy_proc = core.ardy_start(reuse=False)
+                if ardy_proc is not None and core.ardy_wait_ready():
                     vrma_motions = core._timed(
                         "Step3.8 モーション生成", core.build_vrma_motions,
                         blocks, core.VRMA_MOTION_DIR,
