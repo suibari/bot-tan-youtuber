@@ -32,8 +32,8 @@ if TTS_ENGINE not in {"irodori", "voicevox"}:
 IRODORI_URL = os.getenv("IRODORI_URL", "http://localhost:10110").rstrip("/")
 IRODORI_VOICE = os.getenv("IRODORI_VOICE", "tsumugi")
 IRODORI_HOOK_VOICE = os.getenv("IRODORI_HOOK_VOICE", IRODORI_VOICE)
-# 5.4字/秒 × 1.2 で既存の台本見積もり（6.5字/秒）に合わせる。
-IRODORI_SPEED = env_float("IRODORI_SPEED", 1.2)
+# 聞き取りやすさを優先し、標準速度で合成する。
+IRODORI_SPEED = env_float("IRODORI_SPEED", 1.0)
 IRODORI_TIMEOUT = (env_float("IRODORI_CONNECT_TIMEOUT_SEC", 3),
                    env_float("IRODORI_READ_TIMEOUT_SEC", 30))
 

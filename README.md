@@ -1148,7 +1148,7 @@ Shorts・クイズ・ライブは既定で `~/work/bot-tan-tts` の Irodori を�
 - `IRODORI_URL` は既定 `http://localhost:10110`、参照音声は `IRODORI_VOICE=tsumugi`。
 - 読み辞書を適用した後、300字以内に分割して `/synthesize` に送る。
   HTTPエラー・接続失敗・不正なWAVでは、その文全体をVOICEVOXで読み直す。
-- `IRODORI_SPEED=1.2` で従来の台本見積もり（約6.5字/秒）に近づける。
+- `IRODORI_SPEED=1.0` を既定とし、聞き取りやすさを優先して標準速度で合成する。
   実際の字幕・モーションの尺はこれまでどおりWAVから測る。
 - Shortsはモデルロードを待つ。ライブは `wait_load=false` とし、
   配信直前の `warmup()` だけロードを待つ。Irodoriの読み取りタイムアウトは既定30秒。

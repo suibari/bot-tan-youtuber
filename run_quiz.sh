@@ -33,6 +33,10 @@ done
 # 配信側（live/）は .env の LLM_TIMEOUT_SEC のまま短く縛る
 export LLM_TIMEOUT_SEC="${LLM_TIMEOUT_SEC:-180}"
 
+# Irodori の初回モデル読み込みも待つ。2026-09-28 は35.6秒かかり、
+# 既定の30秒では冒頭だけVOICEVOXになった。収録では180秒まで待つ。
+export IRODORI_READ_TIMEOUT_SEC="${IRODORI_READ_TIMEOUT_SEC:-180}"
+
 # VOICEVOX も同じ理由で伸ばす。CPU 版は ARDY のモデルロードと重なると1文に
 # 数十秒かかり、既定の15秒では落ちる（2026-08-31 の朝版はこれで全滅した）。
 # 録画は1文の失敗がパイプラインごと落として動画が出ないので、待ってでも通す。
