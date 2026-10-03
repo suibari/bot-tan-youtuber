@@ -242,6 +242,7 @@ logs/
 
 # ARDY が生成した .vrma。配信を重ねるほど増える。再生成できるので追跡しない
 data/motions/
+data/motions.*/
 
 # OBS が読む字幕・コメント欄。実行時に書かれる
 data/obs/
