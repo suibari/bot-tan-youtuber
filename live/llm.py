@@ -37,7 +37,7 @@ REPLY_SCHEMA = {
         # プール即応用。ARDY の生成を待たずに合うモーションを引くためのラベル
         "motion_category": {
             "type": "string",
-            "enum": ["happy", "surprised", "thinking", "encouraging", "greeting", "neutral"],
+            "enum": ["happy", "surprised", "thinking", "encouraging", "greeting", "neutral", "dance"],
         },
         # ARDY への非同期生成用の英文。字幕の en とは無関係なので混同しないこと
         "motion_en": {"type": "string"},

@@ -17,15 +17,15 @@ import re
 # 拍手: シードを変えた独立2サンプルとも拍手にならず、手が胸の前で中途半端に浮くだけ
 #       だった（夜版72秒で発生）。armSpread を 0 にしても変わらなかった。
 #
-# スカート姿なので使えない動作。しゃがむ・膝を深く曲げる・跳ぶ系は、
-# ARDY が予備動作として「膝を深く曲げて脚を大きく開くしゃがみ」を必ず作り、
-# カメラが正面・腰の高さにあるため下着が映る（実測: 2026-08-11 の夜版 19.3秒地点）。
-# 腰の上下移動(VRMA_HIPS_Y)を切っても脚のポーズは変わらないので、動作ごと落とす。
-# プロンプトでも禁止しているが、LLM が破ったときに事故るのでここでも遮断する
+# 座る・ひざまずく・深くしゃがむ: その場に立って話すキャラには不自然で、
+#       ARDY が脚を大きく開くので下着も映る（2026-08-11 の夜版 19.3秒地点）。
+#
+# ジャンプ・脚の動き（jump / hop / leap / knees）は 2026-10-03 に解禁した。
+# スカートがめくれて太ももが見える程度は許容し、むしろ歓迎とユーザーが判断した
+# （ダンスのジャンプを録画して確認済み）。腰の上下も vrma_style.VRMA_HIPS_Y で通している。
 BANNED_MOTION_RE = re.compile(
-    r"\b(jump|jumps|jumping|leap|leaps|hop|hops|hopping|squat|squats|squatting|"
-    r"crouch|crouches|crouching|kneel|kneels|kneeling|sit|sits|sitting|"
-    r"lunge|lunges|spring|springs|knees?|clap|claps|clapping|applaud|applauds)\b", re.I)
+    r"\b(squat|squats|squatting|crouch|crouches|crouching|kneel|kneels|kneeling|"
+    r"sit|sits|sitting|lunge|lunges|clap|claps|clapping|applaud|applauds)\b", re.I)
 
 # ── 指示文の形 ───────────────────────────────────────
 #
@@ -69,9 +69,9 @@ MOTION_PROMPT_RULES = """書き方のルール（2026-10-03 の録画比較に�
   状態として書いてもよい: is surprised / is excited / is thinking
 - **前後左右への移動は書かない**（walk / step / turn around など。再生側で
   水平移動を捨てるので、その場で足踏みしているように見える）
-- **下半身を使う動作は絶対に禁止**。スカートを履いていてカメラが腰の高さにあるため、
-  しゃがむ・膝を曲げる・跳ぶ・座る動作は下着が映る。
-  禁止: jump / hop / leap / squat / crouch / kneel / sit / knees / spring
+- **跳ねる・弾むのは歓迎**（jumps / hops / bounces）。嬉しい・盛り上がる場面で使う
+- **座る・ひざまずく・深くしゃがむ動作は禁止**（立って話しているキャラなので不自然）
+  禁止: sit / kneel / squat / crouch / lunge
 - **拍手は書かない**（clap / applaud）。生成AIが描けず、手を震わせている画になる
 - 表情だけの動詞は使わない（smiles / looks / feels）。体が動かず棒立ちになる
 - 同じ動作を何度も使わない
@@ -84,7 +84,8 @@ MOTION_PROMPT_RULES = """書き方のルール（2026-10-03 の録画比較に�
   A person talks while gesturing with one hand in a feminine way. /
   A person clasps their hands in front of their chest in a feminine way. /
   A person raises both arms happily in a feminine way. /
-  A person points upward while explaining in a feminine way."""
+  A person points upward while explaining in a feminine way. /
+  A person jumps for joy in a feminine way."""
 
 # 文に motion が無い／禁止動作だったときに代わりに使う待機動作。
 # ARDY のプールが尽きたときにも使う。上の5文は 2026-10-03 の比較録画で使ったもの。

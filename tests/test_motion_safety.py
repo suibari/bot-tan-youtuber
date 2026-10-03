@@ -31,11 +31,15 @@ class NormalizeMotionTextTest(unittest.TestCase):
 
 
 class SanitizeMotionTest(unittest.TestCase):
-    def test_lower_body_and_clapping_are_blocked(self):
-        for text in ("A person jumps happily.", "She claps her hands.",
-                     "A person bends their knees in a feminine way."):
+    def test_sitting_and_clapping_are_blocked(self):
+        for text in ("A person sits down.", "She claps her hands.",
+                     "A person squats in a feminine way."):
             with self.subTest(text=text):
                 self.assertEqual(ms.sanitize_motion(text), "")
+
+    def test_jumping_is_allowed(self):
+        self.assertEqual(ms.sanitize_motion("A person jumps for joy."),
+                         "A person jumps for joy in a feminine way.")
 
     def test_idle_motions_survive_unchanged(self):
         for text in ms.IDLE_MOTIONS:

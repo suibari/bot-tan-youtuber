@@ -183,7 +183,7 @@ _LIVE_OUTPUT_RULES = """
   lines           : 話す内容を文ごとに区切った配列。各要素は {"ja": 日本語, "en": 英訳}
   valence         : -1.0〜1.0 の実数。ポジティブなら正、ネガティブなら負
   arousal         : -1.0〜1.0 の実数。興奮・驚きなら正、落ち着き・眠気なら負
-  motion_category : happy / surprised / thinking / encouraging / greeting / neutral のどれか
+  motion_category : happy / surprised / thinking / encouraging / greeting / neutral / dance のどれか
   motion_en       : 体の動きの指示（英語）
 
 # 書く順番（重要）
@@ -240,6 +240,11 @@ en は必ず英語（アルファベット）で書く。
   例: 「本当にすごいね！」→ 両手を頭上に上げて称える動き
 
 """ + MOTION_PROMPT_RULES + """
+
+**「踊って」「ダンスして」と頼まれたら、ためらわずに踊ること。**
+- motion_category を dance にする（dance はこのときだけ使う）
+- motion_en は踊りの指示にする（例: A person dances happily and jumps in a feminine way.）
+- lines は「いくよー！」「見ててね！」のように短くして、すぐ踊り出す
 
 # 調べたこと
 配信中、あなたはコメントで聞かれたことをその場で調べられます。調べた結果は

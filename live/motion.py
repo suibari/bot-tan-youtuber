@@ -104,6 +104,13 @@ CATEGORY_MOTIONS = {
         "A person waves hello with one hand in a feminine way.",
         "A person bows slightly in a feminine way.",
     ],
+    # 「踊って」と頼まれたとき用。脚とジャンプを使う（2026-10-03 に解禁）。
+    # "cute" / "idol" を付けると脚を大きく蹴り上げる踊りになる（実測）が、それも許容範囲
+    "dance": [
+        "A person dances happily and jumps in a feminine way.",
+        "A person dances energetically with jumps and arm movements in a feminine way.",
+        "A person does a cheerful dance with small hops in a feminine way.",
+    ],
     "neutral": [
         "A person talks while gesturing with one hand in a feminine way.",
         "A person nods happily in a feminine way.",
@@ -346,7 +353,9 @@ class ArdyWorker:
         if not self.enabled:
             return 0
         queued = 0
-        for category in MOTION_CATEGORIES:
+        # ダンスは頼まれた瞬間に無いと待たせることになるので、先に作る
+        order = sorted(MOTION_CATEGORIES, key=lambda c: c != "dance")
+        for category in order:
             seeds = CATEGORY_MOTIONS.get(category) or safety.IDLE_MOTIONS
             shortfall = per_category - self.pool.count(category)
             for i in range(max(0, shortfall)):
