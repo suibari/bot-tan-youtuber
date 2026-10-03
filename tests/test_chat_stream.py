@@ -104,6 +104,23 @@ class ChatStreamTest(unittest.TestCase):
         poller._receive(types.SimpleNamespace(responses=lambda *_: iter(())))
         self.assertEqual(poller._stop.waits, [1, 2, 4])
 
+    def test_normal_close_after_a_while_reconnects_immediately(self):
+        # サーバーは約10秒で正常に閉じる。待たずに繋ぎ直す
+        poller = self.make()
+        poller._stop = StopAfterWait(1)
+        calls = []
+        clock = itertools.count(step=poller.RECONNECT_MIN_CONNECTION_SEC)
+        def responses(*_):
+            calls.append(1)
+            if len(calls) == 3:
+                raise RpcFailure(grpc.StatusCode.UNAVAILABLE)
+            return iter(())
+        with patch.object(chat.time, "monotonic", lambda: next(clock)):
+            poller._receive(types.SimpleNamespace(responses=responses))
+        # 2回は即時、3回目のエラーで初めて待つ（1秒から）
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(poller._stop.waits, [1])
+
     def test_long_silent_connection_resets_backoff(self):
         # コメントが来ないまま接続上限で切れても、次の接続を待たせない。
         poller = self.make()

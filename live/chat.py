@@ -210,6 +210,13 @@ class ChatPoller:
     # 来ない配信でも接続自体は続くので、受信件数ではなく接続時間で判断する。
     # 短くしすぎると、1件だけ通してすぐ制限される状態でリセットを繰り返す。
     STABLE_CONNECTION_SEC = 60.0
+    # streamList はサーバーが接続から約10秒で正常に閉じる（2026-10-03 の journal で
+    # 31回すべて10〜11秒）。公式サンプルと同じく、正常に閉じたら待たずに繋ぎ直す。
+    # 以前は正常終了でも待ちを倍々に延ばしていて、約2分おきの接続になり、
+    # コメントが最大2分遅れていた。
+    # ただし、これより短く閉じたときは異常とみなして倍々に待つ。0秒で繋ぎ直し続けると
+    # 1秒に何回も接続してクォータを数分で使い切るため
+    RECONNECT_MIN_CONNECTION_SEC = 3.0
     SEEN_LIMIT = 10000
 
     def _run(self) -> None:
@@ -243,11 +250,11 @@ class ChatPoller:
                     if not self._handle_response(res):
                         print("[chat] ライブチャット終了")
                         return
-                if self._connection_was_stable(started):
-                    fail_interval = self.FAIL_INTERVAL_MIN
-                interval = max(1.0, fail_interval)
-                # 正常終了でも待ち時間が倍々に延び、コメント受信が最大2分遅れていた
-                # （2026-10-03）。何秒で切れているかを測ってから直すための計測
+                if time.monotonic() - started >= self.RECONNECT_MIN_CONNECTION_SEC:
+                    interval = 0.0
+                else:
+                    interval = max(1.0, fail_interval)
+                # 接続時間と累計接続回数は、クォータの消費を確かめるために残す
                 print(f"[chat] streamList終了: 正常 / 接続{time.monotonic() - started:.1f}秒 "
                       f"/ 応答{n_res}件・項目{n_items}件 / 累計接続{self.connections}回 "
                       f"/ 次は{interval:.0f}秒後")
@@ -271,8 +278,10 @@ class ChatPoller:
                 print(f"[chat] streamList切断: {code.name if code else type(e).__name__} "
                       f"/ 接続{time.monotonic() - started:.1f}秒 / 応答{n_res}件・項目{n_items}件 "
                       f"/ 累計接続{self.connections}回（配信は継続します。次は{interval:.0f}秒後）")
-            fail_interval = min(self.FAIL_INTERVAL_MAX, interval * 2)
-            self._stop.wait(interval)
+            # 即時再接続（interval=0）のあとは、次に異常が起きたとき1秒から待ち始める
+            fail_interval = min(self.FAIL_INTERVAL_MAX, max(self.FAIL_INTERVAL_MIN, interval * 2))
+            if interval > 0:
+                self._stop.wait(interval)
 
     def _connection_was_stable(self, started: float) -> bool:
         return time.monotonic() - started >= self.STABLE_CONNECTION_SEC
