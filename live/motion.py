@@ -75,41 +75,39 @@ LEGACY_CLIP_SEC = 3.0
 
 # カテゴリごとの種モーション。プールを作るときに使う。
 #
-# 書き方は shorts/prompts.py の実測知見に従っている:
-#   - 必ず "A woman stands in place" で始める
-#   - 上体の動きは「…して、正面に戻る」の往復形だけが効く
-#   - 下半身と拍手は使わない（safety.BANNED_MOTION_RE でも遮断される）
-#   - 山場の動作は手が胸より上に来るようにする（腰の高さは画面外）
+# 書き方は common/motion_safety.MOTION_PROMPT_RULES に従う
+# （"A person <短い動作> in a feminine way."。2026-10-03 の録画比較で決めた）。
+# 下半身と拍手は使わない（safety.BANNED_MOTION_RE でも遮断される）。
 CATEGORY_MOTIONS = {
     "happy": [
-        "A woman stands in place and raises both arms straight up above her head.",
-        "A woman stands in place and opens both arms out to the sides at chest height.",
-        "A woman stands in place and raises one hand straight above her head.",
+        "A person raises both arms happily in a feminine way.",
+        "A person waves cheerfully in a feminine way.",
+        "A person cheers excitedly with both hands in a feminine way.",
     ],
     "surprised": [
-        "A woman stands in place and brings both hands up to her cheeks.",
-        "A woman stands in place and leans her upper body backward, then straightens up.",
-        "A woman stands in place and brings one hand up to her mouth.",
+        "A person is surprised in a feminine way.",
+        "A person covers their mouth in surprise in a feminine way.",
+        "A person brings both hands to their cheeks in surprise in a feminine way.",
     ],
     "thinking": [
-        "A woman stands in place and brings one hand up to her chin.",
-        "A woman stands in place and tilts her head slowly toward her right shoulder.",
-        "A woman stands in place and raises one index finger beside her face.",
+        "A person thinks while tilting their head in a feminine way.",
+        "A person is thinking with a hand on their chin in a feminine way.",
+        "A person points upward while explaining in a feminine way.",
     ],
     "encouraging": [
-        "A woman stands in place and clasps both hands together in front of her chest.",
-        "A woman stands in place and pushes both fists forward at chest height.",
-        "A woman stands in place and extends one hand forward at chest height.",
+        "A person clasps their hands in front of their chest in a feminine way.",
+        "A person cheers someone on with both fists in a feminine way.",
+        "A person nods gently while listening in a feminine way.",
     ],
     "greeting": [
-        "A woman stands in place and waves one hand gently beside her face.",
-        "A woman stands in place and raises one hand up beside her head.",
-        "A woman stands in place and nods her head down to her chest.",
+        "A person waves cheerfully in a feminine way.",
+        "A person waves hello with one hand in a feminine way.",
+        "A person bows slightly in a feminine way.",
     ],
     "neutral": [
-        "A woman stands in place and turns her upper body to her right, then back to the front.",
-        "A woman stands in place and leans her upper body to her left, then straightens up.",
-        "A woman stands in place and repeatedly nods her head down and up.",
+        "A person talks while gesturing with one hand in a feminine way.",
+        "A person nods happily in a feminine way.",
+        "A person explains something with both hands in a feminine way.",
     ],
 }
 

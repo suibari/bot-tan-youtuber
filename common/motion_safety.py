@@ -27,80 +27,99 @@ BANNED_MOTION_RE = re.compile(
     r"crouch|crouches|crouching|kneel|kneels|kneeling|sit|sits|sitting|"
     r"lunge|lunges|spring|springs|knees?|clap|claps|clapping|applaud|applauds)\b", re.I)
 
-# 「A <なにか> stands in place [facing forward] [and|.]」までを丸ごと拾う
-_MOTION_PREFIX_RE = re.compile(
-    r"^\s*an?\s+\w+(\s+\w+)?\s+stands?\s+in\s+place"
-    r"(\s+facing\s+forward)?\s*(and\s+|,\s*|\.\s*)?", re.I)
+# ── 指示文の形 ───────────────────────────────────────
+#
+# 2026-10-03 に "A woman stands in place and <到達点つきの細かい動作>." から
+# "A person <短い動作> in a feminine way." に切り替えた。同じ音声・同じ5文で
+# ARDY に両方を渡して録画し、見比べて決めた（Kimodo でも同じ傾向）。
+#
+#   旧: A woman stands in place and brings one hand up to her chin.
+#   新: A person thinks while tilting their head in a feminine way.
+#
+# 旧形式は「手をもぞもぞやっているだけ」に見えていた。理由として分かったこと:
+#   - 学習データ（BONES-SEED の説明文）の主語はほぼすべて "A person"。
+#     "A woman" はデータに無い書き方で、女性らしさにはつながっていなかった
+#   - "stands in place" はデータに大量にある「ただ立っている」動きに引っ張る
+#   - データの説明文は短い。到達点や角度まで細かく書くほど固くなる
+#   - 女性らしさは "in a feminine way"（データにある書き方）で出る
+#
+# 旧形式の実測（「…して、正面に戻る」の往復形だけが体を向けた等）は
+# git の履歴（このファイルの 2026-08-12〜15 の版）に残っている。
 
-MOTION_SUBJECT = "A woman stands in place and "
+# 先頭の主語（と旧形式の "stands in place [facing forward] [and]"）を拾う
+_MOTION_PREFIX_RE = re.compile(
+    r"^\s*(?:an?\s+(?:young\s+)?(?:person|woman|girl|lady|character)|she|they)\b"
+    r"(?:\s+stands?\s+in\s+place(?:\s+facing\s+forward)?)?\s*(?:and\s+|,\s*|\.\s*)?", re.I)
+_HERSELF_RE = re.compile(r"\bherself\b", re.I)
+_HER_RE = re.compile(r"\bher\b", re.I)
+_SHE_RE = re.compile(r"\bshe\b", re.I)
+
+MOTION_SUBJECT = "A person "
+MOTION_STYLE = "in a feminine way"
+
+# 台本・配信の LLM に渡す motion の書き方。夜版・朝版・配信で同じものを使う
+# （以前は3か所に別々に書いてあり、片方だけ直して食い違っていた）。
+MOTION_PROMPT_RULES = """書き方のルール（2026-10-03 の録画比較に基づく）:
+- **"A person" で始め、末尾に "in a feminine way" を付ける**
+  （例: A person waves cheerfully in a feminine way.）
+- **短く書く。動作は1つ、5〜10語程度。** 何をしているかを動詞で書けば十分で、
+  手の到達点や角度まで細かく書かない（細かく書くほど動きが固くなる）
+- "stands in place" は書かない（棒立ちに引っ張られる）
+- 気持ちを表す副詞を使ってよい: cheerfully / happily / excitedly / shyly / gently
+  状態として書いてもよい: is surprised / is excited / is thinking
+- **前後左右への移動は書かない**（walk / step / turn around など。再生側で
+  水平移動を捨てるので、その場で足踏みしているように見える）
+- **下半身を使う動作は絶対に禁止**。スカートを履いていてカメラが腰の高さにあるため、
+  しゃがむ・膝を曲げる・跳ぶ・座る動作は下着が映る。
+  禁止: jump / hop / leap / squat / crouch / kneel / sit / knees / spring
+- **拍手は書かない**（clap / applaud）。生成AIが描けず、手を震わせている画になる
+- 表情だけの動詞は使わない（smiles / looks / feels）。体が動かず棒立ちになる
+- 同じ動作を何度も使わない
+
+よく使う形（この通りでなくてよい。内容に合わせてアレンジすること）:
+  A person waves cheerfully in a feminine way. /
+  A person nods happily in a feminine way. /
+  A person is surprised in a feminine way. /
+  A person thinks while tilting their head in a feminine way. /
+  A person talks while gesturing with one hand in a feminine way. /
+  A person clasps their hands in front of their chest in a feminine way. /
+  A person raises both arms happily in a feminine way. /
+  A person points upward while explaining in a feminine way."""
 
 # 文に motion が無い／禁止動作だったときに代わりに使う待機動作。
-# ARDY のプールが尽きたときにも使う。
-#
-# 選定の根拠は弱い。ARDY は拡散モデルでシードによって出力が大きく変わるのに、
-# 候補ごとにシード1つでしか測っていない。角度変化の二階差分（＝カクつき）が
-# 大きいものを避けたつもりだったが、実際に録画して見比べたところ画面上の差は
-# 確認できなかった。数値はあてにせず、実際の動画で問題が出たものだけを外している。
-#
-# 実際の動画で問題が出て外したもの:
-#   claps their hands ...                拍手にならず、手が胸の前で中途半端に往復して
-#                                        震えて見える（夜版72秒。独立2サンプルで再現）
-#   keeps bouncing lightly on their toes 跳ねる動作。スカートなので下半身は使わない
-#
-# 2026-08-12: 全文にあった "facing forward"（正面固定の明示）を外した。
-# Unity が体の向きを捨てていたので書いても無意味だったが、上限つきで通すようにした
-# 以上、正面を明示すると ARDY が体を向けなくなる。
-#
-# 同じ日に、ARDY の /generate を直接叩いて spec の hips ヨーと上体ロールを実測した
-# （3秒生成・独立2シード・振幅[度]。対照は "raises one hand to their chin"）:
-#
-#   指示                                         hipsヨー幅      上体ロール幅
-#   （対照）                                       4.5 /  8.2     6.4 /  5.1
-#   turns their upper body to their right,
-#     then back to the front                      81.1 / 76.3    25.3 /  7.9
-#   leans their upper body to their left,
-#     then straightens up                         10.0 /  9.3    25.6 / 27.6
-#   slowly sways their upper body from side to
-#     side                                         6.4 /  2.7     6.2 /  2.5  ← 効かない
-#   shakes their head slowly from side to side     1.2 /  1.5   （首ヨー 4.9 / 1.1）← 効かない
-#
-# 「…して、正面に戻る」という往復の形だけが効いた。sways / shakes は対照と差が無い
-# ので、待機動作からもプロンプトの例からも外した。
-#
-# 主語は "A person / their" ではなく "A woman / her" にしてある（2026-08-15）。
-# 動きが男っぽいという指摘への対処。ARDY はテキスト条件付きの拡散モデルなので、
-# 主語の性別で分布が動くことを期待している。上の実測値は "A person / their" 版の
-# ものなので、書き換えるときは振幅が落ちていないか測り直すこと。
+# ARDY のプールが尽きたときにも使う。上の5文は 2026-10-03 の比較録画で使ったもの。
 IDLE_MOTIONS = [
-    "A woman stands in place and opens both arms out to the sides at chest height.",
-    "A woman stands in place and leans her upper body to her left, then straightens up.",
-    "A woman stands in place and repeatedly nods her head down and up.",
-    "A woman stands in place and keeps tilting her head from one shoulder to the other.",
-    "A woman stands in place and clasps both hands together in front of her chest.",
-    "A woman stands in place and brings one hand up to her chin.",
-    "A woman stands in place and turns her upper body to her right, then back to the front.",
-    "A woman stands in place and raises one hand straight above her head.",
+    "A person waves cheerfully in a feminine way.",
+    "A person talks while gesturing with one hand in a feminine way.",
+    "A person thinks while tilting their head in a feminine way.",
+    "A person nods happily in a feminine way.",
+    "A person is surprised in a feminine way.",
+    "A person clasps their hands in front of their chest in a feminine way.",
+    "A person explains something with both hands in a feminine way.",
+    "A person sways gently while talking in a feminine way.",
 ]
 
 
 def normalize_motion_text(text: str) -> str:
-    """モーション指示文の主語を "A woman stands in place and ..." に揃える。
+    """モーション指示文を "A person <動作> in a feminine way." の形に揃える。
 
-    プロンプトで「必ずこの形で始める」と指示しているが、**LLM は普通に破る**。
-    実測（2026-08-12 / 08-15 の朝版）では主語ごと落として
-    `raises one hand up to her chin` のような断片を返しており、
-    ARDY には主語なしの文が渡っていた。禁止語と同じくコード側を最後の砦にする。
-
-    主語が女性であることは ARDY の条件付けに効かせたい要素なので、
-    `A person` と書かれていた場合も含めて書き換える。
+    プロンプトで形を指示しているが、**LLM は普通に破る**。実測（2026-08-12 / 08-15 の
+    朝版）では主語ごと落とした断片を返しており、ARDY には主語なしの文が渡っていた。
+    禁止語と同じくコード側を最後の砦にする。旧形式（"A woman stands in place and ..."）
+    で書かれていても新しい形に直す。代名詞も学習データに合わせて their に寄せる。
     """
     text = (text or "").strip()
     if not text:
         return text
-    body = _MOTION_PREFIX_RE.sub("", text).strip()
+    body = _MOTION_PREFIX_RE.sub("", text).strip().rstrip(".").strip()
     if not body:                      # 主語だけで中身が無いなら捨てる
         return ""
-    return MOTION_SUBJECT + body[0].lower() + body[1:]
+    body = _HERSELF_RE.sub("themselves", body)
+    body = _HER_RE.sub("their", body)
+    body = _SHE_RE.sub("they", body)
+    if "feminine" not in body.lower():
+        body = f"{body} {MOTION_STYLE}"
+    return MOTION_SUBJECT + body[0].lower() + body[1:] + "."
 
 
 def sanitize_motion(text: str) -> str:

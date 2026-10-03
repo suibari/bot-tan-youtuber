@@ -1049,8 +1049,7 @@ def dedupe_vrma_segments(segments: list[dict], window: int = 4) -> list[dict]:
     return out
 
 
-# 指示文の先頭を "A woman stands in place and ..." に揃える正規表現。
-# 「A <なにか> stands in place [facing forward] [and|.]」までを丸ごと拾う
+# 指示文を "A person <動作> in a feminine way." に揃える正規表現（common/motion_safety.py）。
 _MOTION_PREFIX_RE    = motion_safety._MOTION_PREFIX_RE
 MOTION_SUBJECT       = motion_safety.MOTION_SUBJECT
 normalize_motion_text = motion_safety.normalize_motion_text

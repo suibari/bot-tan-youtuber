@@ -11,7 +11,10 @@
   ここを緩めるとCSV方式にした意味がなくなる。
 """
 
+from textwrap import indent as _indent
+
 from prompts import CHARACTER_PROMPT
+from common.motion_safety import MOTION_PROMPT_RULES
 from quiz_data import answer_text, wrong_text
 
 QUIZ_SYSTEM_PROMPT = CHARACTER_PROMPT + """
@@ -165,52 +168,17 @@ def build_quiz_user_prompt(quiz: dict) -> str:
     例: 「実はこうなんだって」  → 人差し指を立てて説明する動き
     例: 「知らなくて大丈夫だよ」→ 両手を胸の前で合わせて落ち着かせる動き
 
-  書き方のルール（実測に基づく。守らないとキャラが棒立ちになる）:
-  - 必ず "A woman stands in place" で始める。
-    **前後左右への移動は書かない**（水平方向の移動は再生側で捨てられるため、
-    歩いてもその場で足踏みしているようにしか見えない）。
-    ただし**その場での体の向き・傾きは使ってよい**（下記）
-  - **腕だけでなく上体も使うこと**。腕しか動かないと立ち絵に見える。
-    体をひねる・傾ける動きは再生側で角度を制限してあるので、書いても顔は正面に残る。
-    **「…して、正面に戻る」という往復の形で書くこと**（実測でこの形だけが効いた）:
-      turns her upper body to her right, then back to the front /
-      leans her upper body to her left, then straightens up /
-      twists her torso to one side, then returns to center
-  - **下半身を使う動作は禁止**。キャラはスカートを履いていて、カメラが正面・腰の高さに
-    あるため、しゃがむ・膝を曲げる・跳ぶ・座る動作は下着が映って公開できない。
-    禁止例: jump / hop / leap / squat / crouch / kneel / sit / bend her knees /
-    spring up。**大きく動かすのは腕・上体・首だけにすること**
-  - **拍手は書かない**。モーション生成AIが拍手を描けず、手が胸の前で中途半端に
-    往復するだけになり、手を震わせている画に見える（実測）
-  - **動作は1つだけ**。「Aして、次にBする」のような複合動作は書かない。
-    ただし「ひねって戻す」「傾けて戻す」のような1往復は1つと数えてよい
-  - **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
+""" + _indent(MOTION_PROMPT_RULES, "  ") + """
+
+  朝版だけの注意:
   - **手や腕を同じ場所で往復させ続ける動作は書かない**。3秒間ずっと手を震わせている
-    画になり、見ていて不安になる（例: 胸の前で両手を上下に繰り返す）。
-    首や上体をゆっくり繰り返し動かすのは可
-  - **抽象的な動詞と表情の描写は禁止**。モーション生成AIは体しか動かせないので、
-    書いても棒立ちになる（実測で腕の動きがほぼゼロだった）
-    禁止例: gestures / expresses / shows / indicates / smiles / looks / feels
-  - 話の山場では手が胸より上に来る動作にする。腰の高さの動きは画面外に出て見えない
+    画になり、見ていて不安になる（例: 胸の前で両手を上下に繰り返す）
+  - **使ってはいけない動作**（実測で不自然な震えが出た）:
+    頬に手を添える / 胸に手を当てる / 腕を組む
   - カメラは引いた全身の画になる。小さくまとまらず、思い切って大きく動かすこと
-  - 1つあたり15語程度まで
-  - **同じ動作を何度も使わない**。文ごとに内容に合わせて変えること
   - explanation の動きは**このクイズの題材そのものを体で表現する**。
     どのクイズでも使い回せる動きにしない
-    （例: 猫がテーマ → raises both hands beside her face like cat paws）
-
-  **使ってはいけない動作**（実測で不自然な震えが出た）:
-    頬に手を添える / 胸に手を当てる / 腕を組む / 拍手
-
-  よく使う形（この通りでなくてよい。内容に合わせてアレンジすること）:
-    raises both arms straight up above her head / opens both arms out to the sides
-    at chest height / raises one hand straight above her head / raises both fists
-    up to her chest / waves one hand gently beside her face / raises one index
-    finger beside her face / clasps both hands together in front of her chest /
-    tilts her head slowly toward her right shoulder / brings one hand up to
-    her chin / nods her head down to her chest /
-    turns her upper body to her right, then back to the front /
-    leans her upper body to her left, then straightens up
+    （例: 猫がテーマ → A person makes cat paws with both hands in a feminine way.）
 
 重要：合計の尺は30秒以内。
 **VOICEVOXの読み上げ速度は約6.5文字/秒**なので、各パートの文字数の目安を超えると
@@ -233,22 +201,22 @@ def build_fallback_script(quiz: dict) -> dict:
         ],
         "answer_reveal": [
             {"text": f"正解は、{ans}の{answer_text(quiz)}！", "valence": 0.9, "arousal": 0.9,
-             "motion": "A woman stands in place and raises one hand straight above her head."},
+             "motion": "A person raises one hand proudly in a feminine way."},
         ],
         "explanation": [
             {"text": quiz["解説"], "valence": 0.7, "arousal": 0.0,
-             "motion": "A woman stands in place and raises one index finger beside her face."},
+             "motion": "A person points upward while explaining in a feminine way."},
         ],
         "affirmation": [
             {"text": "知らなかったってことは、今日ひとつ知れたってことだよ。", "valence": 1.0, "arousal": 0.2,
-             "motion": "A woman stands in place and clasps both hands together in front of her chest."},
+             "motion": "A person clasps their hands in front of their chest in a feminine way."},
         ],
         "thumbnail_text": quiz["問題"][:20],
         "title_hook":     quiz["問題"][:25],
         # LLMが落ちたときは題材に紐づけられないので、どのクイズでも成立する汎用動作にする
         "motions": {
             "think": [
-                "A woman stands in place and brings one hand up to her chin.",
+                "A person thinks while tilting their head in a feminine way.",
             ],
         },
     }

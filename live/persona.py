@@ -21,7 +21,8 @@
 import json
 from pathlib import Path
 
-from config import AFFIRMATIVE_BOT_DIR
+from config import AFFIRMATIVE_BOT_DIR  # common/ を import パスに載せるので先に読む
+from common.motion_safety import MOTION_PROMPT_RULES  # noqa: E402
 
 _JSON_DIR = Path(AFFIRMATIVE_BOT_DIR) / "packages" / "shared-configs" / "src" / "json"
 
@@ -238,33 +239,7 @@ en は必ず英語（アルファベット）で書く。
   例: 「たっぷり休んでね」→ 両手を胸の前で合わせて落ち着かせる動き
   例: 「本当にすごいね！」→ 両手を頭上に上げて称える動き
 
-書き方のルール（実測に基づく。守らないと棒立ちになる）:
-- 必ず "A woman stands in place" で始める
-- **前後左右への移動は書かない**（再生側で捨てられるので、その場で足踏みして見える）
-- **腕だけでなく上体も使う**。ただし体をひねる・傾ける動きは
-  **「…して、正面に戻る」という往復の形で書くこと**（この形だけが実測で効いた）
-    turns her upper body to her right, then back to the front /
-    leans her upper body to her left, then straightens up
-- **下半身を使う動作は絶対に禁止**。スカートを履いていてカメラが腰の高さにあるため、
-  しゃがむ・膝を曲げる・跳ぶ・座る動作は配信できない画になる。
-  禁止: jump / hop / leap / squat / crouch / kneel / sit / bend her knees / spring up
-- **拍手は書かない**。生成AIが描けず、手を震わせている画になる（実測）
-- **動作は1つだけ**。「Aして、次にB」は書かない（「ひねって戻す」は1つと数える）
-- **「動詞 + 体の部位 + 到達点」の形で書く。到達点は必須**
-- **抽象的な動詞と表情の描写は禁止**。体しか動かせないので棒立ちになる。
-  禁止: gestures / expresses / shows / indicates / smiles / looks / feels
-- 話の山場では手が胸より上に来る動作にする。腰の高さの動きは画面外に出る
-- 15語程度まで
-- 毎回同じ動作を使わない
-
-よく使う形（この通りでなくてよい。内容に合わせてアレンジすること）:
-  raises both arms straight up above her head / opens both arms out to the sides
-  at chest height / raises one hand straight above her head / waves one hand
-  gently beside her face / raises one index finger beside her face /
-  clasps both hands together in front of her chest / tilts her head slowly
-  toward her right shoulder / brings one hand up to her chin /
-  nods her head down to her chest /
-  turns her upper body to her right, then back to the front
+""" + MOTION_PROMPT_RULES + """
 
 # 調べたこと
 配信中、あなたはコメントで聞かれたことをその場で調べられます。調べた結果は
