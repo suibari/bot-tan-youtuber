@@ -144,7 +144,7 @@ def build_segments(text: str, category: str,
 
 
 def generate_vrma(text: str, out_vrma: Path, category: str = "neutral",
-                  duration: float = GEN_DURATION, seed: int = None):
+                  duration: float = GEN_DURATION, seed: int = None, count: int = None):
     """モーション指示から .vrma を1本作る。戻り値は尺[秒]、失敗なら None。
 
     text は safety.sanitize_motion を通したものを渡すこと。
@@ -155,7 +155,7 @@ def generate_vrma(text: str, out_vrma: Path, category: str = "neutral",
     3秒クリップ向けなので、連結でも足りるが念のため下限として使う）。
     """
     seed = random.randint(1, 2 ** 31 - 1) if seed is None else seed
-    segments = build_segments(text, category, duration=duration)
+    segments = build_segments(text, category, count=count, duration=duration)
     if len(segments) == 1:
         return ardy.generate_vrma(text=segments[0]["text"], out_vrma=out_vrma,
                                   duration=segments[0]["duration"], seed=seed,
@@ -238,6 +238,37 @@ class MotionPool:
 
 # ── 非同期生成ワーカー ────────────────────────────────
 
+class MotionJob:
+    """その場で作る1本。返答ができた瞬間に依頼し、できしだい発話中に差し替える。
+
+    path はできあがった .vrma（失敗・取り消しなら None）。done が立ったら確定。
+    新しい返答の依頼が来たら、まだ作り始めていない古い依頼は取り消される。
+    """
+
+    def __init__(self, text: str, category: str, duration: float):
+        self.text = text
+        self.category = category
+        self.duration = duration
+        self.path = None
+        self.seconds = 0.0
+        self.requested_at = time.monotonic()
+        self.done = threading.Event()
+        self.cancelled = False
+        self.played_at = None        # idle が Unity へ投げた時刻（monotonic）
+
+    def finish(self, path, seconds: float = 0.0) -> None:
+        self.path = str(path) if path else None
+        self.seconds = seconds
+        self.done.set()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.done.set()
+
+    def ready(self) -> bool:
+        return self.done.is_set() and self.path is not None
+
+
 class ArdyWorker:
     """ARDY への生成依頼を1本ずつ順に処理するワーカー。
 
@@ -261,6 +292,9 @@ class ArdyWorker:
         self._stop = threading.Event()
         self._failure_lock = threading.Lock()
         self._oom_disabled = False
+        # その場で作る1本の枠。プール補充や裏の生成より先に処理する
+        self._urgent = None
+        self._urgent_lock = threading.Lock()
 
     def start(self, wait: bool = True) -> bool:
         """サーバを起動してワーカースレッドを回す。使えなければ False。"""
@@ -282,6 +316,54 @@ class ArdyWorker:
         self._thread = threading.Thread(target=self._run, daemon=True, name="ardy")
         self._thread.start()
         return True
+
+    def request(self, text: str, category: str, duration: float) -> MotionJob:
+        """その場で1本作る。使えなければ None。
+
+        尺 duration の1セグメントだけを作る（3セグメントつなぐより速い）。
+        同じ文のクリップを既に持っていれば、生成せずにそれを返す。
+        前の返答の依頼がまだ始まっていなければ取り消して入れ替える
+        （話題が変わった後で古い身振りが出てくるより、待ちが短いほうがよい）。
+        """
+        if not self.enabled:
+            return None
+        text = safety.sanitize_motion(text)
+        if not text:
+            return None
+        job = MotionJob(text, category, duration)
+        have = self.pool.path_for(category, text)
+        if have.exists():
+            job.finish(have, self.pool.duration_of(have))
+            return job
+        with self._urgent_lock:
+            if self._urgent is not None and not self._urgent.done.is_set():
+                print(f"[ARDY] 前の返答の身振りを取り消します: {self._urgent.text[:50]}")
+                self._urgent.cancel()
+            self._urgent = job
+        return job
+
+    def _take_urgent(self) -> MotionJob:
+        with self._urgent_lock:
+            job, self._urgent = self._urgent, None
+        return None if job is None or job.done.is_set() else job
+
+    def _run_urgent(self, job: MotionJob) -> None:
+        out = self.pool.path_for(job.category, job.text)
+        waited = time.monotonic() - job.requested_at
+        started = time.monotonic()
+        made = generate_vrma(job.text, out, category=job.category,
+                             duration=job.duration, count=1)
+        took = time.monotonic() - started
+        if not made:
+            print(f"[ARDY] その場の身振りを作れませんでした（{took:.1f}秒）: {job.text[:50]}")
+            job.finish(None)
+            return
+        self.pool.write_duration(out, made)
+        # 配信中の生成時間を実測として残す（待ち＝前の生成の終わり待ち）
+        print(f"[ARDY] その場の身振り: 待ち{waited:.1f}秒 + 生成{took:.1f}秒 "
+              f"({made:.1f}秒のクリップ) {job.text[:50]}")
+        job.finish(out, made)
+        self._done.put((str(out), job.category))
 
     def submit(self, text: str, category: str) -> bool:
         """生成を依頼する。キューが一杯なら古いものを捨てて入れ替える。"""
@@ -314,9 +396,12 @@ class ArdyWorker:
             return None
 
     def _next_request(self):
-        """次に作るもの。発話由来の依頼を優先し、無ければプール補充を1件。"""
+        """次に作るもの。発話由来の依頼を優先し、無ければプール補充を1件。
+
+        その場の依頼（_urgent）を待たせないよう、待つのは短く刻む。
+        """
         try:
-            return self._queue.get(timeout=1.0)
+            return self._queue.get(timeout=0.2)
         except queue.Empty:
             pass
         try:
@@ -326,6 +411,10 @@ class ArdyWorker:
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            job = self._take_urgent()
+            if job is not None:
+                self._run_urgent(job)
+                continue
             item = self._next_request()
             if item is None:
                 continue

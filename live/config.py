@@ -92,6 +92,16 @@ IDLE_EMOTION_MAX_SEC = env_float("IDLE_EMOTION_MAX_SEC", 8.0)
 # ほほえみパルスを保つ長さ[秒]。黙っている間にときどき笑顔を作る
 IDLE_SMILE_HOLD_SEC = env_float("IDLE_SMILE_HOLD_SEC", 1.5)
 
+# 返答ごとに、その話題に合った身振りを ARDY でその場で作る（2026-10-03）。
+# 作り置き（プール）は生成が終わるまでのつなぎにだけ使い、できしだい差し替える。
+# false にすると従来どおり「プールから引く＋次の発話以降のために裏で作る」に戻る
+LIVE_MOTION_ON_DEMAND = env_flag("LIVE_MOTION_ON_DEMAND", True)
+# その場で作るクリップの尺[秒]。1セグメントだけにして生成を速くする
+LIVE_MOTION_ON_DEMAND_SEC = env_float("LIVE_MOTION_ON_DEMAND_SEC", 4.0)
+# 「手を挙げて」など動きを頼まれたとき、話し終わってから生成を待つ上限[秒]。
+# 返答の lines で「ちょっと待ってね」と言わせてあるので、黙って待つ時間になる
+LIVE_MOTION_REQUEST_WAIT_SEC = env_float("LIVE_MOTION_REQUEST_WAIT_SEC", 45.0)
+
 # ── VOICEVOX ─────────────────────────────────────
 # 10101 は AivisSpeech Engine の既定ポートでもある。起動時に /speakers で実体を確認する
 VOICEVOX_URL     = _voice.VOICEVOX_URL
@@ -163,8 +173,20 @@ ARDY_ARM_SPREAD    = _ardy.ARDY_ARM_SPREAD
 # これを渡さないと Unity 側は「改修前の見た目」の既定値で動き、-vrmaSmooth（実測で
 # カクつき -64%）も効かない。統合前の配信はこれを1つも渡していなかった。
 # 配信だけ変えたいときは LIVE_VRMA_SMOOTH のように LIVE_ を頭に付けた環境変数を置く。
+#
+# 体の向きだけは配信の既定を Shorts と変える（2026-10-03）。「回って」に応えるため、
+# 上限を 35° → 180°、クリップ由来の首振りを 15° → 90° にした。
+# Shorts は最大12本をつないだ1本を流すので、途中で横を向くとそのまま話し続けかねず、
+# 35° のまま。配信のその場の身振りは4秒の1本で、終われば正面の Idle に戻る。
+LIVE_VRMA_YAW_LIMIT = env_float("LIVE_VRMA_YAW_LIMIT", 180.0)
+LIVE_VRMA_HEAD_YAW  = env_float("LIVE_VRMA_HEAD_YAW", 90.0)
+
+
 def vrma_unity_args() -> list:
-    return _vrma_style.vrma_unity_args(prefix="LIVE_")
+    args = _vrma_style.vrma_unity_args(prefix="LIVE_")
+    args[args.index("-vrmaYawLimit") + 1] = f"{LIVE_VRMA_YAW_LIMIT}"
+    args[args.index("-vrmaHeadYaw") + 1] = f"{LIVE_VRMA_HEAD_YAW}"
+    return args
 
 
 # 次のモーションを投げる間隔を決めるときの重なり[秒]。

@@ -67,13 +67,15 @@ MOTION_PROMPT_RULES = """書き方のルール（2026-10-03 の録画比較に�
 - "stands in place" は書かない（棒立ちに引っ張られる）
 - 気持ちを表す副詞を使ってよい: cheerfully / happily / excitedly / shyly / gently
   状態として書いてもよい: is surprised / is excited / is thinking
-- **前後左右への移動は書かない**（walk / step / turn around など。再生側で
-  水平移動を捨てるので、その場で足踏みしているように見える）
+- **前後左右への移動は書かない**（walk / step など。再生側で
+  水平移動を捨てるので、その場で足踏みしているように見える）。その場で回るのはよい
 - **跳ねる・弾むのは歓迎**（jumps / hops / bounces）。嬉しい・盛り上がる場面で使う
 - **座る・ひざまずく・深くしゃがむ動作は禁止**（立って話しているキャラなので不自然）
   禁止: sit / kneel / squat / crouch / lunge
 - **拍手は書かない**（clap / applaud）。生成AIが描けず、手を震わせている画になる
 - 表情だけの動詞は使わない（smiles / looks / feels）。体が動かず棒立ちになる
+- **話題の形や大きさを手で表すのも良い**（丸い物 → draws a circle in the air /
+  大きい → spreads their arms wide / 小さい → shows something tiny with their fingers）
 - 同じ動作を何度も使わない
 
 よく使う形（この通りでなくてよい。内容に合わせてアレンジすること）:

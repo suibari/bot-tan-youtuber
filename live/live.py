@@ -46,6 +46,7 @@ from config import (
     LIVE_MIN_FPS, LIVE_FPS_PROBE_SEC, LIVE_FPS_GATE, LIVE_FPS_STALL_SEC,
     LIVE_DISPLAY,
     LIVE_HISTORY_TURNS, LIVE_HISTORY_USER_TURNS,
+    LIVE_MOTION_ON_DEMAND, LIVE_MOTION_ON_DEMAND_SEC, LIVE_MOTION_REQUEST_WAIT_SEC,
     SKIP_ARDY, SUBTITLE_LEAD_SEC, UNITY_PROJECT, UNITY_RESTART_MAX,
     UNITY_RESTART_TIMEOUT_SEC, UNITY_RESTART_COOLDOWN_SEC,
     WORK_DIR, ensure_dirs,
@@ -505,15 +506,27 @@ class LiveSession:
         arousal = reply.get("arousal", 0.0)
         category = reply.get("motion_category", "neutral")
 
-        # 1) モーション。合成を待たずに先に動かす。プールから即座に引く。
+        # 1) この返答の身振りを ARDY にその場で作らせる（LIVE_MOTION_ON_DEMAND）。
+        #    ダンスは作り置き（3セグメント・約9秒）のほうが長く踊れるのでプールに任せる
+        motion_en = safety.sanitize_motion(reply.get("motion_en", ""))
+        if (reply.get("motion_request") and category == "dance"
+                and "danc" not in motion_en.lower()):
+            # 「手を挙げて」でも dance を選ぶことがある（実測）。作り置きのダンスが
+            # 流れて頼まれた動きが出ないので、ダンス以外の頼みはダンス扱いにしない
+            category = "happy"
+        job = None
+        if LIVE_MOTION_ON_DEMAND and motion_en and category != "dance":
+            job = self.ardy.request(motion_en, category, LIVE_MOTION_ON_DEMAND_SEC)
+
+        # 2) モーション。合成を待たずに先に動かす。プールから即座に引き、
+        #    その場の身振りができしだい差し替える。
         #    投げるのは idle スレッドの仕事（/motion の送出者を1つにしておかないと、
         #    フェードイン途中のクリップを打ち切って Idle が一瞬混ざる）。
         #    発話が終わるまで、クリップが切れる手前で継ぎ足し続けてくれる
-        self.idle.speak_begin(category, valence, arousal)
+        self.idle.speak_begin(category, valence, arousal, job=job)
 
-        # 2) ARDY へ非同期で投げる。次の発話以降で使えるようになる
-        motion_en = safety.sanitize_motion(reply.get("motion_en", ""))
-        if motion_en:
+        # 3) その場で作らないときは、次の発話以降のために裏で作る（従来の動作）
+        if job is None and motion_en:
             self.ardy.submit(motion_en, category)
 
         prefix = f"utt_{int(time.time() * 1000)}"
@@ -588,12 +601,36 @@ class LiveSession:
             return ""
 
         self._wait_speech_end()
+        if job is not None and reply.get("motion_request"):
+            self._show_requested_motion(job)
         self.idle.speak_end()
         self.last_speech_at = time.monotonic()
 
         text = " ".join(l["ja"] for l in lines[:spoken])
         print(f"[live] 発話{f'({tag})' if tag else ''}: {text[:60]}")
         return text
+
+    def _show_requested_motion(self, job) -> None:
+        """「手を挙げて」など動きを頼まれたとき、その身振りを見せ終わるまで待つ。
+
+        返答の lines で「ちょっと待ってね」と言わせてある。発話中の扱いのまま待つので、
+        待つ間も idle がプールのクリップでつなぎ、できしだい差し込む。
+        LIVE_MOTION_REQUEST_WAIT_SEC を過ぎたら諦める（配信を止めない）。
+        """
+        deadline = time.monotonic() + LIVE_MOTION_REQUEST_WAIT_SEC
+        while job.played_at is None and time.monotonic() < deadline:
+            if job.done.is_set() and job.path is None:
+                print("[live] 頼まれた動きを作れなかったので、見せずに進めます")
+                return
+            time.sleep(0.1)
+        if job.played_at is None:
+            print(f"[live] 頼まれた動きが{LIVE_MOTION_REQUEST_WAIT_SEC:.0f}秒で"
+                  f"間に合わなかったので、見せずに進めます")
+            return
+        # 身振りを最後まで見せる（フェードアウトのぶんは次のクリップと重なる）
+        rest = job.played_at + job.seconds - time.monotonic()
+        if rest > 0:
+            time.sleep(rest)
 
     def _wait_line(self, duration: float, interruptible: bool,
                    lead: float = 0.7) -> bool:

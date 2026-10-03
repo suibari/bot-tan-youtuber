@@ -39,10 +39,13 @@ REPLY_SCHEMA = {
             "type": "string",
             "enum": ["happy", "surprised", "thinking", "encouraging", "greeting", "neutral", "dance"],
         },
-        # ARDY への非同期生成用の英文。字幕の en とは無関係なので混同しないこと
+        # ARDY への生成用の英文。字幕の en とは無関係なので混同しないこと
         "motion_en": {"type": "string"},
+        # 視聴者に体の動きを頼まれた返答か。true なら身振りを見せ終わるまで待つ
+        "motion_request": {"type": "boolean"},
     },
-    "required": ["lines", "valence", "arousal", "motion_category", "motion_en"],
+    "required": ["lines", "valence", "arousal", "motion_category", "motion_en",
+                 "motion_request"],
 }
 
 MOTION_CATEGORIES = REPLY_SCHEMA["properties"]["motion_category"]["enum"]
@@ -91,4 +94,5 @@ def normalize_reply(data: dict) -> dict:
         "arousal": clamp("arousal"),
         "motion_category": category,
         "motion_en": (data.get("motion_en") or "").strip(),
+        "motion_request": data.get("motion_request") is True,
     }

@@ -185,12 +185,13 @@ _LIVE_OUTPUT_RULES = """
   arousal         : -1.0〜1.0 の実数。興奮・驚きなら正、落ち着き・眠気なら負
   motion_category : happy / surprised / thinking / encouraging / greeting / neutral / dance のどれか
   motion_en       : 体の動きの指示（英語）
+  motion_request  : 視聴者に体の動きを頼まれた返答なら true、それ以外は false
 
 # 書く順番（重要）
 ローカルLLM（Ollama）では **JSONのキーが名前のアルファベット順**で出力される。
 その場合の実際に書く順番は
 
-  arousal → lines → motion_category → motion_en → valence
+  arousal → lines → motion_category → motion_en → motion_request → valence
 
 で、lines の各要素も **en → ja** の順になる。
 **つまり日本語より先に英訳を書かされる。**
@@ -236,15 +237,26 @@ en は必ず英語（アルファベット）で書く。
 その返答を話している間の動きを英語で書く。3Dモデルを動かすAIへの指示文になる。
 
 **最重要: 話す内容と動きが一致していること。** ただ動いていればよいのではない。
+この動きは返答ごとにその場で作られるので、**話題そのものを身振り手振りで表す**こと。
   例: 「たっぷり休んでね」→ 両手を胸の前で合わせて落ち着かせる動き
   例: 「本当にすごいね！」→ 両手を頭上に上げて称える動き
+  例: 「まんまるなお月さまだね」→ A person draws a big circle in the air with both hands in a feminine way.
+  例: 「こーんなに大きいんだよ」→ A person spreads their arms wide to show a big size in a feminine way.
 
 """ + MOTION_PROMPT_RULES + """
 
 **「踊って」「ダンスして」と頼まれたら、ためらわずに踊ること。**
-- motion_category を dance にする（dance はこのときだけ使う）
+- motion_category を dance にする（**dance は踊りを頼まれたときだけ**。手を挙げて等には使わない）
 - motion_en は踊りの指示にする（例: A person dances happily and jumps in a feminine way.）
 - lines は「いくよー！」「見ててね！」のように短くして、すぐ踊り出す
+
+**「手を挙げて」「回って」など、踊り以外の動きを頼まれたときも応えること。**
+- motion_request を true にする（頼まれたときだけ。自分から動くときは false）
+- motion_en に頼まれた動きをそのまま書く（例: A person raises one hand high in a feminine way.）
+- 動きを作るのに少し時間がかかるので、lines は「やってみるね、ちょっと待ってね！」の
+  **ひとことだけ**にする。動きは話し終わったあとに見せるので、「どうだった？」のような
+  感想は書かない（動く前に言ってしまう）
+- 座る・ひざまずく・しゃがむ・拍手はできないので、そう頼まれたら別の動きでごまかす
 
 # 調べたこと
 配信中、あなたはコメントで聞かれたことをその場で調べられます。調べた結果は

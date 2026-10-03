@@ -95,15 +95,20 @@ class IdleAnimator(threading.Thread):
         self._speaking = False
         self._speak_category = "neutral"
         self._next_at = 0.0          # 次にモーションを投げる時刻（monotonic）
+        # その場で作った身振り（motion.MotionJob）。できしだい発話中に差し込む
+        self._job = None
+        self._last_play_at = 0.0     # 最後に /motion を投げた時刻（monotonic）
         # 山を作ったあと、次の表情イベントで素の顔へ引き戻すかどうか
         self._releasing = False
 
     # ── 配信ループから呼ぶ ──
 
     def speak_begin(self, category: str, valence: float = None,
-                    arousal: float = None) -> None:
+                    arousal: float = None, job=None) -> None:
         """発話の頭で呼ぶ。すぐに1本投げ、以後クリップが切れる手前で継ぎ足す。
 
+        job（motion.MotionJob）を渡すと、その身振りができしだい差し込む。
+        それまではプールから引いた同じカテゴリのクリップでつなぐ。
         表情は発話側（_speak）が /emotion で決めるので、ここでは振らない。
         """
         if valence is not None and arousal is not None:
@@ -111,6 +116,7 @@ class IdleAnimator(threading.Thread):
         with self._lock:
             self._speaking = True
             self._speak_category = category or "neutral"
+            self._job = job
             self._next_at = 0.0      # 次のループで即座に1本投げる
         # 発話側が /emotion を決めるので、待機中に作った山は捨てる
         self._releasing = False
@@ -119,6 +125,7 @@ class IdleAnimator(threading.Thread):
         """発話が終わったら呼ぶ。待機モードへ戻す。"""
         with self._lock:
             self._speaking = False
+            self._job = None
             # 喋り終わりの余韻を持たせる。すぐ次の待機モーションを投げると
             # 最後のクリップと二重に掛かる
             self._next_at = time.monotonic() + random.uniform(IDLE_MOTION_MIN_SEC,
@@ -149,6 +156,8 @@ class IdleAnimator(threading.Thread):
             due = now >= due_at
 
             if speaking:
+                if self._play_job(now):
+                    continue
                 if due:
                     # 次の予定は「実際に投げた時刻」ではなく「予定時刻」から数える。
                     # 実際の時刻を基準にするとループの刻みぶん（最大 TICK_SEC）だけ
@@ -166,6 +175,35 @@ class IdleAnimator(threading.Thread):
                                                   IDLE_MOTION_MAX_SEC))
             if now >= next_emotion:
                 next_emotion = now + self._next_expression()
+
+    def _play_job(self, now: float) -> bool:
+        """その場で作った身振りができていれば差し込む。投げたら True。
+
+        Unity はフェードイン途中のクリップを打ち切ると重みが1に届かず Idle が
+        一瞬混ざる（VrmaMotionPlayer.EnqueueMotion）。直前に投げたクリップが
+        フェードし終わるまでは待つ。
+        """
+        with self._lock:
+            job = self._job
+        if job is None or not job.ready():
+            return False
+        if now - self._last_play_at < VRMA_CHUNK_OVERLAP + 0.1:
+            return False
+        with self._lock:
+            if self._job is not job:
+                return False
+            self._job = None
+        try:
+            unity_client.motion(job.path)
+        except unity_client.UnityError as e:
+            print(f"[idle] その場の身振りを送れません（無視します）: {e}")
+            return False
+        self._last_play_at = now
+        job.played_at = now
+        print(f"[idle] その場の身振りに切り替え（依頼から{now - job.requested_at:.1f}秒）")
+        # 身振りが終わる手前でプールのクリップへ継ぎ足す
+        self._schedule(max(0.5, job.seconds - VRMA_CHUNK_OVERLAP))
+        return True
 
     def _play(self, category: str, spacing: float = None,
               base: float = None) -> None:
@@ -189,6 +227,7 @@ class IdleAnimator(threading.Thread):
             print(f"[idle] しぐさを送れません（無視します）: {e}")
             self._schedule(retry)
             return
+        self._last_play_at = time.monotonic()
         if spacing is None:
             spacing = max(0.5, clip - VRMA_CHUNK_OVERLAP)
         self._schedule(spacing, base=base)
