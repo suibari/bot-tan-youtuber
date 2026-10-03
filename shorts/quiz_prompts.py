@@ -80,20 +80,22 @@ _SENTENCE_M = {
     "required": ["text", "valence", "arousal", "motion"],
 }
 
-# シンキングタイムだけは発話が無く（カウントダウン音のみ）紐づける文が無いので、
-# ここだけパート単位で受け取る
+# シンキングタイムは発話が無く（カウントダウン音のみ）、エンディングは固定文
+# （quiz_data.pick_greeting + CLOSING_TEXT）でペルソナが書く文が無い。
+# 紐づける文が無いこの2つだけはパート単位で受け取る
 _MOTIONS = {
     "type": "object",
     "properties": {
-        "think": {"type": "array", "items": {"type": "string"}},
+        "think":  {"type": "array", "items": {"type": "string"}},
+        "ending": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["think"],
+    "required": ["think", "ending"],
 }
 
 QUIZ_SCRIPT_SCHEMA = {
     "type": "object",
     "properties": {
-        "question_intro": {"type": "array", "items": _SENTENCE},
+        "question_intro": {"type": "array", "items": _SENTENCE_M},
         "answer_reveal":  {"type": "array", "items": _SENTENCE_M},
         "explanation":    {"type": "array", "items": _SENTENCE_M},
         "affirmation":    {"type": "array", "items": _SENTENCE_M},
@@ -156,11 +158,18 @@ def build_quiz_user_prompt(quiz: dict) -> str:
 ⑦ motion — botたんの体の動き。**英語で**書くこと（日本語だと翻訳で崩れる）
   AIが3Dモデルを動かすための指示文です。
 
-  **answer_reveal / explanation / affirmation の各sentenceに "motion" を付ける**こと
-  （question_intro は動きを付ける区間の外なので不要）。
+  **question_intro / answer_reveal / explanation / affirmation の各sentenceに
+  "motion" を付ける**こと。
+  question_intro はカメラが顔のアップで、サムネもここから撮る。胸から上で見せる動きにし、
+  **手で顔を隠す動き（頬に手を添える・顔の前で手を動かす）は書かない**
+  （例: 両手を胸の前で合わせてわくわくする、首をかしげて問いかける）。
   さらに motions.think に、シンキングタイム中の動きを**英文1つの配列**で入れること
   （ここだけ発話が無いので文に紐づけられない）。
   シンキングタイムは3秒しかないので、2つ入れても後ろは再生されずに捨てられる。
+  motions.ending には、エンディング（朝のあいさつ →「行ってらっしゃい！」）の動きを
+  **英文1〜2つの配列**で入れること。視聴者を朝に送り出す動きにする
+  （例: 手を振って見送る）。**お辞儀は書かない**（モーション生成AIが深く頭を下げ、
+  画面に頭頂部しか映らなくなる）。
 
   **最重要: その文の内容と動きが一致していること**。ただ動いていればよいのではない。
   文で言っていることを体で表す。合っていないと、見ていて不安になる画になる。
@@ -195,9 +204,12 @@ def build_fallback_script(quiz: dict) -> dict:
     ans = quiz["正解"]
     return {
         "question_intro": [
-            {"text": "勘違いクイズ！",  "valence": 0.8, "arousal": 0.8},
-            {"text": quiz["問題"],      "valence": 0.5, "arousal": 0.6},
-            {"text": "どっち？",        "valence": 0.6, "arousal": 0.7},
+            {"text": "勘違いクイズ！",  "valence": 0.8, "arousal": 0.8,
+             "motion": "A person waves cheerfully in a feminine way."},
+            {"text": quiz["問題"],      "valence": 0.5, "arousal": 0.6,
+             "motion": "A person talks while gesturing with one hand in a feminine way."},
+            {"text": "どっち？",        "valence": 0.6, "arousal": 0.7,
+             "motion": "A person thinks while tilting their head in a feminine way."},
         ],
         "answer_reveal": [
             {"text": f"正解は、{ans}の{answer_text(quiz)}！", "valence": 0.9, "arousal": 0.9,
@@ -217,6 +229,9 @@ def build_fallback_script(quiz: dict) -> dict:
         "motions": {
             "think": [
                 "A person thinks while tilting their head in a feminine way.",
+            ],
+            "ending": [
+                "A person waves cheerfully in a feminine way.",
             ],
         },
     }
@@ -240,7 +255,7 @@ def validate_script(script: dict, quiz: dict) -> list[str]:
 
     # 文ごとの motion。ARDY に渡す英文なので、日本語のまま返ってくると
     # FuguMT の英訳が崩れて、その崩れた英文がモーションの条件になってしまう
-    for key in ("answer_reveal", "explanation", "affirmation"):
+    for key in ("question_intro", "answer_reveal", "explanation", "affirmation"):
         for i, sent in enumerate(script.get(key) or []):
             text = ((sent or {}).get("motion") or "").strip()
             if not text:
@@ -258,6 +273,17 @@ def validate_script(script: dict, quiz: dict) -> list[str]:
                 warnings.append(f"motions.think[{i}] が空です")
             elif not text.isascii():
                 warnings.append(f"motions.think[{i}] が英語ではありません: {text[:40]!r}")
+
+    # ending は無くても埋め草の動きで代わりが利くので、台本ごと捨てる
+    # 「が空です」にはしない（quiz_pipeline がフォールバックの判定に使っている）
+    ending = (script.get("motions") or {}).get("ending")
+    if not isinstance(ending, list) or not any((t or "").strip() for t in ending):
+        warnings.append("motions.ending がありません")
+    else:
+        for i, text in enumerate(ending):
+            text = (text or "").strip()
+            if text and not text.isascii():
+                warnings.append(f"motions.ending[{i}] が英語ではありません: {text[:40]!r}")
 
     # 正解発表に正解のラベルが含まれているか
     reveal = "".join(s.get("text", "") for s in script.get("answer_reveal", []))

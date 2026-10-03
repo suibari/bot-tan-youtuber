@@ -51,7 +51,8 @@ _NIGHT_OUTPUT_RULES = """
   "sections": [
     {
       "section": "Thumbnail",
-      "sentences": [{"text": "今日の一言", "valence": 0.8, "arousal": 0.5}]
+      "sentences": [{"text": "今日の一言", "valence": 0.8, "arousal": 0.5,
+                     "motion": "A person ... in a feminine way."}]
     },
     {
       "section": "NagiCorner",
@@ -78,9 +79,15 @@ _NIGHT_OUTPUT_RULES = """
 "CommentCorner" だけを使い、"NagiCorner" は出力しないこと。
 
 【motion（体の動き）】
-"Thumbnail" 以外の各sectionの**すべてのsentenceに "motion" を付ける**こと。
+"Thumbnail" を含む各sectionの**すべてのsentenceに "motion" を付ける**こと。
 その文を話している間の体の動きで、AIが3Dモデルを動かすための指示文。
 **必ず英語**で書く（日本語だと翻訳で崩れる）。
+動画の最初（Thumbnail）と最後（Closing）の動きも毎回ここで決める。
+- Thumbnail はカメラが顔のアップで、サムネもここから撮る。胸から上で見せる動きにし、
+  **手で顔を隠す動き（頬に手を添える・顔の前で手を動かす）は書かない**
+  （例: 両手を胸の前で合わせる、うなずく、小さく首をかしげる）
+- Closing の最後の文は、視聴者を見送る動きにする（例: 手を振る）。
+  **お辞儀は書かない**（モーション生成AIが深く頭を下げ、画面に頭頂部しか映らなくなる）
 
 **最重要: その文の内容と動きが一致していること**。ただ動いていればよいのではない。
 文で言っていることを体で表す。合っていないと、見ていて不安になる画になる。

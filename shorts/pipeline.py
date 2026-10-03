@@ -17,6 +17,7 @@ botたん YouTube Shorts 自動投稿パイプライン
   BGM_PATH            : BGM音声ファイルのパス (省略可)
   YOUTUBE_PRIVACY     : YouTube動画の公開設定 (public/private/unlisted, デフォルト: public)
   VRMA_PULLBACK       : 生成モーション開始以降カメラを引く量[m] (既定 0.7)
+  NIGHT_MOUTH_CLOSE   : 無音時に表情の口成分を打ち消す強さ 0〜1 (既定 1.0)
   （生成モーションの調整値 VRMA_GAIN / VRMA_HIPS_Y などは core.py 側を参照）
 """
 
@@ -59,15 +60,19 @@ from core import (  # noqa: F401
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
 
-# Animatorの既定ステート Blow A Kiss は、トリガー無しで冒頭から4.57秒流れる
-# （Assets/Animations/Blow A Kiss.fbx, firstFrame:0 lastFrame:137 @30fps）。
-# 生成モーションを被せると尻切れになるので、これが終わるまでは置かない
-HOOK_MOTION_SEC = 4.6
+# 冒頭のアップ（カメラを引かない区間）の長さ[秒]。サムネはこの区間から撮る。
+# 以前は Animatorの既定ステート Blow A Kiss（4.57秒）の尺に合わせていた名残で、
+# いまは冒頭も生成モーションで動かす（-skipIntroClip で投げキッスを飛ばす）
+HOOK_CLOSEUP_SEC = 4.6
 # 台本が長すぎたときに警告を出す閾値[秒]。目標は30秒。
 # 無人実行なので生成は止めず、ログに実測尺と文字数を残してプロンプト調整の材料にする
 NIGHT_DURATION_WARN_SEC = 35.0
 # 引き開始以降カメラを引く量[m]
 VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.7"))
+# 表情プリセット(Fcl_ALL_*)は口が開くモーフを含むため、arousal が高い文のあとは
+# 無音でも口が半開きのまま残る（2026-10-03 夜版で arousal が 1.0 まで上がり、
+# だんだん口が開いていくように見えた）。朝版・ライブと同じく無音時に口成分を打ち消す
+MOUTH_CLOSE = float(os.getenv("NIGHT_MOUTH_CLOSE", "1.0"))
 
 # Gemini response_schema: 台本をJSONとして構造化出力させるスキーマ
 SCRIPT_SCHEMA = {
@@ -286,27 +291,32 @@ def generate_corner_timing(
     return corners
 
 def build_vrma_blocks(sentences: list[dict], durations: list[float],
-                      intro_duration: float, vrma_end: float) -> list[dict]:
+                      intro_duration: float, vrma_end: float,
+                      intro_motion: str | None = None) -> list[dict]:
     """文ごとのモーションを、その文が読まれる時刻に置く連続モーションを組む。
 
     sentences: 本編の文（"motion" を持ちうる）。generate_voice に渡したものと同じ順。
     durations: generate_voice が返した各文の実測尺[秒]。
     intro_duration: 冒頭一言の尺[秒]。本編はここから始まる。
-    vrma_end: 生成モーションを終わらせる時刻[秒]。DoThankful に食い込ませないこと。
+    vrma_end: 生成モーションを終わらせる時刻[秒]（音声の全長）。
+    intro_motion: 冒頭一言（Thumbnail）の motion。
 
-    夜版でMixamoが走るのは 冒頭の Blow A Kiss（4.57秒）と Closing の
-    DoThankful・DoWave だけ。その間を1本の連続モーションで埋める。
+    冒頭の Blow A Kiss と締めの DoThankful・DoWave（Mixamo）は撤去し、
+    0秒から最後まで1本の連続モーションで埋める。冒頭・締めの動きも
+    ペルソナが文ごとに書いたものを使うので、毎回違う動きになる。
 
     NOTE: 以前はコーナー単位の motions を尺で按分していたが、どの文に対応するかを
           見ていなかったため、最後の文のために書いた動きがコーナーの中盤で再生されていた。
           「ただ動いている」だけで話している内容と合わない状態だったので、文に紐づけた。
     """
-    w_start, w_end = HOOK_MOTION_SEC, float(vrma_end) - VRMA_TAIL_PAD
+    w_start, w_end = 0.0, float(vrma_end)
     if w_end - w_start < VRMA_SEG_MIN_SEC:
         print("[モーション] 埋められる区間がありません")
         return []
 
     spans, t = [], float(intro_duration)
+    if intro_duration > 0:
+        spans.append({"start": 0.0, "end": float(intro_duration), "motion": intro_motion})
     for sent, dur in zip(sentences, durations):
         spans.append({"start": t, "end": t + dur, "motion": sent.get("motion")})
         t += dur
@@ -479,21 +489,20 @@ def main():
         # 感情タイムライン生成
         emotions, wave_time = build_emotion_timeline(main_sentences, subtitles, intro_duration)
 
-        # トリガー発火時刻を字幕から算出
+        # Mixamo のトリガー発火時刻を字幕から算出。生成モーションに失敗したときだけ使う
         # DoThankful: 締めセクション内に限定（corners末尾がClosing）
         closing_start = corners[-1]["start"] if corners else 0.0
         thankful_time  = _find_subtitle_time(subtitles, "高評価",   start_from=closing_start) or 0.0
-        print(f"[トリガー] waveTime: {wave_time}s, thankfulTime: {thankful_time}s")
 
         # AI生成モーション。失敗しても動画は作る
-        # 生成モーションは DoThankful の直前まで敷く。「高評価」が字幕から見つからず
-        # thankful_time が 0 のときは DoThankful/DoWave と衝突しうるので Closing の手前で止める
-        vrma_end = thankful_time if thankful_time > 0 else closing_start
+        # 冒頭（Blow A Kiss）と締め（DoThankful・DoWave）の Mixamo も生成モーションに
+        # 置き換えたので、0秒から音声の最後まで敷く
         vrma_motions = []
         if VRMA_MOTION_DIR:
             try:
+                intro_motion = thumbnail_sentences[0].get("motion") if thumbnail_sentences else None
                 blocks = build_vrma_blocks(main_sentences, sentence_durations,
-                                           intro_duration, vrma_end)
+                                           intro_duration, total_sec, intro_motion)
                 if blocks:
                     ardy_proc = ardy_start(reuse=False)
                 if ardy_proc is not None and ardy_wait_ready():
@@ -511,20 +520,23 @@ def main():
                 # 2026-08-31 の夜は exit 0 で公開まで通り、誰も気づかなかった
                 from common import notify
                 notify.warn("夜のShorts: ARDY のモーション生成に失敗しました。"
-                            "モーション無しで公開します（logs/pipeline_*.log を確認）")
+                            "Mixamo の固定モーションだけで公開します（logs/pipeline_*.log を確認）")
 
         # 感情JSONファイル保存
         emotion_path = str(tmp_dir / f"bottan_{ts}_emotions.json")
         # greetingTime1 は書き出さない。corners[0].end - 2.0 で発火するが、NagiCorner が
         # 毎回未検出のため常に「締めの2秒前」になり、Standing Greeting の手振り(5.10秒)が
         # コーナー境界を分断していた。省くと生成モーションが最後まで連続する
-        payload = {
-            "emotions":      emotions,
-            "waveTime":      wave_time,
-            "thankfulTime":  thankful_time,
-        }
+        # 生成モーションがあるときは waveTime / thankfulTime を書き出さない
+        # （キーが無ければ VRM1LipSync は DoWave / DoThankful を撃たない）。
+        # 失敗時だけ従来の Mixamo に戻し、棒立ちのまま締まるのを防ぐ
+        payload = {"emotions": emotions}
         if vrma_motions:
             payload["vrmaMotions"] = vrma_motions
+        else:
+            payload["waveTime"] = wave_time
+            payload["thankfulTime"] = thankful_time
+            print(f"[トリガー] waveTime: {wave_time}s, thankfulTime: {thankful_time}s")
         with open(emotion_path, "w") as f:
             json.dump(payload, f, ensure_ascii=False)
         print(f"[感情] 保存: {emotion_path}")
@@ -533,12 +545,15 @@ def main():
 
         # Step 4: Unity録画（Mono GC 競合による確率的クラッシュへの対策でリトライあり）
         # 生成モーションがあるときだけ、フックの次のコーナーからカメラを引く。
-        # 冒頭は Blow A Kiss（手を顔に持っていく動き）なのでアップのままが合う
-        extra = []
+        # 冒頭はサムネを撮るのでアップのままにする
+        extra = ["-mouthCloseOnSilence", f"{MOUTH_CLOSE}"] if MOUTH_CLOSE > 0 else []
+        if vrma_motions:
+            # 冒頭も生成モーションで動かすので、既定ステートの Blow A Kiss を飛ばす
+            extra += ["-skipIntroClip", "1"]
         if vrma_motions and VRMA_PULLBACK > 0:
-            pullback_at = max(corners[0]["start"], HOOK_MOTION_SEC) if corners else HOOK_MOTION_SEC
-            extra = ["-cameraPullbackAt", f"{pullback_at:.2f}",
-                     "-cameraPullbackZ", f"{VRMA_PULLBACK}"] + vrma_unity_args()
+            pullback_at = max(corners[0]["start"], HOOK_CLOSEUP_SEC) if corners else HOOK_CLOSEUP_SEC
+            extra += ["-cameraPullbackAt", f"{pullback_at:.2f}",
+                      "-cameraPullbackZ", f"{VRMA_PULLBACK}"] + vrma_unity_args()
         _retry("Step4 Unity録画", record_with_unity, wav_path, webm_path, emotion_path,
                extra_args=extra or None,
                catch=(RuntimeError, TimeoutError), delay=15)
@@ -546,7 +561,7 @@ def main():
         # サムネ作成
         thumbnail_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
         # 生成モーションを使うときは、カメラが引く前（フック内）からサムネを撮る
-        thumb_before = (max(corners[0]["start"], HOOK_MOTION_SEC)
+        thumb_before = (max(corners[0]["start"], HOOK_CLOSEUP_SEC)
                         if (vrma_motions and corners and VRMA_PULLBACK > 0) else None)
         capture_thumbnail_frame(webm_path, screenshot_path, emotions, before=thumb_before)
         generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)

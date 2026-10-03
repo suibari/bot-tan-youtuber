@@ -1,5 +1,6 @@
 # クレジット。夜版・朝クイズ版で共通。
-# モーションは Mixamo の既製クリップと Text-To-VRMA のAI生成を併用しているので、
+# モーションは Mixamo の既製クリップ（待機中の Idle と、AI生成に失敗したときの代わり）と
+# Text-To-VRMA のAI生成を併用しているので、
 # どちらか一方だけに見えないよう分けて書く。
 # Text-To-VRMA は作者の推奨表記に従う（https://github.com/Kirakun0328/text-to-vrma）。
 # "Built with Meta Llama 3" は ARDY エンジンが内蔵する Llama 3 のライセンス要件。
@@ -10,7 +11,7 @@ BGM: シャイニングスター / 魔王魂
 https://maou.audio
 
 モーションは既製クリップとAI生成の併用です
-・固定モーション: Mixamo (Adobe)
+・待機モーション: Mixamo (Adobe)
 https://www.mixamo.com
 ・AI生成モーション: Text-To-VRMA (© Kiratchi)
 https://github.com/Kirakun0328/text-to-vrma

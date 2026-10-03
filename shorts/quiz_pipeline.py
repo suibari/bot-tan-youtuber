@@ -60,15 +60,14 @@ QUIZ_DURATION_WARN_SEC = 35.0
 # パート間に入れる無音（秒）。THINK後の溜めを長めにして「正解は……」を引き立てる
 PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "END": 0.0}
 
-# AI生成モーションを敷くパート。Mixamoのトリガーが無いところだけを対象にする。
-#   Q   → 既定ステートの Blow A Kiss が流れる（4.57秒）。残りもサムネを撮る
-#         アップの画なので触らない（下の thumbnail.capture_frame を参照）
-#   END → DoGreeting + DoWave
-# THINK 開始から END 開始までを、1本の連続モーションで途切れさせずに埋める。
+# AI生成モーションを敷くパート。冒頭から最後までを1本の連続モーションで埋める。
 #
 # 2026-08-12: AFF を対象に加えた。以前は AFF の頭で DoThankful（Mixamoの一礼）を
 # 撃っていたが、生成モーションを止めてまで出すものではないので撃つのをやめた。
-VRMA_PARTS = ("THINK", "A", "EXPL", "AFF")
+# 2026-10-03: Q（既定ステートの Blow A Kiss）と END（DoGreeting + DoWave）も
+# 生成モーションに置き換えた。固定の動きを毎回生成し直すため。
+# Q はアップの画のままなので、サムネもこれまでどおりアップで撮れる。
+VRMA_PARTS = ("Q", "THINK", "A", "EXPL", "AFF", "END")
 # 生成モーションが始まる THINK からカメラを引く。引く量[m]
 VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.7"))
 
@@ -373,42 +372,47 @@ def build_emotions(segments: list[dict], rng) -> list[dict]:
 
 
 def build_vrma_blocks(segments: list[dict], script: dict) -> list[dict]:
-    """THINK〜END直前を丸ごと埋める、連続モーションのブロックを組む。
+    """冒頭（Q）から最後（END）までを丸ごと埋める、連続モーションのブロックを組む。
 
     夜版と同じく**文ごとのモーションを、その文が読まれる時刻に置く**
     （core.plan_vrma_from_sentences）。パートの尺で按分していた旧実装は
     どの文に対応するかを一切見ていなかったので、ペルソナが最後の文のために
     書いた動きがパートの中盤で再生されることがあった。
 
-    THINK だけは発話が無い（カウントダウン音のみ）ので、台本の motions.think を
-    区間に等分して疑似的な文として扱う。
+    THINK は発話が無い（カウントダウン音のみ）、END は固定文でペルソナが書いた文が
+    無いので、台本の motions.think / motions.ending を区間に等分して疑似的な文として扱う。
     """
     seg = {x["id"]: x for x in segments}
-    if "THINK" not in seg or "END" not in seg:
+    if "Q" not in seg or "END" not in seg:
         return []
 
-    start = float(seg["THINK"]["start"])
-    # 末尾の余白は DoGreeting（END.start+0.2）に食い込ませないため
-    end = float(seg["END"]["start"]) - core.VRMA_TAIL_PAD
+    start = float(seg["Q"]["start"])
+    end = float(seg["END"]["end"])
     if end - start < core.VRMA_SEG_MIN_SEC:
         print(f"[モーション] ブロックの尺が足りない({end - start:.1f}秒)のでスキップ")
         return []
 
+    motions = script.get("motions") or {}
+    part_motions = {pid: [t.strip() for t in (motions.get(key) or []) if (t or "").strip()]
+                    for pid, key in (("THINK", "think"), ("END", "ending"))}
     spans = []
-    think_motions = [t.strip() for t in ((script.get("motions") or {}).get("think") or [])
-                     if (t or "").strip()]
-    th = seg["THINK"]
-    if think_motions:
-        step = (th["end"] - th["start"]) / len(think_motions)
-        for i, text in enumerate(think_motions):
-            spans.append({"start": th["start"] + step * i,
-                          "end":   th["start"] + step * (i + 1),
-                          "motion": text})
     for pid in VRMA_PARTS:
-        if pid == "THINK":
+        if pid not in seg:
             continue
-        if pid in seg:
+        texts = part_motions.get(pid)
+        if texts is None:
             spans += seg[pid].get("spans") or []
+            continue
+        part = seg[pid]
+        if not texts:
+            # 指示が無ければ空の文を置く（plan_vrma_from_sentences が埋め草で埋める）
+            spans.append({"start": part["start"], "end": part["end"], "motion": None})
+            continue
+        step = (part["end"] - part["start"]) / len(texts)
+        for i, text in enumerate(texts):
+            spans.append({"start": part["start"] + step * i,
+                          "end":   part["start"] + step * (i + 1),
+                          "motion": text})
 
     spans.sort(key=lambda sp: sp["start"])
     if not spans:
@@ -436,9 +440,10 @@ def build_emotion_file(segments: list[dict], emotions: list[dict], path: str,
                        vrma_motions: list[dict] = None) -> None:
     """Unityへ渡すJSON。
 
-    greetingTime2 は Unity 側に実装済みだが Python が書き出していなかった
-    デッドコード。ここで埋めることで Unity 無改修のままエンディングの
-    挨拶モーションが発火する。
+    生成モーションがあるときは greetingTime2 / waveTime を書き出さない。
+    エンディングも生成モーションで動かすので、キーが無ければ VRM1LipSync は
+    DoGreeting / DoWave を撃たない（no-op）。生成に失敗したときだけ従来の
+    Mixamo（Standing Greeting + Waving）に戻して、棒立ちのまま終わるのを防ぐ。
 
     greetingTime1 は書き出さない。greetingTime2 と同じ DoGreeting を撃つ重複であり、
     Q.start+0.3 という早さで発火するため Animator の既定ステート
@@ -457,19 +462,16 @@ def build_emotion_file(segments: list[dict], emotions: list[dict], path: str,
     if wave_time is None:
         wave_time = max(0.0, seg["END"]["end"] - 1.5)
 
-    data = {
-        "emotions":      emotions,
-        # 0だと VRM1LipSync が発火しないので必ず正の値にする
-        "greetingTime2": round(seg["END"]["start"] + 0.2, 2),
-        "waveTime":      round(wave_time, 2),
-    }
-
-    # AI生成モーション。既存のMixamoトリガーとは独立していて干渉しない
+    data = {"emotions": emotions}
     if vrma_motions:
         data["vrmaMotions"] = vrma_motions
+    else:
+        # 0だと VRM1LipSync が発火しないので必ず正の値にする
+        data["greetingTime2"] = round(seg["END"]["start"] + 0.2, 2)
+        data["waveTime"] = round(wave_time, 2)
     Path(path).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     print(f"[感情] 保存: {path} "
-          f"(greeting2={data['greetingTime2']}s wave={data['waveTime']}s)")
+          f"(greeting2={data.get('greetingTime2')} wave={data.get('waveTime')})")
     for m in data.get("vrmaMotions", []):
         print(f"[モーション] 生成: {m['file']} @{m['time']}s")
 
@@ -588,7 +590,7 @@ def main(argv=None):
                 # 2026-09-02 の朝は exit 0 で公開まで通り、誰も気づかなかった
                 from common import notify
                 notify.warn("朝のクイズ: ARDY のモーション生成に失敗しました。"
-                            "モーション無しで公開します（logs/quiz_*.log を確認）")
+                            "Mixamo の固定モーションだけで公開します（logs/quiz_*.log を確認）")
 
         # ── Step 4: 表情タイムライン
         import random
@@ -604,6 +606,9 @@ def main(argv=None):
         else:
             extra = ["-cameraOffsetY", f"{CAMERA_OFFSET_Y}",
                      "-mouthCloseOnSilence", f"{MOUTH_CLOSE}"]
+            # 冒頭も生成モーションで動かすので、既定ステートの Blow A Kiss を飛ばす
+            if vrma_motions:
+                extra += ["-skipIntroClip", "1"]
             # 生成モーションがあるときだけ、シンキングタイムからカメラを引く。
             # フック(Q)はアップのまま＝サムネもアップで撮れる
             if vrma_motions and VRMA_PULLBACK > 0:
