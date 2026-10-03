@@ -187,6 +187,8 @@ class ChatPoller:
         self._transport = None
         self._seen_ids = set()
         self._seen_order = deque()
+        # streamList の接続回数。クォータ見積もりの材料（2026-10-03 計測用）
+        self.connections = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -229,17 +231,26 @@ class ChatPoller:
         while not self._stop.is_set():
             started = time.monotonic()
             interval = fail_interval
+            self.connections += 1
+            n_res = n_items = 0
             try:
                 print(f"[chat] streamList接続（{'再開' if self._page_token else '初回'}）")
                 for res in transport.responses(self.live_chat_id, self._page_token):
                     if self._stop.is_set():
                         return
+                    n_res += 1
+                    n_items += len(res.get("items", []))
                     if not self._handle_response(res):
                         print("[chat] ライブチャット終了")
                         return
                 if self._connection_was_stable(started):
                     fail_interval = self.FAIL_INTERVAL_MIN
                 interval = max(1.0, fail_interval)
+                # 正常終了でも待ち時間が倍々に延び、コメント受信が最大2分遅れていた
+                # （2026-10-03）。何秒で切れているかを測ってから直すための計測
+                print(f"[chat] streamList終了: 正常 / 接続{time.monotonic() - started:.1f}秒 "
+                      f"/ 応答{n_res}件・項目{n_items}件 / 累計接続{self.connections}回 "
+                      f"/ 次は{interval:.0f}秒後")
             except Exception as e:
                 if self._stop.is_set():
                     return
@@ -258,7 +269,8 @@ class ChatPoller:
                     # 日次枯渇とは断定しない。配信中にも回復した実績がある。
                     interval = max(30.0, interval)
                 print(f"[chat] streamList切断: {code.name if code else type(e).__name__} "
-                      f"（配信は継続します。次は{interval:.0f}秒後）")
+                      f"/ 接続{time.monotonic() - started:.1f}秒 / 応答{n_res}件・項目{n_items}件 "
+                      f"/ 累計接続{self.connections}回（配信は継続します。次は{interval:.0f}秒後）")
             fail_interval = min(self.FAIL_INTERVAL_MAX, interval * 2)
             self._stop.wait(interval)
 
