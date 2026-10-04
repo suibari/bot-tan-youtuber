@@ -18,6 +18,13 @@ cd "$SCRIPT_DIR" || exit 1
 # common/ を import できるようにリポジトリのルートを通す
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
+# Unity が開けるファイル数の上限を hard まで上げる。
+# systemd の既定は soft 1024 で、Unity 側の C# が変わった直後の起動は
+# スクリプトの再コンパイル（bee_backend）で fd を使い切り、mono のアサーション
+# (fd < sysconf(_SC_OPEN_MAX)) で即死する。端末からは上限が大きいので再現しない。
+# 2026-10-04 の夜版はこれで録画ファイルが出ずに落ちた
+ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+
 mkdir -p "$SCRIPT_DIR/logs"
 
 # 引数から環境変数をセット (KEY=VALUE 形式)
