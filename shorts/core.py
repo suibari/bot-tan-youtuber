@@ -56,6 +56,7 @@ import json
 import time
 import signal
 import hashlib
+import random
 import subprocess
 import tempfile
 from datetime import timezone, timedelta
@@ -890,6 +891,16 @@ VRMA_MAX_SEGMENTS_TOTAL = int(os.getenv("VRMA_MAX_SEGMENTS_TOTAL", "24"))
 VRMA_CHUNK_OVERLAP = _vrma_style.VRMA_CHUNK_OVERLAP
 # ブロック末尾に残す余白[秒]。次のMixamoモーションに食い込ませない
 VRMA_TAIL_PAD = 0.4
+# 生成モーションを音声の終わりからさらに先まで敷く長さ[秒]。
+# Unity の録画は音声の後ろに 3.0 秒続く（VideoRecorder.cs の clipLength + 3.0f）。
+# 音声の終わりで切ると、締めの最後の約4秒がフェードして Idle に戻っていた
+# （2026-10-04 夜版: 音声33.5秒 / モーション32.35秒 / 録画36.5秒）。
+# 録画の終わり + フェード(VRMA_CHUNK_OVERLAP) + ARDY の尺の誤差ぶん余らせる
+VRMA_RECORD_TAIL_SEC = 3.0
+VRMA_OUTRO_SEC = VRMA_RECORD_TAIL_SEC + VRMA_CHUNK_OVERLAP + 0.5
+# ARDY はセグメントごとの尺をトークン単位（8フレーム = 20fps で0.4秒）に切り捨てる。
+# 半単位を足して四捨五入にしないと、1本あたり平均0.2秒ずつ文の時刻から遅れていく
+ARDY_SEG_ROUND_SEC = 0.2
 
 # Unity(VrmaMotionPlayer) に渡す再生時の調整値は common/vrma_style.py にある。
 # 配信（live/unity_live.py）も同じ値で Unity を起動するので、片方だけ直して
@@ -912,6 +923,7 @@ vrma_unity_args      = _vrma_style.vrma_unity_args
 # 集約した。実測で事故った履歴に基づく値なので、緩めるときはあちらのコメントを読むこと。
 VRMA_BANNED_RE      = motion_safety.BANNED_MOTION_RE
 VRMA_IDLE_MOTIONS   = motion_safety.IDLE_MOTIONS
+VRMA_CLOSING_MOTIONS = motion_safety.CLOSING_MOTIONS
 reject_unsafe_motions = motion_safety.reject_unsafe_motions
 
 
@@ -952,7 +964,8 @@ def ardy_generate_segments(segments: list[dict], seed: int, out_json: str) -> fl
     """
     if not segments:
         return None
-    segments = segments[:ARDY_MAX_SEGMENTS]
+    segments = [{**s, "duration": float(s["duration"]) + ARDY_SEG_ROUND_SEC}
+                for s in segments[:ARDY_MAX_SEGMENTS]]
     total = sum(float(s["duration"]) for s in segments)
     timeout = max(ARDY_GEN_TIMEOUT, total * ARDY_GEN_SEC_PER_SEC * 2)
     return _ardy.generate_spec(out_json, segments=segments, seed=seed,
@@ -1070,6 +1083,11 @@ def plan_vrma_from_sentences(spans: list[dict], window_start: float, window_end:
     意図を保ったまま尺の後半で動きが止まるのを防げる。
     短すぎる文は直前のセグメントに吸収させる（1本が短いとIdleと見分けがつかない）。
     """
+    # 最後の文の動きを窓の終わりまで延ばす。延ばさないと、文が終わってから
+    # 録画が止まるまでの間に生成モーションが切れて Idle に戻ってしまう
+    if spans and float(spans[-1]["end"]) < window_end:
+        spans = spans[:-1] + [{**spans[-1], "end": window_end}]
+
     def build(max_split: int, quiet: bool) -> list[dict]:
         out: list[dict] = []
         idle_i = 0
@@ -1121,6 +1139,29 @@ def plan_vrma_from_sentences(spans: list[dict], window_start: float, window_end:
             j = i - 1 if i > 0 else 1
             out[j]["duration"] = round(out[j]["duration"] + out[i]["duration"], 2)
             out.pop(i)
+    return vary_closing_segments(out)
+
+
+def vary_closing_segments(segments: list[dict], rng: random.Random = None) -> list[dict]:
+    """末尾で同じ指示文が続くセグメントの2本目以降を、締めの別の動きに差し替える。
+
+    最後の文は録画の終わりまで延ばすので3本前後に分かれる。同じ文のままだと
+    ARDY が毎回ほぼ同じ手の振り方を3回繰り返し、朝版と夜版でも見分けがつかない。
+    """
+    if len(segments) < 2:
+        return segments
+    last = segments[-1]["text"]
+    k = len(segments) - 1
+    while k > 0 and segments[k - 1]["text"] == last:
+        k -= 1
+    if k == len(segments) - 1:
+        return segments
+    rng = rng or random.Random()
+    pool = [m for m in VRMA_CLOSING_MOTIONS if m != last]
+    picks = rng.sample(pool, min(len(pool), len(segments) - 1 - k))
+    out = [dict(s) for s in segments]
+    for seg, text in zip(out[k + 1:], picks):
+        seg["text"] = text
     return out
 
 

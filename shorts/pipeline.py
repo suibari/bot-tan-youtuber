@@ -52,7 +52,7 @@ from core import (  # noqa: F401
     _dedupe_subtitle_overlaps,
     _start_xvfb, record_with_unity, VRMA_MOTION_DIR,
     ardy_start, ardy_wait_ready, ardy_stop, build_vrma_motions,
-    VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD,
+    VRMA_SEG_MIN_SEC, VRMA_TAIL_PAD, VRMA_OUTRO_SEC,
     VRMA_GAIN, VRMA_HIPS_Y, VRMA_SEG_TARGET_SEC, VRMA_MAX_SEGMENTS_TOTAL,
     VRMA_BODY_TILT, VRMA_YAW_LIMIT, VRMA_HEAD_YAW, VRMA_HEAD_COUNTER,
     plan_vrma_from_sentences, vrma_unity_args, env_flag,
@@ -298,7 +298,8 @@ def build_vrma_blocks(sentences: list[dict], durations: list[float],
     sentences: 本編の文（"motion" を持ちうる）。generate_voice に渡したものと同じ順。
     durations: generate_voice が返した各文の実測尺[秒]。
     intro_duration: 冒頭一言の尺[秒]。本編はここから始まる。
-    vrma_end: 生成モーションを終わらせる時刻[秒]（音声の全長）。
+    vrma_end: 生成モーションを終わらせる時刻[秒]。録画は音声の後ろにも続くので、
+              音声の全長 + VRMA_OUTRO_SEC を渡す。最後の文の動きがそこまで延びる。
     intro_motion: 冒頭一言（Thumbnail）の motion。
 
     冒頭の Blow A Kiss と締めの DoThankful・DoWave（Mixamo）は撤去し、
@@ -496,13 +497,14 @@ def main():
 
         # AI生成モーション。失敗しても動画は作る
         # 冒頭（Blow A Kiss）と締め（DoThankful・DoWave）の Mixamo も生成モーションに
-        # 置き換えたので、0秒から音声の最後まで敷く
+        # 置き換えたので、0秒から録画の最後まで敷く
         vrma_motions = []
         if VRMA_MOTION_DIR:
             try:
                 intro_motion = thumbnail_sentences[0].get("motion") if thumbnail_sentences else None
                 blocks = build_vrma_blocks(main_sentences, sentence_durations,
-                                           intro_duration, total_sec, intro_motion)
+                                           intro_duration, total_sec + VRMA_OUTRO_SEC,
+                                           intro_motion)
                 if blocks:
                     ardy_proc = ardy_start(reuse=False)
                 if ardy_proc is not None and ardy_wait_ready():

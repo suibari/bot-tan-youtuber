@@ -387,7 +387,8 @@ def build_vrma_blocks(segments: list[dict], script: dict) -> list[dict]:
         return []
 
     start = float(seg["Q"]["start"])
-    end = float(seg["END"]["end"])
+    # 録画は音声の後ろにも続くので、その終わりまで END の動きを延ばす
+    end = float(seg["END"]["end"]) + core.VRMA_OUTRO_SEC
     if end - start < core.VRMA_SEG_MIN_SEC:
         print(f"[モーション] ブロックの尺が足りない({end - start:.1f}秒)のでスキップ")
         return []

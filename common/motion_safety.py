@@ -89,6 +89,23 @@ MOTION_PROMPT_RULES = """書き方のルール（2026-10-03 の録画比較に�
   A person points upward while explaining in a feminine way. /
   A person jumps for joy in a feminine way."""
 
+# 動画の締めで、最後の文の動きを分けた2本目以降に使う動き。
+# ARDY は分けた1本ずつを静止姿勢から生成するので、同じ指示文を並べると
+# 「手を上げて振って下ろす」が毎回そっくりなまま3回繰り返される
+# （2026-10-04 の朝版・夜版。LLM が締めに例文の waves cheerfully を書き写していた）。
+# 1本目は台本の動きのまま残し、続きをここから毎回ランダムに選ぶ。
+# 2026-10-04 に候補を ARDY → Unity で録画して選んだ。外したもの:
+#   blows a kiss … 腕が顔の前で交差して顔が隠れる
+#   nods happily … ほぼ静止で、最後に来ると Idle と見分けがつかない
+#   お辞儀       … 頭頂部しか映らなくなる
+CLOSING_MOTIONS = [
+    "A person waves goodbye with both hands in a feminine way.",
+    "A person waves shyly with a small hand in a feminine way.",
+    "A person hops happily while waving in a feminine way.",
+    "A person sways gently while waving in a feminine way.",
+    "A person raises both arms happily in a feminine way.",
+]
+
 # 文に motion が無い／禁止動作だったときに代わりに使う待機動作。
 # ARDY のプールが尽きたときにも使う。上の5文は 2026-10-03 の比較録画で使ったもの。
 IDLE_MOTIONS = [
