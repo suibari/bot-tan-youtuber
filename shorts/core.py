@@ -1451,7 +1451,10 @@ def run_ffmpeg_finalize(input_webm: str, output_mp4: str, vf_parts: list[str],
 
     subprocess.run(cmd, check=True, timeout=timeout)
     output_duration = probe_media_duration(output_mp4)
-    if output_duration < max(1.0, input_duration - 0.5):
+    # Unity の WebM はコンテナの尺が短いほうのストリームより 0.40〜0.45秒長く、
+    # -shortest で出力はそのぶん必ず縮む。0.5秒の許容では 2026-10-07 に 0.511秒差で
+    # 正常な変換を弾いたので、1.0秒まで許す（途中で切れた変換はこれより大きく欠ける）。
+    if output_duration < max(1.0, input_duration - 1.0):
         raise RuntimeError(
             f"MP4変換結果が不完全です "
             f"(尺 {output_duration:.3f}/{input_duration:.3f}秒): {output_mp4}"
