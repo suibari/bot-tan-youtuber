@@ -1409,17 +1409,22 @@ def build_target_filters(text: str) -> list[str]:
 
 
 def run_ffmpeg_finalize(input_webm: str, output_mp4: str, vf_parts: list[str],
-                        bgm_volume: float = 0.05, timeout: int = 120) -> None:
-    """フィルタチェーンを適用してMP4に変換する。BGMがあれば amix でミックスする。"""
+                        bgm_volume: float = 0.05, timeout: int = 120,
+                        bgm_path: str = None) -> None:
+    """フィルタチェーンを適用してMP4に変換する。BGMがあれば amix でミックスする。
+
+    bgm_path はその回に生成した曲（common/bgm.py）。無ければ BGM_PATH の固定曲。
+    """
     vf = ",".join(vf_parts)
+    bgm = str(bgm_path) if bgm_path else BGM_PATH
 
     cmd = [
         "ffmpeg", "-y",
         "-i", input_webm,
     ]
 
-    if BGM_PATH and Path(BGM_PATH).exists():
-        cmd += ["-i", BGM_PATH,
+    if bgm and Path(bgm).exists():
+        cmd += ["-i", bgm,
                 "-filter_complex",
                 f"[0:v]{vf}[v];[1:a]volume={bgm_volume}[bgm];[0:a][bgm]amix=inputs=2:duration=first[a]",
                 "-map", "[v]", "-map", "[a]"]

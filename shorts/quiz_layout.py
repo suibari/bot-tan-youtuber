@@ -31,6 +31,18 @@ SCRIM  = "black@0.45"
 PANEL  = "white@0.86"
 WARN   = "0xE8503A"
 
+# 回ごとに配色を変える。毎日同じ画面が続くと量産コンテンツに見えるため
+# （2026-09 から Shorts フィードに乗らなくなった。shorts/turn.py の冒頭を参照）。
+# main は正解の塗り・枠・ゲージ・締めの字幕。正解の白文字が読める濃さにすること。
+# accent はコーナーラベルと「せいかい！」。先頭が従来の配色
+THEMES = [
+    {"name": "mint",     "main": MINT,       "accent": AMBER,      "panel": PANEL},
+    {"name": "coral",    "main": "0xD9485F", "accent": "0x1F8A7E", "panel": "0xFFF7F2@0.88"},
+    {"name": "sky",      "main": "0x2F6FD6", "accent": "0xF28A00", "panel": "0xF3F8FF@0.88"},
+    {"name": "lavender", "main": "0x6A4FE0", "accent": "0xE0457B", "panel": "0xF8F5FF@0.88"},
+]
+DEFAULT_THEME = THEMES[0]
+
 # レイアウト
 #
 # パネルの高さは Unity のカメラオフセットと連動している。
@@ -114,14 +126,15 @@ def _text(content: str, size: int, color: str, x: str, y, start: float, end: flo
 # 各パーツ
 # ──────────────────────────────────────────────
 
-def build_panel_filters(start: float, end: float) -> list[str]:
+def build_panel_filters(start: float, end: float, theme: dict = DEFAULT_THEME) -> list[str]:
     """上部の白パネルとコーナーラベル"""
+    panel, accent = theme["panel"], theme["accent"]
     box_w = min(len(CORNER_LABEL) * 38 + 40, W - 40)
     return [
-        f"drawbox=x=0:y=0:w={W}:h={PANEL_H}:color={PANEL}:t=fill" + _enable(start, end),
+        f"drawbox=x=0:y=0:w={W}:h={PANEL_H}:color={panel}:t=fill" + _enable(start, end),
         f"drawbox=x=20:y={LABEL_Y}:w={box_w}:h={LABEL_H}:color=white@0.95:t=fill" + _enable(start, end),
-        f"drawbox=x=20:y={LABEL_Y+LABEL_H-2}:w={box_w}:h=6:color={AMBER}:t=fill" + _enable(start, end),
-        _text(CORNER_LABEL, 36, AMBER, "30", LABEL_Y + 12, start, end),
+        f"drawbox=x=20:y={LABEL_Y+LABEL_H-2}:w={box_w}:h=6:color={accent}:t=fill" + _enable(start, end),
+        _text(CORNER_LABEL, 36, accent, "30", LABEL_Y + 12, start, end),
     ]
 
 
@@ -152,18 +165,20 @@ def _choice_filters(label: str, text: str, y: int, box_color: str, text_color: s
     return f
 
 
-def build_choice_filters(quiz: dict, start: float, end: float) -> list[str]:
+def build_choice_filters(quiz: dict, start: float, end: float,
+                         theme: dict = DEFAULT_THEME) -> list[str]:
     """未回答状態の選択肢A/B"""
     return (
         _choice_filters("A", quiz["選択肢A"], CHOICE_A_Y,
-                        "white@0.95", INK, start, end, border=MINT)
+                        "white@0.95", INK, start, end, border=theme["main"])
         + _choice_filters("B", quiz["選択肢B"], CHOICE_B_Y,
-                          "white@0.95", INK, start, end, border=MINT)
+                          "white@0.95", INK, start, end, border=theme["main"])
     )
 
 
-def build_answer_filters(quiz: dict, start: float, end: float) -> list[str]:
-    """正解発表。不正解をスクリムで沈め、正解をミントで塗って白文字にする。
+def build_answer_filters(quiz: dict, start: float, end: float,
+                         theme: dict = DEFAULT_THEME) -> list[str]:
+    """正解発表。不正解をスクリムで沈め、正解をテーマ色で塗って白文字にする。
 
     フィルタは後に書いたものが上に描かれるので、未回答状態の上に重ねる前提。
     """
@@ -178,18 +193,19 @@ def build_answer_filters(quiz: dict, start: float, end: float) -> list[str]:
         f":color={SCRIM}:t=fill" + _enable(start, end),
         # 正解を塗りつぶして白枠で囲む
         f"drawbox=x={CHOICE_X}:y={y_ok}:w={CHOICE_W}:h={CHOICE_H}"
-        f":color={MINT}@0.97:t=fill" + _enable(start, end),
+        f":color={theme['main']}@0.97:t=fill" + _enable(start, end),
         f"drawbox=x={CHOICE_X}:y={y_ok}:w={CHOICE_W}:h={CHOICE_H}"
         f":color=white:t=7" + _enable(start, end),
         _text(correct, 50, "white", str(CHOICE_X + 36), y_ok + 12, start, end),
         _text(ok_text, CHOICE_SIZE, "white", str(CHOICE_X + 118), y_ok + 15, start, end),
         # せいかいバッジ
-        _text("せいかい！", 36, AMBER, str(CHOICE_X + CHOICE_W - 230), y_ok + 20,
+        _text("せいかい！", 36, theme["accent"], str(CHOICE_X + CHOICE_W - 230), y_ok + 20,
               start, end, borderw=5, bordercolor="white"),
     ]
 
 
-def build_gauge_filters(start: float, duration: float = 3.0, steps: int = 50) -> list[str]:
+def build_gauge_filters(start: float, duration: float = 3.0, steps: int = 50,
+                        theme: dict = DEFAULT_THEME) -> list[str]:
     """減少ゲージ。drawbox が時間式を持てないので階段状に並べる。
 
     実測: 1080x1920 / 5秒 / 50段でエンコード増分は 0.6秒程度。
@@ -209,7 +225,7 @@ def build_gauge_filters(start: float, duration: float = 3.0, steps: int = 50) ->
         w = int(GAUGE_W * ratio)
         if w < 4:
             continue
-        color = MINT if ratio > 0.2 else WARN
+        color = theme["main"] if ratio > 0.2 else WARN
         filters.append(
             f"drawbox=x={GAUGE_X}:y={GAUGE_Y}:w={w}:h={GAUGE_H}"
             f":color={color}@0.95:t=fill" + _enable(s, e))
@@ -219,7 +235,8 @@ def build_gauge_filters(start: float, duration: float = 3.0, steps: int = 50) ->
     return filters
 
 
-def build_countdown_filters(start: float, duration: float = 3.0) -> list[str]:
+def build_countdown_filters(start: float, duration: float = 3.0,
+                            theme: dict = DEFAULT_THEME) -> list[str]:
     """残り秒数の数字（1秒ごとに切り替え）。ゲージの右側、パネル内に置く。
 
     既定値は THINK_DURATION（quiz_pipeline.py）と揃えてある。
@@ -227,7 +244,7 @@ def build_countdown_filters(start: float, duration: float = 3.0) -> list[str]:
     """
     n = int(duration)
     return [
-        _text(str(n - i), COUNT_SIZE, MINT, str(COUNT_X), COUNT_Y,
+        _text(str(n - i), COUNT_SIZE, theme["main"], str(COUNT_X), COUNT_Y,
               start + i, start + i + 1, borderw=6, bordercolor="white")
         for i in range(n)
     ]
@@ -255,10 +272,12 @@ def build_caption_filters(subtitles: list[dict], parts: set[str],
 # 組み立て
 # ──────────────────────────────────────────────
 
-def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict]) -> list[str]:
+def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict],
+                       theme: dict = DEFAULT_THEME) -> list[str]:
     """クイズ動画のフィルタチェーン全体を組む。
 
     seg: {"Q": {...}, "THINK": {...}, ...} パートIDをキーにした辞書
+    theme: THEMES の1つ。抽選は呼び出し側（quiz_pipeline）で行う
     """
     t_q     = seg["Q"]["start"]
     t_think = seg["THINK"]["start"]
@@ -270,27 +289,27 @@ def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict]) -> list[str
 
     f = []
     # パネルは最初から最後まで
-    f += build_panel_filters(0.0, t_last)
+    f += build_panel_filters(0.0, t_last, theme)
 
     # 問題文は Q 〜 解説開始まで（解説中は同じ場所に解説字幕を出す）
     f += build_question_filters(quiz["問題"], t_q, t_expl)
 
     # 選択肢は Q 〜 全肯定コメント開始まで
-    f += build_choice_filters(quiz, t_q, t_aff)
+    f += build_choice_filters(quiz, t_q, t_aff, theme)
 
     # シンキングタイム
-    f += build_gauge_filters(t_think, seg["THINK"]["duration"])
-    f += build_countdown_filters(t_think, seg["THINK"]["duration"])
+    f += build_gauge_filters(t_think, seg["THINK"]["duration"], theme=theme)
+    f += build_countdown_filters(t_think, seg["THINK"]["duration"], theme=theme)
 
     # 正解発表以降のハイライト（選択肢の上に重ねる）
-    f += build_answer_filters(quiz, t_a, t_aff)
+    f += build_answer_filters(quiz, t_a, t_aff, theme)
 
     # 字幕
     #   Q/THINK は問題文そのものが出ているので字幕は出さない
     #   A は正解ハイライトがあるので出さない
     f += build_caption_filters(subtitles, {"EXPL"}, y=Q_Y, size=46)
     # 全肯定〜エンディングは選択肢が消えてパネルが空くので、中央寄りに置く
-    f += build_caption_filters(subtitles, {"AFF", "END"}, y=190, size=54, color=MINT)
+    f += build_caption_filters(subtitles, {"AFF", "END"}, y=190, size=54, color=theme["main"])
 
     return f
 

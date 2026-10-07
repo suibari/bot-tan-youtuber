@@ -45,7 +45,10 @@ class ShortsOrderTest(unittest.TestCase):
         def finished(*args):
             events.append('after-motion')
             raise EndProbe()
+        # BGM も GPU を使う（ACE-Step）。音声の後・ARDY の前に1回だけ走ること
+        bgm = types.SimpleNamespace(generate=lambda kind, out_dir: events.append('bgm'))
         env = dict(parse_args=lambda _: args, core=core, datetime=datetime, tempfile=tempfile,
+                   bgm=bgm,
                    Path=Path, time=time, json=json,
                    quiz_data=types.SimpleNamespace(next_quiz=lambda **kw: quiz,
                                                    build_ending_sentences=lambda: []),
@@ -61,7 +64,7 @@ class ShortsOrderTest(unittest.TestCase):
         return events
 
     def test_motion_starts_only_after_audio_and_stops_before_render(self):
-        self.assertEqual(self.run_quiz(), ['audio', 'start', 'motion', 'stop', 'after-motion'])
+        self.assertEqual(self.run_quiz(), ['audio', 'bgm', 'start', 'motion', 'stop', 'after-motion'])
 
     def test_voice_only_never_starts_ardy(self):
         self.assertEqual(self.run_quiz(stage='voice'), ['audio'])
@@ -73,4 +76,4 @@ class ShortsOrderTest(unittest.TestCase):
         self.assertEqual(self.run_quiz(interrupt_audio=True), ['audio'])
 
     def test_interrupted_motion_still_stops_ardy(self):
-        self.assertEqual(self.run_quiz(interrupt_motion=True), ['audio', 'start', 'motion', 'stop'])
+        self.assertEqual(self.run_quiz(interrupt_motion=True), ['audio', 'bgm', 'start', 'motion', 'stop'])

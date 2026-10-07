@@ -11,6 +11,7 @@
   ここを緩めるとCSV方式にした意味がなくなる。
 """
 
+import random
 from textwrap import indent as _indent
 
 from prompts import CHARACTER_PROMPT
@@ -81,7 +82,7 @@ _SENTENCE_M = {
 }
 
 # シンキングタイムは発話が無く（カウントダウン音のみ）、エンディングは固定文
-# （quiz_data.pick_greeting + CLOSING_TEXT）でペルソナが書く文が無い。
+# （quiz_data.pick_greeting + CLOSING_TEXTS）でペルソナが書く文が無い。
 # 紐づける文が無いこの2つだけはパート単位で受け取る
 _MOTIONS = {
     "type": "object",
@@ -108,8 +109,20 @@ QUIZ_SCRIPT_SCHEMA = {
 }
 
 
+# 冒頭の掛け声の例。例を1つに固定すると LLM が毎回それをそのまま使うので、回ごとに抽選する
+# （毎日同じ出だしだと量産コンテンツに見える。shorts/turn.py の冒頭を参照）
+OPENING_CALL_EXAMPLES = [
+    "勘違いクイズ！",
+    "朝のクイズだよ！",
+    "ねえ、知ってた？",
+    "ちょっと問題！",
+    "今日のクイズ！",
+]
+
+
 def build_quiz_user_prompt(quiz: dict) -> str:
     ans = quiz["正解"]
+    opening = random.choice(OPENING_CALL_EXAMPLES)
     return f"""以下のクイズをもとに、YouTube Shorts用の台本を書いてください。
 
 【クイズデータ】（ファクトチェック済み。事実を改変しないこと）
@@ -123,7 +136,7 @@ def build_quiz_user_prompt(quiz: dict) -> str:
 【書いてほしいパート】
 
 ① question_intro（約6秒・40文字以内・2文）— 問題文の文字数を含む
-  - 「勘違いクイズ！」のような**短い**掛け声で始める
+  - 「{opening}」のような**短い**掛け声で始める
   - 続けて問題文を読み上げる（データの問題文をほぼそのまま使う）
   - **選択肢A/Bの文言は画面に表示されるので、音声では読み上げないこと**
   - 「どっち？」の一言で締める（「AとB、どっちだと思う？」と長く言わない）

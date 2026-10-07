@@ -278,7 +278,15 @@ DEFAULT_GREETINGS = [
     "日曜日、いい一日にしようね。",        # 日
 ]
 
-CLOSING_TEXT = "全肯定SNSのNagiから来たbotたんでした。行ってらっしゃい！"
+# 締めの一言。毎回同じ文で終わると量産コンテンツに見えるので、回ごとに抽選する
+# （2026-09 から Shorts フィードに乗らなくなった。shorts/turn.py の冒頭を参照）。
+# どれも Nagi の名前と「行ってらっしゃい！」は残す
+CLOSING_TEXTS = [
+    "全肯定SNSのNagiから来たbotたんでした。行ってらっしゃい！",
+    "Nagiでも待ってるね。botたんでした、行ってらっしゃい！",
+    "続きはNagiでおしゃべりしようね。行ってらっしゃい！",
+    "今日もNagiから応援してるよ。行ってらっしゃい！",
+]
 
 
 def pick_greeting(now=None) -> str:
@@ -297,8 +305,8 @@ def pick_greeting(now=None) -> str:
 
 
 def build_ending_sentences(now=None) -> list[dict]:
-    """エンディング（季節の挨拶 + 固定クロージング）。LLMを通さない。"""
+    """エンディング（季節の挨拶 + 締めの一言）。LLMを通さない。"""
     return [
-        {"text": pick_greeting(now), "valence": 0.8, "arousal": 0.4},
-        {"text": CLOSING_TEXT,       "valence": 1.0, "arousal": 0.6},
+        {"text": pick_greeting(now),            "valence": 0.8, "arousal": 0.4},
+        {"text": random.choice(CLOSING_TEXTS), "valence": 1.0, "arousal": 0.6},
     ]

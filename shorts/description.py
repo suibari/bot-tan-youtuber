@@ -4,11 +4,13 @@
 # どちらか一方だけに見えないよう分けて書く。
 # Text-To-VRMA は作者の推奨表記に従う（https://github.com/Kirakun0328/text-to-vrma）。
 # "Built with Meta Llama 3" は ARDY エンジンが内蔵する Llama 3 のライセンス要件。
+_BGM_FIXED = """BGM: シャイニングスター / 魔王魂
+https://maou.audio"""
+
 _CREDITS = """━━━━━━━━━━━━━━━━━━
 【クレジット】
 ボイス: VOICEVOX:春日部つむぎ
-BGM: シャイニングスター / 魔王魂
-https://maou.audio
+{bgm}
 
 モーションは既製クリップとAI生成の併用です
 ・待機モーション: Mixamo (Adobe)
@@ -22,7 +24,13 @@ https://hub.vroid.com/characters/8989036456159515698/models/8059739950029054425
 ━━━━━━━━━━━━━━━━━━"""
 
 
-def build_description() -> str:
+def _credits(bgm_generated: bool) -> str:
+    """BGM の行だけ、その回に生成した曲か固定曲かで差し替える。"""
+    from common.bgm import CREDIT
+    return _CREDITS.format(bgm=CREDIT if bgm_generated else _BGM_FIXED)
+
+
+def build_description(bgm_generated: bool = False) -> str:
     return f"""全肯定botたんが今日Nagiで感じたことをお話しします。
 
 🤖 この動画はAIによる完全自動投稿です
@@ -46,7 +54,7 @@ https://note.com/suibari/n/n36e699f32479
 ━━━━━━━━━━━━━━━━━━
 #botたん #全肯定 #Nagi #VTuber
 
-{_CREDITS}"""
+{_credits(bgm_generated)}"""
 
 
 def build_title(thumbnail_text: str = "") -> str:
@@ -77,11 +85,10 @@ https://nagi.suibari.com
 https://note.com/suibari/n/n36e699f32479
 ━━━━━━━━━━━━━━━━━━
 #botたん #全肯定 #雑学 #クイズ #Nagi #VTuber
+"""
 
-{_CREDITS}"""
 
-
-def build_quiz_description(quiz: dict = None) -> str:
+def build_quiz_description(quiz: dict = None, bgm_generated: bool = False) -> str:
     answer_line = ""
     if quiz:
         ans = quiz.get("正解", "")
@@ -95,7 +102,8 @@ def build_quiz_description(quiz: dict = None) -> str:
 台本作成・動画撮影・YouTubeアップロードまで全て自動で行っています。
 クイズの内容は事前に人の手で確認したものを使っています。
 
-{_COMMON_FOOTER}"""
+{_COMMON_FOOTER}
+{_credits(bgm_generated)}"""
 
 
 def build_quiz_title(hook: str = "") -> str:

@@ -121,6 +121,7 @@ SCRIPT_SCHEMA = {
 
 from psycopg2.extras import RealDictCursor
 
+from common import bgm
 from common.db import connect_raw
 
 
@@ -340,7 +341,7 @@ def build_vrma_blocks(sentences: list[dict], durations: list[float],
 
 def finalize_video(input_webm: str, output_mp4: str,
                    subtitles: list[dict] = None,
-                   target_text: str = "") -> None:
+                   target_text: str = "", bgm_path=None) -> None:
     """FFmpegで縦型Shorts用MP4に変換・字幕合成する（夜版レイアウト）
 
     target_text は「誰に向けた動画か」を示す一言（Thumbnail セクション＝サムネに
@@ -356,7 +357,7 @@ def finalize_video(input_webm: str, output_mp4: str,
     if target_text:
         vf_parts += build_target_filters(target_text)
 
-    run_ffmpeg_finalize(input_webm, output_mp4, vf_parts)
+    run_ffmpeg_finalize(input_webm, output_mp4, vf_parts, bgm_path=bgm_path)
 
 
 # ──────────────────────────────────────────────
@@ -381,6 +382,7 @@ def main():
     wav_path       = str(tmp_dir / f"bottan_{ts}.wav")
     intro_wav_path = wav_path.replace(".wav", "_intro.wav")
     webm_path      = str(tmp_dir / f"bottan_{ts}.webm")
+    bgm_path       = None   # Step3.7 で生成できたときだけ入る
     mp4_path    = str(tmp_dir / f"bottan_{ts}.mp4")
     screenshot_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
 
@@ -495,6 +497,10 @@ def main():
         closing_start = corners[-1]["start"] if corners else 0.0
         thankful_time  = _find_subtitle_time(subtitles, "高評価",   start_from=closing_start) or 0.0
 
+        # BGM 生成（ACE-Step）。失敗したら固定曲に戻る。
+        # ARDY と同じく ollama・Irodori を空けてから GPU を使うので、ARDY の直前に置く
+        bgm_path = _timed("Step3.7 BGM生成", bgm.generate, "night", tmp_dir)
+
         # AI生成モーション。失敗しても動画は作る
         # 冒頭（Blow A Kiss）と締め（DoThankful・DoWave）の Mixamo も生成モーションに
         # 置き換えたので、0秒から録画の最後まで敷く
@@ -569,11 +575,12 @@ def main():
         generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
 
         # Step 5: MP4変換
-        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, thumbnail_text)
+        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, thumbnail_text,
+               bgm_path)
 
         # Step 6: YouTubeアップロード
         title = build_title(thumbnail_text)
-        description = build_description()
+        description = build_description(bgm_generated=bgm_path is not None)
         if not env_flag("SKIP_YOUTUBE"):
             yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description, thumbnail_path)
             if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
@@ -599,7 +606,9 @@ def main():
     finally:
         #pass
         # 一時ファイル削除
-        for path in [wav_path, intro_wav_path, webm_path]:
+        for path in [wav_path, intro_wav_path, webm_path, bgm_path]:
+            if path is None:
+                continue
             if Path(path).exists():
                 Path(path).unlink()
                 print(f"[Cleanup] 削除: {path}")

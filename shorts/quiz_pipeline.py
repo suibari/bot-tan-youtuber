@@ -27,6 +27,7 @@ JST 6:00 に起動し、約30秒のクイズ動画を生成して YouTube に投
 """
 
 import os
+import random
 import sys
 import json
 import time
@@ -40,6 +41,7 @@ load_dotenv()
 
 import core
 import quiz_data
+from common import bgm
 import quiz_layout
 from quiz_prompts import (
     QUIZ_SYSTEM_PROMPT, QUIZ_SCRIPT_SCHEMA,
@@ -567,6 +569,14 @@ def main(argv=None):
             cleanup_targets.clear()   # 検証用に残す
             return 0
 
+        # ── Step 3.7: BGM 生成（ACE-Step）。失敗したら固定曲に戻る
+        # ARDY と同じく ollama・Irodori を空けてから GPU を使うので、ARDY の直前に置く
+        bgm_path = None
+        if not args.preview:
+            bgm_path = core._timed("Step3.7 BGM生成", bgm.generate, "quiz", tmp_dir)
+            if bgm_path:
+                cleanup_targets.append(str(bgm_path))
+
         # ── Step 3.8: AI生成モーション
         # 失敗しても動画は作る。生成モーションのためにその日の投稿を落とさない
         vrma_motions = []
@@ -625,7 +635,7 @@ def main(argv=None):
 
         # ── Step 6: 合成
         core._timed("Step6 MP4合成", _render,
-                    quiz, segments, subtitles, source_webm, mp4_path, args.preview)
+                    quiz, segments, subtitles, source_webm, mp4_path, args.preview, bgm_path)
 
         # ── Step 7: サムネイル
         thumb_ok = False
@@ -647,7 +657,8 @@ def main(argv=None):
         if core.env_flag("SKIP_YOUTUBE") or args.preview:
             print("[YouTube] スキップ")
         else:
-            _upload(quiz, script, mp4_path, thumbnail_path if thumb_ok else "")
+            _upload(quiz, script, mp4_path, thumbnail_path if thumb_ok else "",
+                    bgm_generated=bgm_path is not None)
 
         print(f"\n✅ パイプライン完了: {mp4_path}  (合計: {time.time()-total_start:.1f}秒)")
         return 0
@@ -664,26 +675,29 @@ def main(argv=None):
                     print(f"[Cleanup] 削除: {p}")
 
 
-def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False):
+def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm_path=None):
     """クイズUIを合成してMP4を出力する"""
     seg = {s["id"]: s for s in segments}
     total = max(s["end"] for s in segments) + 1.0
 
-    vf_parts = quiz_layout.build_quiz_filters(quiz, seg, subtitles)
+    theme = random.choice(quiz_layout.THEMES)
+    print(f"[Render] 配色: {theme['name']}")
+    vf_parts = quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme)
 
     if preview or not source_webm:
         quiz_layout.render_preview(vf_parts, mp4_path, duration=total)
     else:
         vf_parts = core.base_vf_parts() + vf_parts
-        core.run_ffmpeg_finalize(source_webm, mp4_path, vf_parts, timeout=300)
+        core.run_ffmpeg_finalize(source_webm, mp4_path, vf_parts, timeout=300,
+                                 bgm_path=bgm_path)
 
 
-def _upload(quiz, script, mp4_path, thumbnail_path):
+def _upload(quiz, script, mp4_path, thumbnail_path, bgm_generated=False):
     from youtube import upload_to_youtube, save_youtube_upload_to_db, notify_discord
     from description import build_quiz_title, build_quiz_description
 
     title = build_quiz_title(script.get("title_hook") or quiz["問題"])
-    description = build_quiz_description(quiz)
+    description = build_quiz_description(quiz, bgm_generated=bgm_generated)
 
     yt_url = core._timed("Step8 YT投稿", upload_to_youtube,
                          mp4_path, title, description, thumbnail_path)
