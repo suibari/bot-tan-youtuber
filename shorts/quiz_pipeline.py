@@ -27,6 +27,7 @@ JST 6:00 に起動し、約30秒のクイズ動画を生成して YouTube に投
 """
 
 import os
+import random
 import sys
 import json
 import time
@@ -669,7 +670,9 @@ def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False):
     seg = {s["id"]: s for s in segments}
     total = max(s["end"] for s in segments) + 1.0
 
-    vf_parts = quiz_layout.build_quiz_filters(quiz, seg, subtitles)
+    theme = random.choice(quiz_layout.THEMES)
+    print(f"[Render] 配色: {theme['name']}")
+    vf_parts = quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme)
 
     if preview or not source_webm:
         quiz_layout.render_preview(vf_parts, mp4_path, duration=total)
