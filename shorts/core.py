@@ -23,7 +23,7 @@ botたん動画パイプライン 共通処理
   UNITY_PROJECT       : Unityプロジェクトのパス
   UNITY_RECORD_TIMEOUT_SEC : Unity録画の待機上限秒 (デフォルト: 3600。実際は伸びが止まったら UNITY_RECORD_STALL_SEC で落ちる)
   VRMA_MOTION_DIR     : AI生成モーション(.vrma)の出力先 (省略時は従来のMixamoモーションのみ)
-  ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /mnt/data/ardy-engine)
+  ARDY_ENGINE_ROOT    : ARDYエンジンの導入先 (既定 /home/suibari/ardy-engine)
   ARDY_MERGED_BASE    : テキストエンコーダ(15GB)の置き場。読み込み速度が
                         パイプライン全体を左右するのでSSDを指すこと
   ARDY_REPO           : text-to-vrma のリポジトリパス
@@ -821,10 +821,6 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
 # サーバーは RSS 約9.5GB を占有するため常駐させず、パイプライン実行中だけ起動する。
 # モデル読み込みに4〜5分かかるので、台本生成・音声合成の前に起動しておくこと。
 
-# /mnt/data は sda1(ext4, 1.2TB) で /etc/fstab に nofail 付きで登録済み。
-# 以前は NTFS(sda2) 上にあったが、udisks2 の自動マウントはデスクトップセッション依存で
-# systemd timer からの無人実行では未マウントになり生成が丸ごとスキップされていた。
-# ext4 化で FUSE のオーバーヘッドも外れる（ただし同じHDDなので速度改善は限定的）
 # ARDY エンジンの設定と起動・生成は common/ardy.py に集約した。
 # ここは後方互換の再輸出（既存の呼び出し名を変えないため）。
 ARDY_ENGINE_ROOT   = _ardy.ARDY_ENGINE_ROOT

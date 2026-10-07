@@ -25,24 +25,28 @@ from common import motion_safety
 # エンジン一式（venv 7.2GB + hf-cache 17GB）の置き場。**中身は SSD にあること。**
 # ここは venv/bin/python と HF_HOME の親で、起動のたびに全部読み直される。
 #
-# 2026-08-30 に実体を SSD (/home/suibari/ardy-engine) へ移し、この既定値は
-# そこへの symlink になっている。venv には絶対パスが焼き込まれているため
-# （site-packages の __editable___ardy_0_2_0_finder.py が ardy/ を直接指す）、
-# パスを変えずに symlink で差し替えるのが一番安全。
+# 2026-08-30 に実体を SSD (/home/suibari/ardy-engine) へ移し、しばらくは
+# HDD 上の /mnt/data/ardy-engine を symlink にして旧パスのまま使っていた。
+# 2026-10 に HDD を取り外して symlink ごと消えたため、venv に焼き込まれた絶対パス
+# （bin/ のシバン、site-packages の __editable___ardy_0_2_0_finder.py ほか）を
+# SSD の実パスへ書き換え、既定値もそちらにした。
 #
 # 実測（1.5GB を direct I/O で読む）:
-#   HDD  /mnt/data (WDC WD20EARX)  89 MB/s
-#   SSD  /         (KIOXIA SATA)  442 MB/s
+#   HDD  (WDC WD20EARX、取り外し済み)  89 MB/s
+#   SSD  /         (KIOXIA SATA)       442 MB/s
 # ready までの時間は 175秒 → 101秒 になった。
-ARDY_ENGINE_ROOT = os.getenv("ARDY_ENGINE_ROOT", "/mnt/data/ardy-engine")
+ARDY_ENGINE_ROOT = os.getenv("ARDY_ENGINE_ROOT", "/home/suibari/ardy-engine")
 # テキストエンコーダ(15GB)の置き場。ARDY_ENGINE_ROOT とは別に指定できる。
 # HDD 上だと mmap のランダム読みで ready まで530秒以上かかり
 # ARDY_READY_TIMEOUT に間に合わないため、ここだけ先に SSD へ移してあった
 # （エンジン一式が SSD へ移った今も、別指定できる状態は残しておく）
 ARDY_MERGED_BASE = os.getenv("ARDY_MERGED_BASE",
-                             str(Path(ARDY_ENGINE_ROOT) / "llm2vec-base-merged"))
+                             "/home/suibari/ardy-models/llm2vec-base-merged")
 ARDY_REPO = os.getenv("ARDY_REPO", "/home/suibari/work/text-to-vrma")
 ARDY_PORT = int(os.getenv("ARDY_PORT", "2337"))
+# ARDY サーバーに見せる GPU（CUDA_VISIBLE_DEVICES に渡す。UUID 推奨）。
+# 2枚以上見えるとエンコードが OOM になるので、複数 GPU の環境では必ず1枚に絞ること（start() 参照）
+ARDY_CUDA_DEVICES = os.getenv("ARDY_CUDA_DEVICES", "").strip()
 ARDY_URL = f"http://127.0.0.1:{ARDY_PORT}"
 
 # true にすると既にポートで動いているサーバーをそのまま使う（開発時用）。
@@ -374,6 +378,13 @@ def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
     # Electron版も同じ値を渡している (electron/ardy-client.cjs)
     env["TEXT_ENCODER_DEVICE"] = "cpu"
     env["HF_HOME"] = str(root / "hf-cache")
+    # GPU が2枚以上見えると、上の指定があっても LLM2Vec の encode が GPU ごとに
+    # プロセスを立てて 8B エンコーダを各 GPU へ載せ、CUDA OOM になる
+    # （llm2vec.py の torch.cuda.device_count() > 1 分岐。2026-10-07 に GPU 増設で発生）。
+    # 1枚だけ見せて CPU エンコードの経路に戻す。番号は nvidia-smi と CUDA で
+    # 振り方が違うため UUID で指定する
+    if ARDY_CUDA_DEVICES:
+        env["CUDA_VISIBLE_DEVICES"] = ARDY_CUDA_DEVICES
 
     cmd = [str(root / "venv/bin/python"),
            str(Path(ARDY_REPO) / "tools/ardy-engine/server.py"),
