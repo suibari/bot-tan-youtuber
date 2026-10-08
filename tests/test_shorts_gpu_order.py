@@ -53,6 +53,8 @@ class ShortsOrderTest(unittest.TestCase):
                    quiz_data=types.SimpleNamespace(next_quiz=lambda **kw: quiz,
                                                    build_ending_sentences=lambda: []),
                    generate_quiz_script=lambda quiz: {}, build_audio=audio,
+                   # 英訳は ollama を使う。ACE-Step・ARDY が GPU を取る前に済ませること
+                   translate_script=lambda quiz, script: events.append('translate'),
                    build_subtitles=lambda segments: [], build_vrma_blocks=lambda *a: ['block'],
                    build_emotions=finished)
         exec(compile(module, str(source), 'exec'), env)
@@ -64,16 +66,16 @@ class ShortsOrderTest(unittest.TestCase):
         return events
 
     def test_motion_starts_only_after_audio_and_stops_before_render(self):
-        self.assertEqual(self.run_quiz(), ['audio', 'bgm', 'start', 'motion', 'stop', 'after-motion'])
+        self.assertEqual(self.run_quiz(), ['translate', 'audio', 'bgm', 'start', 'motion', 'stop', 'after-motion'])
 
     def test_voice_only_never_starts_ardy(self):
-        self.assertEqual(self.run_quiz(stage='voice'), ['audio'])
+        self.assertEqual(self.run_quiz(stage='voice'), ['translate', 'audio'])
 
     def test_script_only_never_starts_ardy(self):
         self.assertEqual(self.run_quiz(stage='script'), [])
 
     def test_interrupted_audio_never_starts_ardy(self):
-        self.assertEqual(self.run_quiz(interrupt_audio=True), ['audio'])
+        self.assertEqual(self.run_quiz(interrupt_audio=True), ['translate', 'audio'])
 
     def test_interrupted_motion_still_stops_ardy(self):
-        self.assertEqual(self.run_quiz(interrupt_motion=True), ['audio', 'bgm', 'start', 'motion', 'stop'])
+        self.assertEqual(self.run_quiz(interrupt_motion=True), ['translate', 'audio', 'bgm', 'start', 'motion', 'stop'])

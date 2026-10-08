@@ -34,7 +34,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from prompts import SYSTEM_PROMPT, build_user_prompt
-from description import build_description, build_title
+from description import build_description, build_title, _credits
+import english
 
 from thumbnail import capture_thumbnail_frame, generate_thumbnail
 
@@ -458,6 +459,11 @@ def main():
         section_starts = {k: v[0]["text"][:8] if v else "" for k, v in sections.items()}
         print(f"[セクション] 検出: {list(sections.keys())}")
 
+        # Step 2.5: 英訳（英語字幕トラックと英語タイトル用）。ollama が載っているうちに済ませる。
+        # 失敗したら None で、日本語だけで公開する
+        en = _timed("Step2.5 英訳", english.translate,
+                    [thumbnail_text] + [s["text"] for s in main_sentences], thumbnail_text)
+
         # Step 3: 音声生成。各文の実測尺を受け取り、モーションを文に紐づけるのに使う
         sentence_durations = _timed("Step3 音声生成", generate_voice,
                                     main_sentences, wav_path, thumbnail_text)
@@ -581,8 +587,22 @@ def main():
         # Step 6: YouTubeアップロード
         title = build_title(thumbnail_text)
         description = build_description(bgm_generated=bgm_path is not None)
+        en_upload = None
+        if en:
+            # 字幕は文単位。冒頭一言 + 本編の各文を、音声の実測尺で並べる（build_vrma_blocks と同じ）
+            cues, t = [{"start": 0.0, "end": intro_duration, "text": en["lines"][0]}], intro_duration
+            for line, dur in zip(en["lines"][1:], sentence_durations):
+                cues.append({"start": t, "end": t + dur, "text": line})
+                t += dur
+            en_upload = {
+                "title": english.build_title(en["title"]),
+                "description": english.build_description(
+                    "night", _credits(bgm_generated=bgm_path is not None)),
+                "srt": english.build_srt(cues),
+            }
         if not env_flag("SKIP_YOUTUBE"):
-            yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description, thumbnail_path)
+            yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description,
+                            thumbnail_path, en_upload)
             if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
                 corners_metadata = [
                     {"corner_name": "Thumbnail", "theme": thumbnail_text},

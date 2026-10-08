@@ -43,6 +43,7 @@ import core
 import quiz_data
 from common import bgm
 import quiz_layout
+import english
 from quiz_prompts import (
     QUIZ_SYSTEM_PROMPT, QUIZ_SCRIPT_SCHEMA,
     build_quiz_user_prompt, build_fallback_script, validate_script,
@@ -133,6 +134,46 @@ def generate_quiz_script(quiz: dict) -> dict:
         script[key] = _normalize_sentences(script[key])
 
     return script
+
+
+# 英訳する台詞のパート。build_audio に渡す順と同じ（THINK は発話が無いので無い）
+_EN_PARTS = ("question_intro", "answer_reveal", "explanation", "affirmation", "ending")
+
+
+def translate_script(quiz: dict, script: dict) -> dict | None:
+    """台詞と問題・選択肢を英訳し、各文の dict に "en" を書き込む。
+
+    返り値は {"question", "choice_a", "choice_b", "title"}（説明文・字幕用）。
+    訳せなければ None で、台本には何も書き込まない。
+    """
+    sentences = [s for key in _EN_PARTS for s in script.get(key) or []]
+    extra = [quiz["問題"], quiz["選択肢A"], quiz["選択肢B"]]
+    en = english.translate([s["text"] for s in sentences] + extra,
+                           script.get("title_hook") or quiz["問題"])
+    if en is None:
+        return None
+    for s, line in zip(sentences, en["lines"]):
+        s["en"] = line
+    question, choice_a, choice_b = en["lines"][len(sentences):]
+    return {"question": question, "choice_a": choice_a, "choice_b": choice_b,
+            "title": en["title"]}
+
+
+def build_en_cues(segments: list[dict], en: dict) -> list[dict]:
+    """英語字幕トラックの区間。文単位で、音声の実測区間（spans）に合わせる。
+
+    THINK（カウントダウン）は台詞が無いが、画面には選択肢が出ているので英語の選択肢を出す。
+    """
+    cues = []
+    for seg in segments:
+        if seg["id"] == "THINK":
+            cues.append({"start": seg["start"], "end": seg["end"],
+                         "text": f"A: {en['choice_a']}\nB: {en['choice_b']}"})
+            continue
+        for sent, span in zip(seg["sentences"], seg["spans"]):
+            cues.append({"start": span["start"], "end": span["end"],
+                         "text": sent.get("en", "")})
+    return cues
 
 
 # ──────────────────────────────────────────────
@@ -545,6 +586,12 @@ def main(argv=None):
         ending = quiz_data.build_ending_sentences()
         script["ending"] = ending
 
+        # 英訳（英語字幕トラックと英語タイトル用）。ollama が載っているうちに済ませる。
+        # 失敗したら None で、日本語だけで公開する
+        en = None
+        if not (args.dry_run or args.stage == "script"):
+            en = core._timed("Step2.5 英訳", translate_script, quiz, script)
+
         if args.dry_run or args.stage == "script":
             print(json.dumps({"quiz": quiz, "script": script}, ensure_ascii=False, indent=2))
             return 0
@@ -658,7 +705,8 @@ def main(argv=None):
             print("[YouTube] スキップ")
         else:
             _upload(quiz, script, mp4_path, thumbnail_path if thumb_ok else "",
-                    bgm_generated=bgm_path is not None)
+                    bgm_generated=bgm_path is not None,
+                    en_cues=build_en_cues(segments, en) if en else None, en=en)
 
         print(f"\n✅ パイプライン完了: {mp4_path}  (合計: {time.time()-total_start:.1f}秒)")
         return 0
@@ -692,15 +740,28 @@ def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm
                                  bgm_path=bgm_path)
 
 
-def _upload(quiz, script, mp4_path, thumbnail_path, bgm_generated=False):
+def _upload(quiz, script, mp4_path, thumbnail_path, bgm_generated=False,
+            en_cues=None, en=None):
     from youtube import upload_to_youtube, save_youtube_upload_to_db, notify_discord
-    from description import build_quiz_title, build_quiz_description
+    from description import build_quiz_title, build_quiz_description, _credits
 
     title = build_quiz_title(script.get("title_hook") or quiz["問題"])
     description = build_quiz_description(quiz, bgm_generated=bgm_generated)
 
+    en_upload = None
+    if en:
+        ans = quiz["正解"]
+        ans_text = en["choice_a"] if ans == "A" else en["choice_b"]
+        en_upload = {
+            "title": english.build_title(en["title"], "Morning Quiz"),
+            "description": english.build_description(
+                "quiz", _credits(bgm_generated),
+                quiz_line=f"Today's question: {en['question']}\nAnswer: {ans} ({ans_text})"),
+            "srt": english.build_srt(en_cues or []),
+        }
+
     yt_url = core._timed("Step8 YT投稿", upload_to_youtube,
-                         mp4_path, title, description, thumbnail_path)
+                         mp4_path, title, description, thumbnail_path, en_upload)
     if yt_url:
         if os.getenv("YOUTUBE_PRIVACY", "public") == "public":
             save_youtube_upload_to_db(yt_url, title, [
