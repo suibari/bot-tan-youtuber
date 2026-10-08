@@ -37,6 +37,7 @@ from prompts import SYSTEM_PROMPT, build_user_prompt
 from description import build_description, build_title, _credits
 import english
 import chibi
+import rich_text
 
 from thumbnail import capture_thumbnail_frame, generate_thumbnail
 
@@ -59,7 +60,7 @@ from core import (  # noqa: F401
     VRMA_BODY_TILT, VRMA_YAW_LIMIT, VRMA_HEAD_YAW, VRMA_HEAD_COUNTER,
     plan_vrma_from_sentences, vrma_unity_args, env_flag,
     esc_drawtext, base_vf_parts, build_subtitle_filters, build_target_filters,
-    build_top_subtitle_filters, TOP_SUB_MAX_CHARS, plan_cuts, build_cut_filters,
+    build_top_subtitle_filters, TOP_SUB_MAX_CHARS, TOP_SUB_Y, plan_cuts, build_cut_filters,
     resolve_peak,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
@@ -395,7 +396,7 @@ def finalize_video(input_webm: str, output_mp4: str,
         return NIGHT_FACE_CLOSE
 
     vf_parts = base_vf_parts()
-    overlays, sfx, post = [], [], []
+    overlays, sfx = [], []
     if subtitles:
         cut_end = end or subtitles[-1]["end"]
         spans = spans or [{"start": s["start"]} for s in subtitles]
@@ -410,7 +411,7 @@ def finalize_video(input_webm: str, output_mp4: str,
               + " ".join(f"{c['start']:.1f}s×{c['zoom']}/{c['angle']:+g}°" for c in cuts))
         vf_parts += build_cut_filters(cuts, face_at)
 
-        inserts = chibi.plan_inserts(spans, subtitles)
+        inserts = chibi.plan_inserts(spans, subtitles, video_end=cut_end)
         print("[ちびキャラ] " + (" ".join(f"{i['start']:.1f}-{i['end']:.1f}s {i['reaction']}"
                                          for i in inserts) or "なし"))
         overlays = chibi.build_overlays(inserts, work_dir or tempfile.gettempdir())
@@ -419,10 +420,11 @@ def finalize_video(input_webm: str, output_mp4: str,
                 and not any(sp.get("reaction") and sp["start"] <= c["start"] < sp["end"]
                             for sp in spans)]
         sfx = chibi.build_sfx(inserts, emph)
-        post = build_top_subtitle_filters(subtitles)
+        # 字幕は画像で描いてイラストの上に重ねる（rich_text。文字の内側に紺が出ない）
+        overlays += rich_text.caption_overlays(subtitles, TOP_SUB_Y, work_dir or tempfile.gettempdir())
 
     run_ffmpeg_finalize(input_webm, output_mp4, vf_parts, bgm_path=bgm_path,
-                        max_duration=end, overlays=overlays, post_vf=post, sfx=sfx)
+                        max_duration=end, overlays=overlays, sfx=sfx)
 
 
 # ──────────────────────────────────────────────

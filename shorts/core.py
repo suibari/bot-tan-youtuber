@@ -321,6 +321,9 @@ def _is_word_head(ch: str) -> bool:
 # ような複合動詞の中にもあるので、助詞の直後のほうを優先する
 _PARTICLES = set("はがをにでともへの")   # 「や」「か」「よ」「ね」は語の中に多いので外す（「や｜り遂げた」）
 
+# 助詞の直後でも、ここから始まるなら切らない（「と／いう」「と／いって」）
+_NOT_AFTER_PARTICLE = {"いう", "いっ", "いわ", "した", "して", "する"}
+
 # 直後で切ると語が割れる文字（「終えたっ」「ていう」）。行頭禁則の _NO_LINE_START とは
 # 別物で、「ん」のように行末に来てよい文字は含めない
 _NO_CUT_AFTER = set("っッゃゅょャュョぁぃぅぇぉァィゥェォー")
@@ -337,7 +340,8 @@ def _snap_kana_cut(text: str, cut: int, lo: int, hi: int) -> int:
     """
     def after_particle(p):
         # 助詞の直後。「今日一日を／やり遂げた」。ひらがな→漢字の変わり目より確かな切れ目
-        return text[p - 1] in _PARTICLES and text[p] not in _NO_LINE_START
+        return (text[p - 1] in _PARTICLES and text[p] not in _NO_LINE_START
+                and text[p:p + 2] not in _NOT_AFTER_PARTICLE)
 
     def good(p):
         return (_is_hiragana(text[p - 1]) and text[p - 1] not in _NO_CUT_AFTER

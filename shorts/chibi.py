@@ -115,7 +115,12 @@ def subtitles_in(span: dict, subtitles: list[dict]) -> list[dict]:
             if span["start"] <= (s["start"] + s["end"]) / 2 < span["end"]]
 
 
-def plan_inserts(spans: list[dict], subtitles: list[dict]) -> list[dict]:
+# イラストが消えてから文（動画）が終わるまでがこれより短ければ、終わりまで出し続ける。
+# 一瞬だけ元の画面に戻るのが見えた（2026-10-08、夜版の決め台詞のあと）
+INSERT_TAIL_SNAP = 0.6
+
+
+def plan_inserts(spans: list[dict], subtitles: list[dict], video_end: float = None) -> list[dict]:
     """reaction の付いた文ごとに、差し込む区間を決める。
 
     強調する語句（台本の "peak"）の字幕に合わせる。字幕はその語句で区切ってあるので
@@ -144,6 +149,10 @@ def plan_inserts(spans: list[dict], subtitles: list[dict]) -> list[dict]:
             start = max(sp["start"], end - INSERT_MIN)
         if end - start > INSERT_MAX:
             end = start + INSERT_MAX
+        # 文の終わり・動画の終わりまでわずかなら、そこまで延ばす（一瞬だけ戻るのを防ぐ）
+        for limit in (sp["end"], video_end):
+            if limit is not None and 0 < limit - end < INSERT_TAIL_SNAP:
+                end = limit
         out.append({"start": round(start, 3), "end": round(end, 3), "reaction": name})
         if len(out) >= MAX_INSERTS:
             break

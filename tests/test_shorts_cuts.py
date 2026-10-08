@@ -158,10 +158,18 @@ class LineBreakTest(unittest.TestCase):
         "今日もお疲れ様、本当によく頑張ったね。": ["今日もお疲れ様、", "本当によく頑張ったね。"],
         "話せなかった日のあなたも頑張ってた": ["話せなかった日の", "あなたも頑張ってた"],
     }
+    PEAK_CASES = {
+        # 「と」は助詞だが「という」の途中では切らない
+        "脳には報酬系という仕組み": ["脳には報酬系", "という仕組み"],
+    }
 
     def test_lines_break_between_words(self):
         for text, want in self.CASES.items():
             self.assertEqual(core._top_subtitle_layout(text, core.TOP_SUB_FONT_SIZE)[0], want, text)
+
+    def test_peak_lines_break_between_words(self):
+        for text, want in self.PEAK_CASES.items():
+            self.assertEqual(core._top_subtitle_layout(text, core.TOP_SUB_PEAK_SIZE)[0], want, text)
 
     def test_a_compound_verb_fits_on_one_line(self):
         # 「頑張り／抜いた」と割るより、少し小さくして1行にする
@@ -197,6 +205,48 @@ class SplitWithPeaksTest(unittest.TestCase):
     def test_a_peak_not_in_the_text_is_ignored(self):
         pieces = core.split_with_peaks("今日もえらいよ。", 16, ["存在しない"])
         self.assertEqual(pieces, [("今日もえらいよ。", False)])
+
+
+class RichTextTest(unittest.TestCase):
+    """縁取り文字を画像で描く（rich_text.py）。"""
+
+    def test_holes_inside_letters_are_filled(self):
+        # 「口」の内側は外側の紺フチではなく、白で塞がれる（ffmpeg の border だと紺が入った）
+        from PIL import Image, ImageDraw
+        import rich_text
+        m = Image.new("L", (60, 60), 0)
+        ImageDraw.Draw(m).rectangle((10, 10, 50, 50), outline=255, width=6)
+        filled = rich_text._fill_holes(m)
+        self.assertEqual(filled.getpixel((30, 30)), 255)   # 内側は塞がる
+        self.assertEqual(filled.getpixel((3, 3)), 0)       # 外側はそのまま
+
+    def test_a_caption_image_spans_the_screen_width(self):
+        import tempfile
+        from pathlib import Path
+        import rich_text
+        with tempfile.TemporaryDirectory() as d:
+            _, w, h = rich_text.caption_image("Nagiで免許更新を", False, Path(d) / "c.png")
+        self.assertEqual(w, core.W)
+        self.assertGreater(h, core.TOP_SUB_FONT_SIZE)
+
+
+class InsertTailTest(unittest.TestCase):
+    """イラストが消えてから文・動画が終わるまでがわずかなら、終わりまで出す。"""
+
+    def test_the_last_insert_runs_to_the_end_of_the_video(self):
+        import chibi
+        subs = [{"start": 26.4, "end": 28.0, "text": "そっと耳を傾けるよ。", "peak": True}]
+        spans = [{"start": 26.4, "end": 28.1, "reaction": "smug"}]
+        ins = chibi.plan_inserts(spans, subs, video_end=28.4)
+        self.assertEqual(ins[-1]["end"], 28.4)
+
+    def test_a_long_gap_is_left_alone(self):
+        import chibi
+        subs = [{"start": 10.0, "end": 11.5, "text": "白湯を飲むこと", "peak": True},
+                {"start": 11.6, "end": 14.0, "text": "リラックス効果を高められるって"}]
+        spans = [{"start": 10.0, "end": 14.0, "reaction": "surprising"}]
+        ins = chibi.plan_inserts(spans, subs, video_end=30.0)
+        self.assertEqual(ins[-1]["end"], 11.5)
 
 
 if __name__ == "__main__":

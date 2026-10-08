@@ -45,6 +45,7 @@ from common import bgm
 import quiz_layout
 import english
 import chibi
+import rich_text
 from quiz_prompts import (
     QUIZ_SYSTEM_PROMPT, QUIZ_SCRIPT_SCHEMA,
     build_quiz_user_prompt, build_fallback_script, validate_script,
@@ -87,6 +88,9 @@ CAPTION_PARTS = {"Q", "A", "EXPL", "AFF", "END"}
 CAPTION_TOP = quiz_layout.PANEL_H + 36
 # ちびキャラは字幕の下に収まる大きさにする（夜版は 940px）
 QUIZ_CHIBI_W = 760
+# 最後の台詞（エンディング）のあと、動画を切るまでの余韻[秒]。録画には生成モーションの
+# 余白が数秒あり、残すとパネルも字幕も無い画面が続いた（2026-10-08）
+QUIZ_TAIL_SEC = 0.6
 
 # Unityカメラを鉛直に上げる量[m]。quiz_layout.PANEL_H と連動しているので
 # 片方だけ変えないこと（実測 3647px/m、PANEL_H=470 → Δy≒0.11）
@@ -783,14 +787,24 @@ def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm
         inside = chibi.subtitles_in(sp, captions)
         if sp["reaction"] and inside and not any(c.get("peak") for c in inside) and sp["part"] == "A":
             inside[-1]["peak"] = True
-    panel = quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme, panel_captions=False)
-    post = panel + core.build_top_subtitle_filters(captions, top=CAPTION_TOP)
-
     if preview or not source_webm:
+        # レイアウト確認用。画像で重ねる部分は ffmpeg の描画で代用する
+        post = (quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme, panel_captions=False)
+                + core.build_top_subtitle_filters(captions, top=CAPTION_TOP))
         quiz_layout.render_preview(post, mp4_path, duration=total)
         return
 
-    end = max(s["end"] for s in segments)
+    work = Path(mp4_path).parent
+    video_end = round(seg["END"]["end"] + QUIZ_TAIL_SEC, 3)
+    # パネルは回答前と正解発表後の2枚の画像を差し替える。最後まで出し続ける
+    panel_q, panel_a = quiz_layout.rich_panel_images(quiz, theme, work)
+    t_a = seg["A"]["start"]
+    panel = [{"path": panel_q, "start": 0.0, "end": t_a, "x": 0, "y": 0},
+             {"path": panel_a, "start": t_a, "end": video_end + 1.0, "x": 0, "y": 0}]
+    # ゲージとカウントダウンは時間で動くので ffmpeg で描き、パネルの上に重ねる
+    gauge = quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme, draw_panel=False)
+
+    end = video_end
     # パートの切り替わりでカットを切り、正解発表だけ強く寄る
     spans = [{"start": s["start"], "emphasis": s["id"] in EMPHASIS_PARTS} for s in segments]
     if pullback_at is not None:
@@ -806,11 +820,14 @@ def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm
     inserts = chibi.plan_inserts(reaction_spans, captions)
     print("[ちびキャラ] " + (" ".join(f"{i['start']:.1f}-{i['end']:.1f}s {i['reaction']}"
                                      for i in inserts) or "なし"))
-    overlays = chibi.build_overlays(inserts, Path(mp4_path).parent, width=QUIZ_CHIBI_W)
+    # 重ねる順: ちびキャラ → パネル → 字幕（あとのものが上）
+    overlays = (chibi.build_overlays(inserts, work, width=QUIZ_CHIBI_W) + panel
+                + rich_text.caption_overlays(captions, CAPTION_TOP, work))
     core.run_ffmpeg_finalize(source_webm, mp4_path,
                              core.base_vf_parts() + core.build_cut_filters(cuts, face_at),
                              timeout=300, bgm_path=bgm_path, overlays=overlays,
-                             post_vf=post, sfx=chibi.build_sfx(inserts))
+                             post_vf=gauge, sfx=chibi.build_sfx(inserts),
+                             max_duration=video_end)
 
 
 def _upload(quiz, script, mp4_path, thumbnail_path, bgm_generated=False,
