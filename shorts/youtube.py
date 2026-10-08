@@ -135,8 +135,80 @@ def _set_thumbnail(youtube, video_id: str, thumbnail_path: str) -> bool:
     return False
 
 
-def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_path: str = "") -> None:
-    """YouTube Data API v3で動画をアップロードする"""
+def _with_retry(label: str, fn) -> bool:
+    """アップロード直後の 404 に備えて、THUMBNAIL_RETRY_DELAYS で伸ばしながら試す。
+
+    失敗しても例外は投げない（_set_thumbnail と同じく、動画は既に公開されている）。
+    """
+    for i, delay in enumerate([0] + THUMBNAIL_RETRY_DELAYS):
+        if delay:
+            print(f"[YouTube] {label}を{delay}秒後に再試行します")
+            time.sleep(delay)
+        try:
+            fn()
+            print(f"[YouTube] {label}完了" + (f"（{i}回再試行）" if i else ""))
+            return True
+        except Exception as e:
+            print(f"[YouTube] {label}に失敗: {e}")
+    return False
+
+
+def _add_english_caption(youtube, video_id: str, srt: str) -> None:
+    """英語字幕トラックを付ける。quota は captions.insert の 400。"""
+    import io
+    from googleapiclient.http import MediaIoBaseUpload
+
+    def caption():
+        media = MediaIoBaseUpload(io.BytesIO(srt.encode("utf-8")),
+                                  mimetype="application/octet-stream", resumable=False)
+        youtube.captions().insert(part="snippet", body={"snippet": {
+            "videoId": video_id, "language": "en", "name": "English", "isDraft": False,
+        }}, media_body=media).execute()
+
+    _with_retry("英語字幕の追加", caption)
+
+
+def _localize(body: dict, english: dict) -> dict:
+    """insert の body に英語版のタイトル・説明文（localizations）を載せたものを返す。
+
+    **投稿のあとから videos.update で付けてはいけない。** 2026-10-08 の非公開テストで、
+    投稿直後（処理中）に update するとタグが消えた。update の応答にはタグが入っていたのに、
+    処理が終わると消えていた。処理を待ってから update すれば残るが、Shorts の処理は
+    数分かかるので待てない。
+    """
+    return {
+        **body,
+        "snippet": {**body["snippet"], "defaultLanguage": "ja"},
+        "localizations": {"en": {"title": english["title"],
+                                 "description": english["description"]}},
+    }
+
+
+def _insert(youtube, body: dict, mp4_path: str) -> dict:
+    from googleapiclient.http import MediaFileUpload
+
+    media = MediaFileUpload(mp4_path, mimetype="video/mp4", resumable=True)
+    request = youtube.videos().insert(
+        part=",".join(body.keys()),
+        body=body,
+        media_body=media
+    )
+
+    response = None
+    while response is None:
+        status, response = request.next_chunk()
+        if status:
+            print(f"[YouTube] アップロード進捗: {int(status.progress() * 100)}%")
+    return response
+
+
+def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_path: str = "",
+                      english: dict = None) -> None:
+    """YouTube Data API v3で動画をアップロードする
+
+    english（{"title", "description", "srt"}）を渡すと、英語版のタイトル・説明文を
+    投稿と同時に付け、投稿のあとに英語字幕トラックを足す。
+    """
     print(f"[YouTube] アップロード中: {title}")
     youtube = _get_youtube_client()
     if youtube is None:
@@ -144,7 +216,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
         return None
 
     try:
-        from googleapiclient.http import MediaFileUpload
+        from googleapiclient.errors import HttpError
 
         privacy = os.getenv("YOUTUBE_PRIVACY", "public")
         body = {
@@ -160,24 +232,28 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
             }
         }
 
-        media = MediaFileUpload(mp4_path, mimetype="video/mp4", resumable=True)
-        request = youtube.videos().insert(
-            part=",".join(body.keys()),
-            body=body,
-            media_body=media
-        )
-
-        response = None
-        while response is None:
-            status, response = request.next_chunk()
-            if status:
-                print(f"[YouTube] アップロード進捗: {int(status.progress() * 100)}%")
+        english = english or {}
+        if english.get("title"):
+            try:
+                response = _insert(youtube, _localize(body, english), mp4_path)
+            except HttpError as e:
+                # 英訳のタイトルが YouTube の制約に引っかかると 400 で弾かれる。
+                # 英語のために投稿を止めないので、英語版なしで出し直す
+                if e.resp.status != 400:
+                    raise
+                print(f"[YouTube] 英語版タイトル付きの投稿が弾かれました。英語版なしで出し直します: {e}")
+                response = _insert(youtube, body, mp4_path)
+        else:
+            response = _insert(youtube, body, mp4_path)
 
         video_id = response['id']
         url = f"https://youtube.com/watch?v={video_id}"
 
         if thumbnail_path and Path(thumbnail_path).exists():
             _set_thumbnail(youtube, video_id, thumbnail_path)
+
+        if english.get("srt"):
+            _add_english_caption(youtube, video_id, english["srt"])
 
         print(f"[YouTube] アップロード完了 ({privacy}): {url}")
         return url
