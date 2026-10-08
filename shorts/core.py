@@ -317,6 +317,10 @@ def _is_word_head(ch: str) -> bool:
     return ("一" <= ch <= "鿿") or ("ァ" <= ch <= "ヺ") or bool(_WORD_CHAR.match(ch))
 
 
+# 直後で切ってよい助詞。ひらがな→漢字の変わり目は「やり／遂げた」「頑張り／抜いた」の
+# ような複合動詞の中にもあるので、助詞の直後のほうを優先する
+_PARTICLES = set("はがをにでともへの")   # 「や」「か」「よ」「ね」は語の中に多いので外す（「や｜り遂げた」）
+
 # 直後で切ると語が割れる文字（「終えたっ」「ていう」）。行頭禁則の _NO_LINE_START とは
 # 別物で、「ん」のように行末に来てよい文字は含めない
 _NO_CUT_AFTER = set("っッゃゅょャュョぁぃぅぇぉァィゥェォー")
@@ -331,13 +335,22 @@ def _snap_kana_cut(text: str, cut: int, lo: int, hi: int) -> int:
     そこを優先する。見つからなければ、少なくとも行頭禁則の文字（っ・ー など）の
     手前では切らない。
     """
+    def after_particle(p):
+        # 助詞の直後。「今日一日を／やり遂げた」。ひらがな→漢字の変わり目より確かな切れ目
+        return text[p - 1] in _PARTICLES and text[p] not in _NO_LINE_START
+
     def good(p):
         return (_is_hiragana(text[p - 1]) and text[p - 1] not in _NO_CUT_AFTER
                 and _is_word_head(text[p]))
-    for d in range(0, max(cut - lo, hi - cut) + 1):
-        for p in (cut - d, cut + d):
-            if lo <= p <= hi and 0 < p < len(text) and good(p):
-                return p
+    # 中央から離れすぎない範囲で、助詞の直後を最優先にする
+    near = max(2, (hi - lo) // 3)
+    for test in (after_particle, good):
+        for d in range(0, max(cut - lo, hi - cut) + 1):
+            if test is after_particle and d > near:
+                break
+            for p in (cut - d, cut + d):
+                if lo <= p <= hi and 0 < p < len(text) and test(p):
+                    return p
     for d in range(0, max(cut - lo, hi - cut) + 1):
         for p in (cut - d, cut + d):
             if (lo <= p <= hi and 0 < p < len(text)
@@ -446,6 +459,46 @@ def _chunk_mora_bounds(chunks: list[str], n_sent_moras: int) -> list[tuple]:
         e_idx = max(s_idx, min(idx_end, n_sent_moras) - 1)
         bounds.append((s_idx, e_idx))
     return bounds
+
+
+def resolve_peak(text: str, peak: str, min_len: int = 4) -> str | None:
+    """LLM が書いた強調語句を、本文に実際にある部分文字列に直す。
+
+    ローカルLLMは「text からそのまま抜き出す」と書いても言い換えることがある
+    （「やり遂げた日のあなたは本当にすごい」→「頑張った日のあなたは本当にすごい」）。
+    本文といちばん長く一致する部分を採り、語の途中から始まっていれば語の切れ目まで進め、
+    途中で終わっていれば後ろのひらがなを2文字まで足す（「温ま」→「温まって」）。
+    min_len 文字未満しか一致しなければ使わない。
+    """
+    peak = (peak or "").strip()
+    if not peak:
+        return None
+    if peak in text:
+        return peak
+    best_i, best_n = 0, 0
+    for i in range(len(text)):
+        for j in range(len(peak)):
+            n = 0
+            while i + n < len(text) and j + n < len(peak) and text[i + n] == peak[j + n]:
+                n += 1
+            if n > best_n:
+                best_i, best_n = i, n
+    if best_n < min_len:
+        return None
+    start, end = best_i, best_i + best_n
+
+    def boundary(p):
+        return p == 0 or text[p - 1] in "、。！？「『 " or (
+            _is_hiragana(text[p - 1]) and _is_word_head(text[p]))
+    # 語の途中から始まっていたら、一致の中で最初の語の切れ目まで進める（「た日の」→「日の」）
+    if not boundary(start):
+        start = next((p for p in range(start + 1, end - min_len + 1) if boundary(p)), start)
+    # 語の途中で終わっていたら、後ろのひらがなを2文字まで足す（「温ま」→「温まって」）。
+    # それ以上足すと次の語まで食う（「労れる」→「労れるあな」）
+    for _ in range(2):
+        if end < len(text) and _is_hiragana(text[end]):
+            end += 1
+    return text[start:end]
 
 
 def split_with_peaks(sentence: str, max_chars: int, peaks: list[str] = ()) -> list[tuple]:
@@ -1533,10 +1586,17 @@ def _wrap_top_subtitle(text: str, max_units: int) -> list[str]:
 def _top_subtitle_layout(text: str, size: int) -> tuple[list[str], int]:
     """行に割り、2行の幅に収まるまで文字を小さくする。返り値は (行, 文字サイズ)。"""
     avail = W - 2 * TOP_SUB_PAD_X - 2 * TOP_SUB_OUTER_BORDER
-    # 2割まで小さくすれば1行に入るなら1行にする（「最後までやり／遂げた」を防ぐ）
-    for sz in range(size, int(size * 0.8) - 1, -4):
+    # 少し小さくすれば1行に入るなら1行にする（「最後までやり／遂げた」を防ぐ）
+    for sz in range(size, int(size * 0.75) - 1, -4):
         if _text_px(text, sz) <= avail:
             return [text], sz
+    # 少し小さくすれば読点で2行に割れるなら、そうする（「本／当によく頑張ったね」を防ぐ）
+    for i, ch in enumerate(text[:-1]):
+        if ch in "、，！？":
+            a, b = text[:i + 1], text[i + 1:]
+            for sz in range(size, int(size * 0.8) - 1, -4):
+                if max(_text_px(a, sz), _text_px(b, sz)) <= avail:
+                    return [a, b], sz
     while True:
         max_units = avail * 2 // size
         # wrap_subtitle_lines は3行目以降を黙って捨てるので、収まるかは wrap_cjk で見る
@@ -1550,7 +1610,8 @@ def _top_subtitle_layout(text: str, size: int) -> tuple[list[str], int]:
 
 
 def build_top_subtitle_filters(subtitles: list[dict], color: str = TOP_SUB_COLOR,
-                               peak_color: str = TOP_SUB_PEAK_COLOR) -> list[str]:
+                               peak_color: str = TOP_SUB_PEAK_COLOR,
+                               top: int = TOP_SUB_Y) -> list[str]:
     """字幕を画面上部に大きく出す。1行を 影 → 濃いフチ → 白フチ付きの色文字 の3枚で描く。
 
     強調の1枚（"peak"）は、文字色と縁取りの内外を入れ替える（黄色の文字 + 紺フチ + 白フチ）。
@@ -1571,7 +1632,7 @@ def build_top_subtitle_filters(subtitles: list[dict], color: str = TOP_SUB_COLOR
         line_h = int(size * 1.18)
         drop = f"{TOP_SUB_POP_PX}*pow(max(0,1-(t-{s})/{TOP_SUB_POP_SEC}),2)"
         for i, line in enumerate(lines):
-            y = TOP_SUB_Y + line_h * i
+            y = top + line_h * i
             txt = f"fontfile={font}:text='{esc_drawtext(line)}':expansion=none:fontsize={size}"
             parts += [
                 f"drawtext={txt}:fontcolor={TOP_SUB_OUTLINE}@0.45"
@@ -1729,7 +1790,10 @@ def run_ffmpeg_finalize(input_webm: str, output_mp4: str, vf_parts: list[str],
 
     graph = [f"[0:v]{','.join(vf_parts)}[b0]"]
     for k, ov in enumerate(overlays):
-        cmd += ["-loop", "1", "-framerate", str(CUT_FPS), "-i", str(ov["path"])]
+        # 画像は1枚だけ読む。overlay は副入力が終わると最後の1枚を出し続ける（eof_action の既定）
+        # ので、ループさせなくても enable の区間ずっと出る。-loop 1 にすると 1080x1920 の
+        # PNG を毎フレーム読み直し、朝版（画像6枚・37秒）は5分の上限を超えて落ちた
+        cmd += ["-i", str(ov["path"])]
         graph.append(
             f"[b{k}][{n_in}:v]overlay=x='{ov.get('x', 0)}':y='{ov.get('y', 0)}':eval=frame"
             f":enable='between(t,{ov['start']:.3f},{ov['end']:.3f})'[b{k + 1}]")

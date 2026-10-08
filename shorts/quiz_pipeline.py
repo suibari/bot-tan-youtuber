@@ -44,6 +44,7 @@ import quiz_data
 from common import bgm
 import quiz_layout
 import english
+import chibi
 from quiz_prompts import (
     QUIZ_SYSTEM_PROMPT, QUIZ_SCRIPT_SCHEMA,
     build_quiz_user_prompt, build_fallback_script, validate_script,
@@ -77,6 +78,15 @@ VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.7"))
 PULLBACK_MOVE_SEC = 0.4
 # 強く寄るパート（山場）。字幕1枚ごとに寄り・傾きを変えたら多すぎた（2026-10-08）
 EMPHASIS_PARTS = {"A"}
+# 正解発表は必ず山場にする。台本で reaction が付いていなければこの差分を出す
+# （それ以外の山場は、夜版と同じく台本の reaction / peak で毎回変わる）
+REVEAL_REACTION = "surprising"
+# 台詞の字幕を出すパート（THINK は台詞が無い）
+CAPTION_PARTS = {"Q", "A", "EXPL", "AFF", "END"}
+# 字幕はパネルのすぐ下。口はアップで y≈1540、引いたあとで y≈1210 なので、2行でも届かない
+CAPTION_TOP = quiz_layout.PANEL_H + 36
+# ちびキャラは字幕の下に収まる大きさにする（夜版は 940px）
+QUIZ_CHIBI_W = 760
 
 # Unityカメラを鉛直に上げる量[m]。quiz_layout.PANEL_H と連動しているので
 # 片方だけ変えないこと（実測 3647px/m、PANEL_H=470 → Δy≒0.11）
@@ -351,11 +361,15 @@ def build_subtitles(segments: list[dict], max_chars: int = 20) -> list[dict]:
         for lo, hi in zip(bounds, bounds[1:]):
             spans = seg["spans"][lo:hi]
             text = "".join(s["text"] for s in seg["sentences"][lo:hi])
+            # 山場の強調語句（台本の "peak"）で字幕を区切る。ちびキャラをその1枚に合わせる
+            peaks = [p for sent in seg["sentences"][lo:hi]
+                     if chibi.reaction_of(sent)
+                     and (p := core.resolve_peak(sent["text"], sent.get("peak")))]
             subs += core.generate_subtitle_timing(
                 text,
                 time_offset=spans[0]["start"],
                 actual_duration=round(spans[-1]["end"] - spans[0]["start"], 3),
-                max_chars=max_chars,
+                max_chars=max_chars, peaks=peaks,
             )
         for s in subs:
             s["part"] = seg["id"]
@@ -577,8 +591,11 @@ def main(argv=None):
             segments  = saved["segments"]
             subtitles = saved["subtitles"]
             source_webm = args.webm or saved.get("webm", "")
+            # 本番は生成モーションがあるとき THINK からカメラを引く。再合成ではそれを前提にする
+            think = next((s["start"] for s in segments if s["id"] == "THINK"), None)
             _render(quiz, segments, subtitles, source_webm, mp4_path,
-                    preview=args.preview or not source_webm)
+                    preview=args.preview or not source_webm,
+                    pullback_at=think if VRMA_PULLBACK > 0 else None)
             print(f"\n✅ 再合成完了: {mp4_path}  ({time.time()-total_start:.1f}秒)")
             return 0
 
@@ -609,7 +626,9 @@ def main(argv=None):
                                script, ending, wav_path, tmp_dir, prefix)
         cleanup_targets.append(wav_path)
 
-        subtitles = core._timed("Step3.5 字幕生成", build_subtitles, segments)
+        # 字幕は夜版と同じ縁取りの太字で出すので、1枚を夜版と同じ長さで切る
+        subtitles = core._timed("Step3.5 字幕生成", build_subtitles, segments,
+                                core.TOP_SUB_MAX_CHARS)
 
         # 再実行用にタイムラインを保存
         Path(timeline_path).write_text(json.dumps({
@@ -739,33 +758,59 @@ def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm
     """クイズUIを合成してMP4を出力する
 
     パートが切り替わるたびに botたんの画角を変え、正解発表だけ強く寄る（core.plan_cuts）。
-    パネルや字幕はカットのあとに重ねるので、寄っても傾かない。
+    台詞の字幕は夜版と同じ縁取りの太字で、パネルの下に出す。
+    台本で reaction の付いた文（山場）では、強調語句の字幕の間だけちびキャラに切り替えて
+    効果音を鳴らす。正解発表は必ず山場にする（REVEAL_REACTION）。
+    パネル（問題・選択肢・正解ハイライト）と字幕はイラストより上に重ねるので、
+    イラストの間も正解が見える。カットのあとに重ねるので、寄っても傾かない。
     """
     seg = {s["id"]: s for s in segments}
     total = max(s["end"] for s in segments) + 1.0
 
     theme = random.choice(quiz_layout.THEMES)
     print(f"[Render] 配色: {theme['name']}")
-    vf_parts = quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme)
+    captions = [dict(s) for s in subtitles if s.get("part") in CAPTION_PARTS]
+    reaction_spans = []
+    for s in segments:
+        for sent, sp in zip(s.get("sentences") or [], s.get("spans") or []):
+            reaction_spans.append({"start": sp["start"], "end": sp["end"], "part": s["id"],
+                                   "reaction": chibi.reaction_of(sent)})
+    # 正解発表は必ず山場にする。LLM が付け忘れたら最後の文に付け、最後の字幕を強調にする
+    reveal = [sp for sp in reaction_spans if sp["part"] == "A"]
+    if reveal and not any(sp["reaction"] for sp in reveal):
+        reveal[-1]["reaction"] = REVEAL_REACTION
+    for sp in reaction_spans:
+        inside = chibi.subtitles_in(sp, captions)
+        if sp["reaction"] and inside and not any(c.get("peak") for c in inside) and sp["part"] == "A":
+            inside[-1]["peak"] = True
+    panel = quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme, panel_captions=False)
+    post = panel + core.build_top_subtitle_filters(captions, top=CAPTION_TOP)
 
     if preview or not source_webm:
-        quiz_layout.render_preview(vf_parts, mp4_path, duration=total)
+        quiz_layout.render_preview(post, mp4_path, duration=total)
+        return
+
+    end = max(s["end"] for s in segments)
+    # パートの切り替わりでカットを切り、正解発表だけ強く寄る
+    spans = [{"start": s["start"], "emphasis": s["id"] in EMPHASIS_PARTS} for s in segments]
+    if pullback_at is not None:
+        cuts = core.plan_cuts(spans, end, forced=[pullback_at + PULLBACK_MOVE_SEC],
+                              wide_at=[pullback_at])
     else:
-        end = max(s["end"] for s in segments)
-        # パートの切り替わりでカットを切り、正解発表だけ強く寄る
-        spans = [{"start": s["start"], "emphasis": s["id"] in EMPHASIS_PARTS} for s in segments]
-        if pullback_at is not None:
-            cuts = core.plan_cuts(spans, end, forced=[pullback_at + PULLBACK_MOVE_SEC],
-                                  wide_at=[pullback_at])
-        else:
-            cuts = core.plan_cuts(spans, end)
-        print(f"[カット] {len(cuts)}カット: "
-              + " ".join(f"{c['start']:.1f}s×{c['zoom']}/{c['angle']:+g}°" for c in cuts))
-        face_at = (lambda t: FACE_WIDE if pullback_at is not None and t >= pullback_at
-                   else FACE_CLOSE)
-        vf_parts = core.base_vf_parts() + core.build_cut_filters(cuts, face_at) + vf_parts
-        core.run_ffmpeg_finalize(source_webm, mp4_path, vf_parts, timeout=300,
-                                 bgm_path=bgm_path)
+        cuts = core.plan_cuts(spans, end)
+    print(f"[カット] {len(cuts)}カット: "
+          + " ".join(f"{c['start']:.1f}s×{c['zoom']}/{c['angle']:+g}°" for c in cuts))
+    face_at = (lambda t: FACE_WIDE if pullback_at is not None and t >= pullback_at
+               else FACE_CLOSE)
+
+    inserts = chibi.plan_inserts(reaction_spans, captions)
+    print("[ちびキャラ] " + (" ".join(f"{i['start']:.1f}-{i['end']:.1f}s {i['reaction']}"
+                                     for i in inserts) or "なし"))
+    overlays = chibi.build_overlays(inserts, Path(mp4_path).parent, width=QUIZ_CHIBI_W)
+    core.run_ffmpeg_finalize(source_webm, mp4_path,
+                             core.base_vf_parts() + core.build_cut_filters(cuts, face_at),
+                             timeout=300, bgm_path=bgm_path, overlays=overlays,
+                             post_vf=post, sfx=chibi.build_sfx(inserts))
 
 
 def _upload(quiz, script, mp4_path, thumbnail_path, bgm_generated=False,

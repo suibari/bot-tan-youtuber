@@ -74,6 +74,30 @@ class LoopStructureTest(unittest.TestCase):
         self.assertIn("③ 決め台詞", prompt)
 
 
+class NagiMentionTest(unittest.TestCase):
+    """この動画は Nagi の紹介も兼ねているので、②に「Nagiで」が無ければ書き直させる。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import json
+        import pipeline
+        cls.check = staticmethod(pipeline.mentions_nagi)
+        cls.script = staticmethod(lambda text: json.dumps({"sections": [
+            {"section": "Thumbnail", "sentences": [{"text": "えらいよ"}]},
+            {"section": "NagiCorner", "sentences": [{"text": text}, {"text": "だからね"}]},
+        ], "meta": {"nagi_themes": []}}, ensure_ascii=False))
+
+    def test_a_script_that_names_nagi_passes(self):
+        self.assertTrue(self.check(self.script("実はね、Nagiで免許更新の投稿を見たんだ。")))
+
+    def test_a_script_without_nagi_is_rejected(self):
+        # 2026-10-08 の試し撮りで実際に出た文
+        self.assertFalse(self.check(self.script("実はね、視力検査で動揺しつつも合格できたっていう投稿を見たんだ。")))
+
+    def test_the_prompt_requires_it(self):
+        self.assertIn("「Nagiで」の一言は必ず入れる", build())
+
+
 class ConstraintSectionTest(unittest.TestCase):
     def test_nagi_theme_exclusion_is_passed(self):
         prompt = build(corner_context={"excluded_nagi_themes": ["眠れない夜"]})

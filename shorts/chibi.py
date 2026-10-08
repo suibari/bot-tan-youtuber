@@ -46,23 +46,43 @@ POP_PX        = 70     # 出てくるときに下から跳ね上がる量[px]
 POP_SEC       = 0.15
 
 
+# down（しょんぼり）を付けてよい文の valence の上限。これ以上明るい文なら shame にする
+DOWN_MAX_VALENCE = 0.2
+
+
+def reaction_of(sent: dict) -> str | None:
+    """台本の文の reaction を、差分名か None にそろえる（"none" や空は None）。
+
+    明るい文（valence が DOWN_MAX_VALENCE 以上）に「しょんぼり」が付いていたら
+    「照れ・本音」にする。ローカルLLMは「不安だったあなたは本当にすごい」のような
+    褒める文に、話題の「不安」に引っ張られて down を付けた（2026-10-08、プロンプトで
+    止めても3回中3回）。
+    """
+    r = sent.get("reaction")
+    if r in (None, "", "none") or r not in REACTIONS:
+        return None
+    if r == "down" and (sent.get("valence") or 0) >= DOWN_MAX_VALENCE:
+        return "shame"
+    return r
+
+
 def available() -> set[str]:
     return {n for n in REACTIONS if (CHIBI_DIR / f"{n}.png").exists()}
 
 
-def normalized(name: str, out_dir: Path) -> Path:
+def normalized(name: str, out_dir: Path, width: int = CHIBI_W) -> Path:
     """外接矩形で切り抜き、幅を CHIBI_W にそろえる。
 
     素材ごとにキャンバスの大きさと余白が違うので、キャンバスではなく描かれている
     部分の幅でそろえる（全差分とも座りポーズで、髪の広がりまでの幅がほぼ同じ）。
     ドット絵風だが格子がそろっていないので、nearest ではなく LANCZOS で縮める。
     """
-    out = Path(out_dir) / f"chibi_{name}.png"
+    out = Path(out_dir) / f"chibi_{name}_{width}.png"
     im = Image.open(CHIBI_DIR / f"{name}.png").convert("RGBA")
     box = im.getchannel("A").point(lambda a: 255 if a > 16 else 0).getbbox()
     im = im.crop(box)
-    scale = CHIBI_W / im.width
-    im = im.resize((CHIBI_W, round(im.height * scale)), Image.LANCZOS)
+    scale = width / im.width
+    im = im.resize((width, round(im.height * scale)), Image.LANCZOS)
     im.save(out)
     return out
 
@@ -85,8 +105,14 @@ def burst_background(name: str, out_dir: Path) -> Path:
 
 
 def subtitles_in(span: dict, subtitles: list[dict]) -> list[dict]:
+    """その文の字幕。字幕の真ん中の時刻で決める。
+
+    字幕の時刻（モーラから計算）と文の区間（音声の実測尺）は少しずれるので、
+    「文の中に収まっている字幕」で選ぶと、文の頭の字幕が落ちることがある
+    （2026-10-08: 強調語句の「白湯を飲むだけで、」が落ち、次の1枚にイラストが出た）。
+    """
     return [s for s in subtitles
-            if s["start"] >= span["start"] - 0.05 and s["end"] <= span["end"] + 0.1]
+            if span["start"] <= (s["start"] + s["end"]) / 2 < span["end"]]
 
 
 def plan_inserts(spans: list[dict], subtitles: list[dict]) -> list[dict]:
@@ -94,7 +120,7 @@ def plan_inserts(spans: list[dict], subtitles: list[dict]) -> list[dict]:
 
     強調する語句（台本の "peak"）の字幕に合わせる。字幕はその語句で区切ってあるので
     （core.split_with_peaks）、ちょうどその語句を言っている間だけイラストになる。
-    peak が見つからなければ文の最後の字幕1枚に合わせる。
+    peak が見つからなければ、文の最後の2枚のうち漢字の多いほうに合わせる。
     短すぎれば手前へ広げ、長すぎれば頭から INSERT_MAX 秒だけにする。
     """
     have = available()
@@ -108,7 +134,10 @@ def plan_inserts(spans: list[dict], subtitles: list[dict]) -> list[dict]:
         if peak:
             start, end = peak[0]["start"], peak[-1]["end"]
         elif inside:
-            start, end = inside[-1]["start"], inside[-1]["end"]
+            # peak が無ければ、最後の2枚のうち漢字の多いほう。最後の1枚は
+            # 「言われてるみたいなんだよ。」のような語尾だけのことが多い
+            last = max(inside[-2:], key=lambda s: sum("一" <= c <= "鿿" for c in s["text"]))
+            start, end = last["start"], last["end"]
         else:
             start, end = sp["start"], sp["end"]
         if end - start < INSERT_MIN:
@@ -121,21 +150,25 @@ def plan_inserts(spans: list[dict], subtitles: list[dict]) -> list[dict]:
     return out
 
 
-def build_overlays(inserts: list[dict], out_dir: Path) -> list[dict]:
-    """core.run_ffmpeg_finalize の overlays。背景を敷いてから、ちびキャラを跳ね上げて出す。"""
+def build_overlays(inserts: list[dict], out_dir: Path, width: int = CHIBI_W,
+                   bottom: int = CHIBI_BOTTOM) -> list[dict]:
+    """core.run_ffmpeg_finalize の overlays。背景を敷いてから、ちびキャラを跳ね上げて出す。
+
+    朝版は上部にクイズのパネルと字幕があるので、小さめ（width）に出す。
+    """
     overlays, cache = [], {}
     for ins in inserts:
         name = ins["reaction"]
         if name not in cache:
-            cache[name] = (burst_background(name, out_dir), normalized(name, out_dir))
+            cache[name] = (burst_background(name, out_dir), normalized(name, out_dir, width))
         bg, fg = cache[name]
         h = Image.open(fg).height
-        y0 = CHIBI_BOTTOM - h
+        y0 = bottom - h
         s = ins["start"]
         overlays.append({"path": bg, "start": s, "end": ins["end"], "x": 0, "y": 0})
         overlays.append({
             "path": fg, "start": s, "end": ins["end"],
-            "x": (core.W - CHIBI_W) // 2,
+            "x": (core.W - width) // 2,
             "y": f"{y0}+{POP_PX}*pow(max(0,1-(t-{s})/{POP_SEC}),2)",
         })
     return overlays

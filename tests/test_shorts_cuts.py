@@ -129,6 +129,56 @@ class TopSubtitleTest(unittest.TestCase):
         self.assertLess(size, core.TOP_SUB_PEAK_SIZE)
 
 
+class ResolvePeakTest(unittest.TestCase):
+    """ローカルLLMは強調語句を本文から写さずに言い換えることがある（2026-10-08）。"""
+
+    def test_an_exact_peak_is_kept(self):
+        self.assertEqual(core.resolve_peak("今日もえらいよ。", "えらいよ"), "えらいよ")
+
+    def test_a_paraphrased_peak_snaps_to_the_text(self):
+        self.assertEqual(core.resolve_peak(
+            "実は、白湯を飲むだけで内臓が温まってリラックスできるって言われてるらしいよ。",
+            "白湯を飲むだけで内臓が温まる"), "白湯を飲むだけで内臓が温まって")
+        self.assertEqual(core.resolve_peak(
+            "だからね、当たり前のことを一つでもやり遂げた日のあなたは本当にすごいよ。",
+            "頑張った日のあなたは本当にすごい"), "日のあなたは本当にすごいよ")
+        self.assertEqual(core.resolve_peak(
+            "そんなふうに自分を労れるあなたは、本当に素敵なことしてるよ。", "自分を労った"),
+            "自分を労れる")
+
+    def test_an_unrelated_peak_is_dropped(self):
+        self.assertIsNone(core.resolve_peak("今日もえらいよ。", "まったく別"))
+        self.assertIsNone(core.resolve_peak("今日もえらいよ。", ""))
+
+
+class LineBreakTest(unittest.TestCase):
+    """2026-10-08 の夜版で、改行が語の途中に来た字幕。"""
+    CASES = {
+        "今日一日をやり遂げたあなたを、": ["今日一日を", "やり遂げたあなたを、"],
+        "今日もお疲れ様、本当によく頑張ったね。": ["今日もお疲れ様、", "本当によく頑張ったね。"],
+        "話せなかった日のあなたも頑張ってた": ["話せなかった日の", "あなたも頑張ってた"],
+    }
+
+    def test_lines_break_between_words(self):
+        for text, want in self.CASES.items():
+            self.assertEqual(core._top_subtitle_layout(text, core.TOP_SUB_FONT_SIZE)[0], want, text)
+
+    def test_a_compound_verb_fits_on_one_line(self):
+        # 「頑張り／抜いた」と割るより、少し小さくして1行にする
+        lines, _ = core._top_subtitle_layout("頑張り抜いたあなたの心に、", core.TOP_SUB_FONT_SIZE)
+        self.assertEqual(lines, ["頑張り抜いたあなたの心に、"])
+
+
+class SubtitlesInTest(unittest.TestCase):
+    def test_a_subtitle_starting_just_before_the_sentence_belongs_to_it(self):
+        # 字幕の時刻（モーラから計算）は文の区間（実測）より少し早く始まることがある
+        import chibi
+        subs = [{"start": 11.2, "end": 12.4, "text": "白湯を飲むだけで、", "peak": True},
+                {"start": 12.5, "end": 14.0, "text": "体内の水分バランスを整える"}]
+        got = chibi.subtitles_in({"start": 11.3, "end": 15.0}, subs)
+        self.assertEqual([s["text"] for s in got], ["白湯を飲むだけで、", "体内の水分バランスを整える"])
+
+
 class SplitWithPeaksTest(unittest.TestCase):
     def test_the_peak_gets_its_own_subtitle(self):
         # 2026-10-08: ちびキャラは「感じやすくなるって」ではなく

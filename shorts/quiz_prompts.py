@@ -14,7 +14,7 @@
 import random
 from textwrap import indent as _indent
 
-from prompts import CHARACTER_PROMPT
+from prompts import CHARACTER_PROMPT, REACTION_RULES
 from common.motion_safety import MOTION_PROMPT_RULES
 from quiz_data import answer_text, wrong_text
 
@@ -43,9 +43,10 @@ QUIZ_SYSTEM_PROMPT = CHARACTER_PROMPT + """
   **各キーには、そのキーの担当ぶんだけを入れること。**
   いちばん最初に書く affirmation に台本を丸ごと入れてしまう事故が実際に起きた。
   書き始める前に、頭の中で①〜⑦を全部組み立ててから、キーの順に取り出して書くこと。
-- sentence の中のフィールドも同じ理由で arousal → motion → text → valence の順に
-  なりうる。**text より先に motion を書かされる**ので、
-  「どんな文を言うか」を決めてから motion を書くこと。
+- sentence の中のフィールドも同じ理由で arousal → motion → peak → reaction → text →
+  valence の順になりうる。**text より先に motion・peak を書かされる**ので、
+  「どんな文を言うか」を決めてから motion・peak を書くこと。peak は、そのあと書く
+  text に一字一句そのまま含まれていなければならない。
   motion は必ず英文で書く（"motions.think" のようなキー名を入れてはいけない）。
 - 日本語のみで出力する
 - textフィールドに[Happy][Sad]などの感情タグを含めないこと。感情はvalence/arousalで表現する
@@ -77,8 +78,13 @@ _SENTENCE_M = {
         "valence": {"type": "number"},
         "arousal": {"type": "number"},
         "motion":  {"type": "string"},
+        # 山場の演出（ちびキャラの差分名）と強調語句。夜版と同じ（prompts.REACTION_RULES）。
+        # 必須にしないとローカルLLMは peak を省く
+        "reaction": {"type": "string", "enum": [
+            "none", "surprising", "down", "thinking", "shame", "joyful", "smug", "sitting"]},
+        "peak":     {"type": "string"},
     },
-    "required": ["text", "valence", "arousal", "motion"],
+    "required": ["text", "valence", "arousal", "motion", "reaction", "peak"],
 }
 
 # シンキングタイムは発話が無く（カウントダウン音のみ）、エンディングは固定文
@@ -201,6 +207,19 @@ def build_quiz_user_prompt(quiz: dict) -> str:
   - explanation の動きは**このクイズの題材そのものを体で表現する**。
     どのクイズでも使い回せる動きにしない
     （例: 猫がテーマ → A person makes cat paws with both hands in a feminine way.）
+
+⑧ reaction と peak — 山場の演出。question_intro / answer_reveal / explanation /
+  affirmation の各 sentence に書く。
+
+""" + _indent(REACTION_RULES, "  ") + """
+
+  朝版だけの決まり:
+  - **answer_reveal は必ず山場にする**（正解を明かす文。"surprising" か "joyful"）。
+    peak は正解を言う部分（例:「正解は……B！」）
+  - 山場は answer_reveal を含めて**2〜3文**。どこを山場にするかは毎回このクイズに
+    合わせて選ぶ（問いかけの「どっち？」、解説の意外な事実、全肯定の一言など）。
+    毎回同じ場所にしないこと
+  - question_intro の最初の文は "none"（顔のアップでサムネイルを撮るため）
 
 重要：合計の尺は30秒以内。
 **VOICEVOXの読み上げ速度は約6.5文字/秒**なので、各パートの文字数の目安を超えると

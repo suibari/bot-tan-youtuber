@@ -60,6 +60,7 @@ from core import (  # noqa: F401
     plan_vrma_from_sentences, vrma_unity_args, env_flag,
     esc_drawtext, base_vf_parts, build_subtitle_filters, build_target_filters,
     build_top_subtitle_filters, TOP_SUB_MAX_CHARS, plan_cuts, build_cut_filters,
+    resolve_peak,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
 
@@ -106,14 +107,17 @@ SCRIPT_SCHEMA = {
                                 # その文を話している間の体の動き（英語）。
                                 # 文に紐づけることで、台詞と動きが必ず対応する
                                 "motion":  {"type": "string"},
-                                # 山場の演出（ちびキャラの差分名）。山場の文にだけ付く
+                                # 山場の演出（ちびキャラの差分名）。山場でない文は "none"
                                 "reaction": {"type": "string", "enum": [
-                                    "surprising", "down", "thinking", "shame",
+                                    "none", "surprising", "down", "thinking", "shame",
                                     "joyful", "smug", "sitting"]},
-                                # 山場の文のうち、いちばん強調する語句（text からそのまま抜き出す）
+                                # 山場の文のうち、いちばん強調する語句（text からそのまま抜き出す）。
+                                # 山場でない文は ""
                                 "peak": {"type": "string"},
                             },
-                            "required": ["text", "valence", "arousal"],
+                            # reaction / peak も必須にする。任意にするとローカルLLMは
+                            # reaction だけ書いて peak を省いた（2026-10-08 の試し撮りで2文とも）
+                            "required": ["text", "valence", "arousal", "reaction", "peak"],
                         },
                     },
                 },
@@ -181,6 +185,21 @@ def fetch_from_bot_db() -> dict:
 # ──────────────────────────────────────────────
 # Step 2: LLMで台本生成
 # ──────────────────────────────────────────────
+
+# NagiCorner に「Nagi」が無いときに台本を書き直させる回数（ローカルLLMなので課金は無い）
+NAGI_MENTION_RETRIES = 2
+
+
+def mentions_nagi(raw_script: str) -> bool:
+    """NagiCorner の文に「Nagi」が入っているか。JSON が壊れていたら判定しない（真を返す）。"""
+    try:
+        sd = parse_script_json(raw_script)
+    except Exception:
+        return True
+    texts = [st.get("text", "") for sec in sd.get("sections", [])
+             if sec.get("section") == "NagiCorner" for st in sec.get("sentences", [])]
+    return not texts or any("Nagi" in t or "ナギ" in t for t in texts)
+
 
 def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None) -> str:
     """DBデータから台本を生成する"""
@@ -314,7 +333,7 @@ def sentence_spans(sentences: list[dict], durations: list[float],
     spans = [{"start": 0.0, "end": intro_duration, "emphasis": False}] if intro_duration > 0 else []
     t = intro_duration
     for sent, dur in zip(sentences, durations):
-        reaction = sent.get("reaction") or None
+        reaction = chibi.reaction_of(sent)
         spans.append({"start": round(t, 3), "end": round(t + dur, 3), "reaction": reaction,
                       "emphasis": bool(reaction) or sent.get("_section") == "Closing"})
         t += dur
@@ -468,6 +487,16 @@ def main():
         else:
             raw_script = _timed("Step2 台本生成", generate_script, data, comments,
                                 corner_context)
+            # Nagi の紹介を兼ねているので「Nagiで見かけた」は外せない。抜けたら書き直させる
+            for retry in range(NAGI_MENTION_RETRIES):
+                if has_comments or mentions_nagi(raw_script):
+                    break
+                print(f"[LLM] NagiCorner に「Nagi」が無いので書き直します（{retry + 1}回目）")
+                raw_script = _timed("Step2 台本生成", generate_script, data, comments,
+                                    corner_context)
+            else:
+                if not has_comments and not mentions_nagi(raw_script):
+                    print("[警告] 書き直しても NagiCorner に「Nagi」が入りませんでした。このまま続けます")
 
         # Step 2.5: JSONパース、クリーン台本作成
         script_data = parse_script_json(raw_script)
@@ -518,8 +547,10 @@ def main():
         # Step 3.5: 字幕・コーナータイミング生成
         # 字幕は上部に大きく出すので、1枚を短めに切る（core.TOP_SUB_MAX_CHARS）
         # 山場の強調語句（台本の "peak"）で字幕を区切り、ちびキャラをその1枚に合わせる
-        peaks = [s["peak"] for s in main_sentences if (s.get("peak") or "") in s["text"]
-                 and s.get("peak")]
+        # reaction の無い文の peak は使わない（"none" の文に書かれても強調しない）
+        peaks = [p for s in main_sentences
+                 if chibi.reaction_of(s) and (p := resolve_peak(s["text"], s.get("peak")))]
+        print(f"[強調] {peaks or 'なし'}")
         subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration,
                                              actual_duration=actual_main_duration,
                                              max_chars=TOP_SUB_MAX_CHARS, peaks=peaks)

@@ -273,11 +273,13 @@ def build_caption_filters(subtitles: list[dict], parts: set[str],
 # ──────────────────────────────────────────────
 
 def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict],
-                       theme: dict = DEFAULT_THEME) -> list[str]:
+                       theme: dict = DEFAULT_THEME, panel_captions: bool = True) -> list[str]:
     """クイズ動画のフィルタチェーン全体を組む。
 
     seg: {"Q": {...}, "THINK": {...}, ...} パートIDをキーにした辞書
     theme: THEMES の1つ。抽選は呼び出し側（quiz_pipeline）で行う
+    panel_captions: False なら台詞の字幕をパネルに出さない（パネルの下に夜版と同じ
+                    縁取りの字幕を出すとき）。問題文は最後まで残す
     """
     t_q     = seg["Q"]["start"]
     t_think = seg["THINK"]["start"]
@@ -291,8 +293,9 @@ def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict],
     # パネルは最初から最後まで
     f += build_panel_filters(0.0, t_last, theme)
 
-    # 問題文は Q 〜 解説開始まで（解説中は同じ場所に解説字幕を出す）
-    f += build_question_filters(quiz["問題"], t_q, t_expl)
+    # 問題文は Q 〜 解説開始まで（解説中は同じ場所に解説字幕を出す）。
+    # 字幕をパネルに出さないときは最後まで残す
+    f += build_question_filters(quiz["問題"], t_q, t_expl if panel_captions else t_last)
 
     # 選択肢は Q 〜 全肯定コメント開始まで
     f += build_choice_filters(quiz, t_q, t_aff, theme)
@@ -303,6 +306,9 @@ def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict],
 
     # 正解発表以降のハイライト（選択肢の上に重ねる）
     f += build_answer_filters(quiz, t_a, t_aff, theme)
+
+    if not panel_captions:
+        return f
 
     # 字幕
     #   Q/THINK は問題文そのものが出ているので字幕は出さない
