@@ -44,6 +44,8 @@ import quiz_data
 from common import bgm
 import quiz_layout
 import english
+import chibi
+import rich_text
 from quiz_prompts import (
     QUIZ_SYSTEM_PROMPT, QUIZ_SCRIPT_SCHEMA,
     build_quiz_user_prompt, build_fallback_script, validate_script,
@@ -73,10 +75,30 @@ PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "EN
 VRMA_PARTS = ("Q", "THINK", "A", "EXPL", "AFF", "END")
 # 生成モーションが始まる THINK からカメラを引く。引く量[m]
 VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.7"))
+# Unity がカメラを引ききるまでの時間[秒]（VideoRecorder.PullbackDuration）
+PULLBACK_MOVE_SEC = 0.4
+# 強く寄るパート（山場）。字幕1枚ごとに寄り・傾きを変えたら多すぎた（2026-10-08）
+EMPHASIS_PARTS = {"A"}
+# 正解発表は必ず山場にする。台本で reaction が付いていなければこの差分を出す
+# （それ以外の山場は、夜版と同じく台本の reaction / peak で毎回変わる）
+REVEAL_REACTION = "surprising"
+# 台詞の字幕を出すパート（THINK は台詞が無い）
+CAPTION_PARTS = {"Q", "A", "EXPL", "AFF", "END"}
+# 字幕はパネルのすぐ下。口はアップで y≈1540、引いたあとで y≈1210 なので、2行でも届かない
+CAPTION_TOP = quiz_layout.PANEL_H + 36
+# ちびキャラは字幕の下に収まる大きさにする（夜版は 940px）
+QUIZ_CHIBI_W = 760
+# 最後の台詞（エンディング）のあと、動画を切るまでの余韻[秒]。録画には生成モーションの
+# 余白が数秒あり、残すとパネルも字幕も無い画面が続いた（2026-10-08）
+QUIZ_TAIL_SEC = 0.6
 
 # Unityカメラを鉛直に上げる量[m]。quiz_layout.PANEL_H と連動しているので
 # 片方だけ変えないこと（実測 3647px/m、PANEL_H=470 → Δy≒0.11）
 CAMERA_OFFSET_Y = float(os.getenv("MORNING_CAMERA_OFFSET_Y", "0.11"))
+# カット割りで寄るときの中心（顔の画面座標）。CAMERA_OFFSET_Y を変えたら測り直すこと。
+# 2026-10-08 の録画のフレームから実測した値（目と口の中間）
+FACE_CLOSE = (540, 1540)
+FACE_WIDE  = (540, 1210)
 # 表情プリセット(Fcl_ALL_*)は口が開くモーフを含むため、発話していない間も口が開いたまま
 # になる。朝版はシンキングタイムなど無音区間が長いので、Unity 側で表情の口成分だけを
 # 打ち消す。眉と目の表情は残るので表情が抜けて見えることはない。
@@ -343,11 +365,15 @@ def build_subtitles(segments: list[dict], max_chars: int = 20) -> list[dict]:
         for lo, hi in zip(bounds, bounds[1:]):
             spans = seg["spans"][lo:hi]
             text = "".join(s["text"] for s in seg["sentences"][lo:hi])
+            # 山場の強調語句（台本の "peak"）で字幕を区切る。ちびキャラをその1枚に合わせる
+            peaks = [p for sent in seg["sentences"][lo:hi]
+                     if chibi.reaction_of(sent)
+                     and (p := core.resolve_peak(sent["text"], sent.get("peak")))]
             subs += core.generate_subtitle_timing(
                 text,
                 time_offset=spans[0]["start"],
                 actual_duration=round(spans[-1]["end"] - spans[0]["start"], 3),
-                max_chars=max_chars,
+                max_chars=max_chars, peaks=peaks,
             )
         for s in subs:
             s["part"] = seg["id"]
@@ -569,8 +595,11 @@ def main(argv=None):
             segments  = saved["segments"]
             subtitles = saved["subtitles"]
             source_webm = args.webm or saved.get("webm", "")
+            # 本番は生成モーションがあるとき THINK からカメラを引く。再合成ではそれを前提にする
+            think = next((s["start"] for s in segments if s["id"] == "THINK"), None)
             _render(quiz, segments, subtitles, source_webm, mp4_path,
-                    preview=args.preview or not source_webm)
+                    preview=args.preview or not source_webm,
+                    pullback_at=think if VRMA_PULLBACK > 0 else None)
             print(f"\n✅ 再合成完了: {mp4_path}  ({time.time()-total_start:.1f}秒)")
             return 0
 
@@ -601,7 +630,9 @@ def main(argv=None):
                                script, ending, wav_path, tmp_dir, prefix)
         cleanup_targets.append(wav_path)
 
-        subtitles = core._timed("Step3.5 字幕生成", build_subtitles, segments)
+        # 字幕は夜版と同じ縁取りの太字で出すので、1枚を夜版と同じ長さで切る
+        subtitles = core._timed("Step3.5 字幕生成", build_subtitles, segments,
+                                core.TOP_SUB_MAX_CHARS)
 
         # 再実行用にタイムラインを保存
         Path(timeline_path).write_text(json.dumps({
@@ -658,6 +689,7 @@ def main(argv=None):
         cleanup_targets.append(emotion_path)
 
         # ── Step 5: Unity録画
+        pullback_at = None
         if args.preview:
             print("[Unity] --preview のためスキップ")
             source_webm = ""
@@ -671,6 +703,7 @@ def main(argv=None):
             # フック(Q)はアップのまま＝サムネもアップで撮れる
             if vrma_motions and VRMA_PULLBACK > 0:
                 think_start = next(s["start"] for s in segments if s["id"] == "THINK")
+                pullback_at = think_start
                 extra += ["-cameraPullbackAt", f"{think_start:.2f}",
                           "-cameraPullbackZ", f"{VRMA_PULLBACK}"] + core.vrma_unity_args()
             core._retry("Step5 Unity録画", core.record_with_unity,
@@ -682,7 +715,8 @@ def main(argv=None):
 
         # ── Step 6: 合成
         core._timed("Step6 MP4合成", _render,
-                    quiz, segments, subtitles, source_webm, mp4_path, args.preview, bgm_path)
+                    quiz, segments, subtitles, source_webm, mp4_path, args.preview, bgm_path,
+                    pullback_at)
 
         # ── Step 7: サムネイル
         thumb_ok = False
@@ -723,21 +757,77 @@ def main(argv=None):
                     print(f"[Cleanup] 削除: {p}")
 
 
-def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm_path=None):
-    """クイズUIを合成してMP4を出力する"""
+def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm_path=None,
+            pullback_at=None):
+    """クイズUIを合成してMP4を出力する
+
+    パートが切り替わるたびに botたんの画角を変え、正解発表だけ強く寄る（core.plan_cuts）。
+    台詞の字幕は夜版と同じ縁取りの太字で、パネルの下に出す。
+    台本で reaction の付いた文（山場）では、強調語句の字幕の間だけちびキャラに切り替えて
+    効果音を鳴らす。正解発表は必ず山場にする（REVEAL_REACTION）。
+    パネル（問題・選択肢・正解ハイライト）と字幕はイラストより上に重ねるので、
+    イラストの間も正解が見える。カットのあとに重ねるので、寄っても傾かない。
+    """
     seg = {s["id"]: s for s in segments}
     total = max(s["end"] for s in segments) + 1.0
 
     theme = random.choice(quiz_layout.THEMES)
     print(f"[Render] 配色: {theme['name']}")
-    vf_parts = quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme)
-
+    captions = [dict(s) for s in subtitles if s.get("part") in CAPTION_PARTS]
+    reaction_spans = []
+    for s in segments:
+        for sent, sp in zip(s.get("sentences") or [], s.get("spans") or []):
+            reaction_spans.append({"start": sp["start"], "end": sp["end"], "part": s["id"],
+                                   "reaction": chibi.reaction_of(sent)})
+    # 正解発表は必ず山場にする。LLM が付け忘れたら最後の文に付け、最後の字幕を強調にする
+    reveal = [sp for sp in reaction_spans if sp["part"] == "A"]
+    if reveal and not any(sp["reaction"] for sp in reveal):
+        reveal[-1]["reaction"] = REVEAL_REACTION
+    for sp in reaction_spans:
+        inside = chibi.subtitles_in(sp, captions)
+        if sp["reaction"] and inside and not any(c.get("peak") for c in inside) and sp["part"] == "A":
+            inside[-1]["peak"] = True
     if preview or not source_webm:
-        quiz_layout.render_preview(vf_parts, mp4_path, duration=total)
+        # レイアウト確認用。画像で重ねる部分は ffmpeg の描画で代用する
+        post = (quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme, panel_captions=False)
+                + core.build_top_subtitle_filters(captions, top=CAPTION_TOP))
+        quiz_layout.render_preview(post, mp4_path, duration=total)
+        return
+
+    work = Path(mp4_path).parent
+    video_end = round(seg["END"]["end"] + QUIZ_TAIL_SEC, 3)
+    # パネルは回答前と正解発表後の2枚の画像を差し替える。最後まで出し続ける
+    panel_q, panel_a = quiz_layout.rich_panel_images(quiz, theme, work)
+    t_a = seg["A"]["start"]
+    panel = [{"path": panel_q, "start": 0.0, "end": t_a, "x": 0, "y": 0},
+             {"path": panel_a, "start": t_a, "end": video_end + 1.0, "x": 0, "y": 0}]
+    # ゲージとカウントダウンは時間で動くので ffmpeg で描き、パネルの上に重ねる
+    gauge = quiz_layout.build_quiz_filters(quiz, seg, subtitles, theme, draw_panel=False)
+
+    end = video_end
+    # パートの切り替わりでカットを切り、正解発表だけ強く寄る
+    spans = [{"start": s["start"], "emphasis": s["id"] in EMPHASIS_PARTS} for s in segments]
+    if pullback_at is not None:
+        cuts = core.plan_cuts(spans, end, forced=[pullback_at + PULLBACK_MOVE_SEC],
+                              wide_at=[pullback_at])
     else:
-        vf_parts = core.base_vf_parts() + vf_parts
-        core.run_ffmpeg_finalize(source_webm, mp4_path, vf_parts, timeout=300,
-                                 bgm_path=bgm_path)
+        cuts = core.plan_cuts(spans, end)
+    print(f"[カット] {len(cuts)}カット: "
+          + " ".join(f"{c['start']:.1f}s×{c['zoom']}/{c['angle']:+g}°" for c in cuts))
+    face_at = (lambda t: FACE_WIDE if pullback_at is not None and t >= pullback_at
+               else FACE_CLOSE)
+
+    inserts = chibi.plan_inserts(reaction_spans, captions)
+    print("[ちびキャラ] " + (" ".join(f"{i['start']:.1f}-{i['end']:.1f}s {i['reaction']}"
+                                     for i in inserts) or "なし"))
+    # 重ねる順: ちびキャラ → パネル → 字幕（あとのものが上）
+    overlays = (chibi.build_overlays(inserts, work, width=QUIZ_CHIBI_W) + panel
+                + rich_text.caption_overlays(captions, CAPTION_TOP, work))
+    core.run_ffmpeg_finalize(source_webm, mp4_path,
+                             core.base_vf_parts() + core.build_cut_filters(cuts, face_at),
+                             timeout=300, bgm_path=bgm_path, overlays=overlays,
+                             post_vf=gauge, sfx=chibi.build_sfx(inserts),
+                             max_duration=video_end)
 
 
 def _upload(quiz, script, mp4_path, thumbnail_path, bgm_generated=False,

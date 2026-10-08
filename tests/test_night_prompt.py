@@ -1,44 +1,26 @@
-"""夜版Shortsのプロンプト（shorts/prompts.py・shorts/pipeline.py）。
+"""夜版Shortsのプロンプト（shorts/prompts.py）。
 
 2026-08-25 18:00 の締めが
 
     「botたんも今日、資格取得のために警察署に行って、緊張したけど、
       全肯定で乗り切ったよ！高評価も嬉しいな。また明日ね！」
 
-になった。この出来事は biorhythm_history に存在せず、同じプロンプトに並んでいた
-Nagi の他人の投稿（「警察署に行ってきました🫡 資格取得の為に用事がありましてね
-決して悪い事したわけじゃないのにめっちゃ緊張した💧」）そのものだった。
+になった。この出来事は Nagi の他人の投稿（「警察署に行ってきました🫡 …」）そのもの
+だった。当時は締めで botたん自身の出来事を語らせていて、それと他人の投稿が同じ
+プロンプトに並んでいた。
 
-原因は2つ:
-
-1. 【今日のbotたんの状態一覧】と【今日Nagiで心に残った投稿一覧】が、どちらも
-   「一人称の日本語で書かれた具体的な出来事」の箇条書きとして並んでいた。
-   投稿側に「他人が書いたもの」という印が無かった。
-2. ガードが「②で紹介した投稿の内容を流用しない」しか禁じていなかった。
-   ②で紹介したのは別の投稿だったので、警察署の投稿は文面上セーフだった。
-
-対処は「LLM に選ばせない」こと。締めで使うエピソードは pick_closing_mood が
-Python 側で1件に確定し、プロンプトにはそれだけを載せる。
+2026-10 にループする台本（③決め台詞が①掴みへつながる）へ変えたときに、
+締めの「今日の出来事」と挨拶を外した。投稿が他人のものだという印は残す。
 """
 
 import unittest
-from datetime import datetime, timezone
 
 import prompts
 
 
-MOOD_RELAX = {
-    "status": "Relax", "energy": 45,
-    "mood": "お風呂上がりでリラックスして、ハンバーグを思い返して嬉しくなった",
-    "mood_en": "Bot-tan is relaxing after a bath.",
-    "created_at": datetime(2026, 8, 25, 12, 22, tzinfo=timezone.utc),
-}
-MOOD_STUDY = {"status": "Study", "energy": 64, "mood": "数学の課題で達成感",
-              "mood_en": "solving math", "created_at": None}
 POLICE_POST = ("警察署に行ってきました🫡 資格取得の為に用事がありましてね "
                "決して悪い事したわけじゃないのにめっちゃ緊張した💧")
 DATA = {
-    "moods": [MOOD_RELAX, MOOD_STUDY],
     "interactions": [
         {"post_text": "Don't ever give up.", "score": 90},
         {"post_text": POLICE_POST, "score": 88},
@@ -51,86 +33,75 @@ def build(**kwargs):
     return prompts.build_user_prompt(DATA, **kwargs)
 
 
-class ClosingMoodBlockTest(unittest.TestCase):
-    def test_only_the_chosen_episode_is_offered(self):
-        prompt = build(closing_mood=MOOD_RELAX)
-        self.assertIn("ハンバーグ", prompt)
-        # 選ばなかった Mood は載らない＝LLM に「選ぶ」余地を残さない
-        self.assertNotIn("数学の課題", prompt)
-        self.assertNotIn("自分で選んでください", prompt)
-        self.assertNotIn("【今日のbotたんの状態一覧】", prompt)
-
-    def test_the_english_mood_is_not_sent(self):
-        # 英文が増えるほど混同の材料になり、字幕の文字数↔モーラ対応も狂う
-        self.assertNotIn("Bot-tan is relaxing", build(closing_mood=MOOD_RELAX))
-
-    def test_energy_is_labelled_on_the_0_to_100_scale(self):
-        # 以前は 0.7 / 0.3 で判定していたので、実データでは常に「高め」だった
-        self.assertIn("エネルギー:普通", build(closing_mood=MOOD_RELAX))
-        self.assertIn("エネルギー:高め", build(closing_mood={**MOOD_RELAX, "energy": 80}))
-        self.assertIn("エネルギー:低め", build(closing_mood={**MOOD_RELAX, "energy": 10}))
-
-    def test_it_falls_back_to_the_first_mood(self):
-        # キャッシュ再生など closing_mood を渡さない経路でも壊れない
-        self.assertIn("ハンバーグ", build())
-
-
-class NagiPostListTest(unittest.TestCase):
+class OtherPeoplesPostsTest(unittest.TestCase):
     def test_the_post_list_is_marked_as_written_by_other_people(self):
-        prompt = build(closing_mood=MOOD_RELAX)
+        prompt = build()
         self.assertIn(POLICE_POST, prompt)       # 紹介はする（②で使う）
         self.assertIn("他の人が書いた投稿", prompt)
         self.assertIn("botたん自身の体験ではありません", prompt)
 
-    def test_the_guard_covers_every_post_not_just_the_one_used(self):
-        prompt = build(closing_mood=MOOD_RELAX)
-        self.assertIn("②で紹介したかどうかに関わらず", prompt)
-        self.assertIn("どの投稿の内容も〇〇に流用してはいけない", prompt)
-
     def test_empty_posts_are_dropped(self):
-        # 画像だけの投稿は紹介できないので一覧に出さない
-        self.assertNotIn("3. (score:88)", build(closing_mood=MOOD_RELAX))
+        self.assertNotIn("3. (score:88)", build())
 
-
-class SystemPromptTest(unittest.TestCase):
     def test_the_output_rules_state_where_things_come_from(self):
         self.assertIn("【出どころの区別（最重要）】", prompts.SYSTEM_PROMPT)
         self.assertIn("botたん自身の体験として語ってはいけません", prompts.SYSTEM_PROMPT)
 
 
-class ConstraintSectionTest(unittest.TestCase):
-    def test_the_excluded_status_is_not_repeated_in_the_prompt(self):
-        # 除外は pick_closing_mood が Python 側で適用済み。重ねて書いても効かない
-        prompt = build(closing_mood=MOOD_RELAX,
-                       corner_context={"excluded_first_greeting_statuses": ["Study"],
-                                       "excluded_nagi_themes": ["眠れない夜"]})
-        self.assertNotIn("状態のエピソードを選ばないこと", prompt)
-        self.assertIn("眠れない夜", prompt)      # Nagi のテーマ除外はそのまま効く
+class LoopStructureTest(unittest.TestCase):
+    def test_the_closing_hands_over_to_the_hook(self):
+        prompt = build()
+        self.assertIn("③決め台詞を言い終えた直後に①掴みがもう一度流れる", prompt)
+        self.assertIn("意外な事実", prompt)
+        self.assertIn("本音", prompt)
+
+    def test_the_closing_has_no_sign_off(self):
+        # 「また明日ね」「高評価」を言わせるとループが切れる
+        prompt = build()
+        self.assertIn("「高評価」・「チャンネル登録」・「また明日ね」などの挨拶は入れない", prompt)
+        self.assertNotIn("「高評価」という語を必ず含めること", prompt)
+        self.assertNotIn("また明日ね」で終わる", prompt)
+
+    def test_botttan_own_episode_is_not_requested(self):
+        prompt = build()
+        self.assertNotIn("botたんの今日の出来事", prompt)
+        self.assertNotIn("first_greeting_status", prompts.SYSTEM_PROMPT)
+
+    def test_comment_days_keep_the_same_closing(self):
+        prompt = build(comments=[{"author": "a", "text": "かわいい"}])
+        self.assertIn('section名を"CommentCorner"', prompt)
+        self.assertNotIn('section名を"NagiCorner"', prompt)
+        self.assertIn("③ 決め台詞", prompt)
 
 
-class PickClosingMoodTest(unittest.TestCase):
+class NagiMentionTest(unittest.TestCase):
+    """この動画は Nagi の紹介も兼ねているので、②に「Nagiで」が無ければ書き直させる。"""
+
     @classmethod
     def setUpClass(cls):
+        import json
         import pipeline
-        cls.pick = staticmethod(pipeline.pick_closing_mood)
+        cls.check = staticmethod(pipeline.mentions_nagi)
+        cls.script = staticmethod(lambda text: json.dumps({"sections": [
+            {"section": "Thumbnail", "sentences": [{"text": "えらいよ"}]},
+            {"section": "NagiCorner", "sentences": [{"text": text}, {"text": "だからね"}]},
+        ], "meta": {"nagi_themes": []}}, ensure_ascii=False))
 
-    def test_recently_used_statuses_are_avoided(self):
-        ctx = {"excluded_first_greeting_statuses": ["Study"]}
-        for _ in range(20):
-            self.assertEqual(self.pick([MOOD_RELAX, MOOD_STUDY], ctx)["status"], "Relax")
+    def test_a_script_that_names_nagi_passes(self):
+        self.assertTrue(self.check(self.script("実はね、Nagiで免許更新の投稿を見たんだ。")))
 
-    def test_it_still_returns_something_when_everything_is_excluded(self):
-        # 無人実行なので、候補ゼロで落とさない
-        ctx = {"excluded_first_greeting_statuses": ["Study", "Relax"]}
-        self.assertIsNotNone(self.pick([MOOD_RELAX, MOOD_STUDY], ctx))
+    def test_a_script_without_nagi_is_rejected(self):
+        # 2026-10-08 の試し撮りで実際に出た文
+        self.assertFalse(self.check(self.script("実はね、視力検査で動揺しつつも合格できたっていう投稿を見たんだ。")))
 
-    def test_no_moods_gives_none(self):
-        self.assertIsNone(self.pick([], {}))
-        self.assertIsNone(self.pick(None, None))
+    def test_the_prompt_requires_it(self):
+        self.assertIn("「Nagiで」の一言は必ず入れる", build())
 
-    def test_it_works_without_a_corner_context(self):
-        self.assertIn(self.pick([MOOD_RELAX, MOOD_STUDY], None)["status"],
-                      ("Relax", "Study"))
+
+class ConstraintSectionTest(unittest.TestCase):
+    def test_nagi_theme_exclusion_is_passed(self):
+        prompt = build(corner_context={"excluded_nagi_themes": ["眠れない夜"]})
+        self.assertIn("眠れない夜", prompt)
 
 
 if __name__ == "__main__":

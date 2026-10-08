@@ -249,3 +249,6 @@ data/obs/
 
 # クイズの消費台帳。パイプラインが追記する
 data/quiz_used.csv
+
+# 効果音ラボの効果音。規約で再配布が禁止されているので追跡しない（shorts/chibi.py）
+data/se/

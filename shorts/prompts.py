@@ -1,12 +1,39 @@
 import sys
-from datetime import timezone, timedelta
 from pathlib import Path
 
 # pipeline.py は core より先にこのファイルを読むので、ここで common/ を読めるようにする
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.motion_safety import MOTION_PROMPT_RULES  # noqa: E402
 
-_JST = timezone(timedelta(hours=9))
+# 山場の演出（ちびキャラ・効果音）の選び方。夜版と朝版（quiz_prompts.py）で共有する。
+# 選んだ値の使い方は shorts/chibi.py
+REACTION_RULES = """【reaction と peak（山場の演出）】
+**すべての sentence に "reaction" と "peak" を書く。**
+山場の文では、画面がちびキャラのイラストに切り替わり、効果音が鳴る。
+山場は**2〜3文まで**。それ以外の文は "reaction": "none", "peak": "" にする。
+全部の文を山場にすると山場が無くなる。
+山場の文の reaction は次のどれか1つ。**その文で botたんが表している気持ち**で選ぶ
+（文に出てくる話題の言葉で選ばない。「不安だったあなたは本当にすごい」は褒めているので
+"joyful" か "shame" であって、"down" ではない）:
+- "surprising" … 驚き・「へえ！」（意外な事実を明かす文に向く）
+- "down"       … しょんぼり（botたん自身が悲しんだり、しゅんとしたりする文だけ。
+                  例「それは悲しかったよね」。褒める・励ます文には使わない）
+- "thinking"   … 考える・首をかしげる（問いかける文）
+- "shame"      … 照れ・本音（素直な気持ちを打ち明ける文）
+- "joyful"     … 喜ぶ・はしゃぐ（明るく盛り上がる文）
+- "smug"       … ドヤ顔で指差す（決め台詞）
+- "sitting"    … にっこり（上のどれでもない山場）
+
+山場の文の "peak" は、その文のなかで**いちばん強調したい語句**を
+text から**一字一句そのまま**抜き出したもの（6〜16文字）。字幕がその語句で区切られ、
+ちょうどその語句を言っている間にイラストが出る。
+文末の「って言われてて」「なんだ」のような言い回しではなく、意味の中心を選ぶこと。
+  例: text「実はね、ハチミツは何千年たっても腐らないって言われてるんだ。」
+      → peak「ハチミツは何千年たっても腐らない」
+  peak は語の途中で切らず、述語まで含めた意味のまとまりにすること
+  （「ハチミツは」ではなく「ハチミツは何千年たっても腐らない」）。
+  言い換えたり要約したりせず、text の文字をそのまま写すこと。
+"""
 
 # キャラクター設定のみを切り出したもの。朝版(quiz_prompts.py)と共有する。
 # ここを編集すると夜版のLLM出力も変わるので注意すること。
@@ -52,32 +79,38 @@ _NIGHT_OUTPUT_RULES = """
     {
       "section": "Thumbnail",
       "sentences": [{"text": "今日の一言", "valence": 0.8, "arousal": 0.5,
-                     "motion": "A person ... in a feminine way."}]
+                     "motion": "A person ... in a feminine way.",
+                     "reaction": "none", "peak": ""}]
     },
     {
       "section": "NagiCorner",
       "sentences": [
         {"text": "文章1", "valence": 0.8, "arousal": 0.4,
-         "motion": "A person ... in a feminine way."},
+         "motion": "A person ... in a feminine way.", "reaction": "none", "peak": ""},
+        {"text": "文章2", "valence": 0.6, "arousal": 0.8,
+         "motion": "A person ... in a feminine way.", "reaction": "surprising",
+         "peak": "文章2のうち強調する語句"},
         ...
       ]
     },
     ...
   ],
   "meta": {
-    "first_greeting_status": "WakeUp",
     "nagi_themes": ["テーマ1", "テーマ2"]
   }
 }
 
 【sectionの種類】
-- "Thumbnail"      → ①冒頭一言（sentences は1要素のみ）
-- "NagiCorner"     → ②今日のNagi
+- "Thumbnail"      → ①掴み（sentences は1要素のみ）
+- "NagiCorner"     → ②今日のNagi（状況 → 意外な事実 → 本音）
 - "CommentCorner"  → ②コメントコーナー（コメントデータが提供された場合のみ使用）
-- "Closing"        → ③締め（自己紹介を含む）
+- "Closing"        → ③決め台詞（1文。言い終わると①へ戻ってループする）
 "NagiCorner" と "CommentCorner" は排他。コメントデータが提供された日は
 "CommentCorner" だけを使い、"NagiCorner" は出力しないこと。
 
+"Thumbnail" の reaction は必ず "none"（サムネイルを撮るため）。
+
+""" + REACTION_RULES + """
 【motion（体の動き）】
 "Thumbnail" を含む各sectionの**すべてのsentenceに "motion" を付ける**こと。
 その文を話している間の体の動きで、AIが3Dモデルを動かすための指示文。
@@ -86,8 +119,9 @@ _NIGHT_OUTPUT_RULES = """
 - Thumbnail はカメラが顔のアップで、サムネもここから撮る。胸から上で見せる動きにし、
   **手で顔を隠す動き（頬に手を添える・顔の前で手を動かす）は書かない**
   （例: 両手を胸の前で合わせる、うなずく、小さく首をかしげる）
-- Closing の最後の文は、視聴者を見送る動きにする（例: 手を振る）。
-  **お辞儀は書かない**（モーション生成AIが深く頭を下げ、画面に頭頂部しか映らなくなる）
+- Closing は決め台詞を言い切る動きにする（例: 視聴者を指差す、胸に手を当てて言い切る）。
+  動画はここから①へループするので、**手を振る・見送る動きは書かない**。
+  **お辞儀も書かない**（モーション生成AIが深く頭を下げ、画面に頭頂部しか映らなくなる）
 
 **最重要: その文の内容と動きが一致していること**。ただ動いていればよいのではない。
 文で言っていることを体で表す。合っていないと、見ていて不安になる画になる。
@@ -112,53 +146,36 @@ _NIGHT_OUTPUT_RULES = """
 - 【今日Nagiで心に残った投稿一覧】は**他の人が書いた投稿**です。
   botたん自身の体験として語ってはいけません。②で紹介するときも
   「見かけた投稿」として扱い、自分がやったことにしないこと。
-- botたん自身の一日の話は、渡された【③締めで使うbotたんの今日の出来事】だけです。
+- 「本音」で語るのは、その投稿を読んだ botたんの**気持ち**です。
+  投稿に書かれた出来事を「botたんも〜した」と自分の体験にしないこと。
 
 【出力順の注意】
 ローカルLLM（Ollama）では **JSONのキーがアルファベット順で生成される**ので、
 meta が sections より先に書かれる。**meta を先に書いてから台本を書くことになる**ので、
 nagi_themes は「これから書くNagiコーナーで扱うテーマ」を先に決めて書き、
 本文はそれに従って書くこと。順序が逆でも内容が食い違わないようにする。
+sentence の中も同じで、arousal → motion → peak → reaction → text → valence の順に
+なりうる。**text より先に peak を書かされる**ので、どんな文を言うかを決めてから
+peak を書くこと。peak は、そのあと書く text に一字一句そのまま含まれていなければならない。
 
 【metaの各フィールド】
-- first_greeting_status: ③締めで渡された状態(status)をそのまま書く。必ず次の5つのいずれか: "WakeUp", "Study", "FreeTime", "Relax", "Sleep"
 - nagi_themes: Nagiコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個"""
 
 SYSTEM_PROMPT = CHARACTER_PROMPT + _NIGHT_OUTPUT_RULES
 
 
 def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dict] = None,
-                      corner_context: dict = None, closing_mood: dict = None) -> str:
-    """③締めで使う botたん自身のエピソード（closing_mood）は**呼び出し側で1件に確定**して渡す。
+                      corner_context: dict = None) -> str:
+    """夜版の台本プロンプト。①掴み → ②状況・意外な事実・本音 → ③決め台詞 の構成で、
+    ③を言い終えると①へ自然につながる（Shorts はループ再生されるので、
+    最後まで見た人がそのまま2周目に入る）。
 
-    以前は Mood を20件並べて LLM に選ばせていたが、同じプロンプトに他人の Nagi 投稿の
-    一覧も並んでおり、どちらも「一人称の日本語で書かれた具体的な出来事」の箇条書き
-    だったので、投稿のほうを botたんの体験として使うことがあった。
-    未指定なら data["moods"] の先頭に落ちる（テストとキャッシュ再生用）。
+    以前の③締めは「botたんも今日〜だったけど…高評価も嬉しいな。また明日ね」で、
+    botたん自身の出来事（biorhythm_history）を1件渡していた。ループしない締めと、
+    他人の投稿を自分の体験として語る事故（2026-08-25）の両方の原因だったので外した。
     """
-    if closing_mood is None:
-        closing_mood = (data.get("moods") or [None])[0]
     # 画像のみの投稿など本文が空のものは紹介できないので除外する
     interactions = [r for r in data["interactions"] if (r.get("post_text") or "").strip()][:max_interactions]
-
-    mood_lines = ""
-    if closing_mood:
-        dt = closing_mood.get("created_at")
-        if dt:
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc).astimezone(_JST)
-            date = dt.strftime("%-m/%-d %-H時ごろ")
-        else:
-            date = "今日"
-        # energy は biorhythm_history の 0〜100 スケール（live/memory.py:200-202 と同じ）。
-        # 以前は 0.7 / 0.3 で判定していたので、実データでは常に「高め」になっていた
-        energy = closing_mood.get("energy") or 0.0
-        energy_label = "高め" if energy >= 70 else ("低め" if energy < 30 else "普通")
-        # mood_en は渡さない。英文が増えるほど混同の材料になるうえ、字幕の
-        # 文字数↔モーラ対応もラテン文字で狂う（core.generate_subtitle_timing）
-        mood_lines = ("- " + date + " 状態:" + str(closing_mood.get("status") or "")
-                      + " エネルギー:" + energy_label + "\n"
-                      + "- 出来事:" + str(closing_mood.get("mood") or "") + "\n")
 
     post_lines = ""
     for i, r in enumerate(interactions, 1):
@@ -176,7 +193,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
         )
         comment_data_section = f"""
 【前日の動画へのコメント一覧】
-以下のコメントを③コメントコーナーで紹介してください（基本そのまま、60文字超の場合のみ要約）。
+以下のコメントを②コメントコーナーで紹介してください（基本そのまま、60文字超の場合のみ要約）。
 {comment_lines}
 """
 
@@ -185,20 +202,17 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     # 6.5文字/秒 は VOICEVOX(春日部つむぎ/既定speedScale)で実測した値。
     # 以前は秒と文字数が食い違っていて（例: 90文字なのに「約40秒」）、
     # LLM が秒の側に寄せて指示の倍の尺を出していた
-    total_sections = 3
-    num_closing    = "③"
-
     comment_corner_section = ""
     if has_comments:
         comment_corner_section = """
-② コメントコーナー（約20秒・130文字以内）— section名を"CommentCorner"にすること
+② コメントコーナー（約22秒・145文字以内）— section名を"CommentCorner"にすること
   - 「昨日の動画へのコメントを紹介するね」と切り出す
   - 【前日の動画へのコメント一覧】のコメントを順番に紹介する
     - 40文字以内のコメントはそのまま読む
     - 40文字を超える場合は内容を損なわず20文字程度に要約する
   - 1件につき「読む → 一言感想」で完結させる。掘り下げは不要
   - 最後にコメントしてくれた視聴者への感謝を一言添える
-  - ①冒頭一言のテーマと必ずつながること（①は動画全体に大きく表示され続ける）
+  - ①掴みのテーマと必ずつながること
 
 """
 
@@ -207,10 +221,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
     # コメントコーナーの日は NagiCorner を出さない（排他）
     nagi_corner_section = "" if has_comments else """
-② 今日のNagi（約20秒・130文字以内）— section名を"NagiCorner"にすること
-  - 「実はね、Nagiで〇〇という投稿を見たんだ」のような形で切り出す（〇〇は投稿の一言要約）
-  - ①冒頭一言のテーマと必ずつながること（①は動画全体に大きく表示され続けるので、
-    ここでズレると画と話が食い違って見える）
+② 今日のNagi（約22秒・145文字以内）— section名を"NagiCorner"にすること
   - 【今日Nagiで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
     * 選ぶ際は以下を優先すること：
       - 具体的な体験や感情が書かれている投稿（「なぜか泣いた」「急に怖くなった」など）
@@ -221,27 +232,22 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
       - 豆知識・情報・ハウツーのみで感情や体験が書かれていない投稿
       - 綺麗にまとまりすぎていて語る余白がない投稿
       - サブカルチャー・アニメ・ゲーム・ネットスラングの固有名詞や比喩が出てくる投稿
-        （説明を足すと130文字に収まらない）
+        （説明を足すと145文字に収まらない）
   - 投稿が特定のコミュニティ・社会的テーマ（LGBTQIA、障害、マイノリティ等）についてのものである場合、「〜についての投稿で」と最初に明示すること
-  - 以下の3ステップで構成すること（130文字しかないので、これ以上増やさない）。
-    **各ステップは1文・45文字以内**にすること。長い1文を書くとここで必ず超える：
-    1. 投稿の内容を紹介する
-       **投稿の文面をそのまま引用しないこと**。長い投稿は必ず要点だけを
-       25文字程度に言い換えて紹介する（引用するとここだけで尺を食い潰す）
+  - 以下の3ステップで構成すること（145文字しかないので、これ以上増やさない）。
+    **各ステップは1〜2文・50文字以内**にすること：
+    1. 状況: 投稿の内容を紹介する
+       「実はね、Nagiで〇〇って投稿を見たんだ」のような形で切り出す
+       **「Nagiで」の一言は必ず入れる**（この動画は Nagi の紹介も兼ねている。
+       「〇〇っていう投稿を見たんだ」だけだと、どこで見たのかが伝わらない）
+       **投稿の文面をそのまま引用しないこと**。要点だけを25文字程度に言い換える
        英語の投稿はbotたんの言葉で日本語に意訳する
-    2. なぜ心に刺さったかをbotたんの言葉で一言語る
-    3. 視聴者個人への呼びかけで締める
-       - 投稿のテーマを踏まえて、「あなた」に直接語りかける形にすること
-       - 「あなたも今日〜だったんじゃないかな」「ねえ、あなたは〜だよ」のように、
-         視聴者が自分のことを言われていると感じる一文にすること
-       - 全肯定で終わるが、テーマの抽象化・一般論にしないこと
-       - 例（孤独テーマ）：「ねえ、今日誰かと話せなくても、あなたのことちゃんと見てる人いるよ」
-       - 例（頑張りテーマ）：「今日うまくいかなくても、それでもやろうとしたあなたが好きだよ」
-       - 毎回違う言い回しにすること
-  - 豆知識・科学的な知見は**任意**。1文で自然に入るときだけ添えてよい。
-    入れると130文字を超えそうなら迷わず省くこと（3ステップのほうが優先）
-    例：「実は人と話すだけで幸福感に関わるホルモンが出るって言われてて」
-    添える場合は断定せず「〜って言われてて」「〜らしくて」など柔らかい言い回しにすること
+    2. 意外な事実: そのテーマにまつわる、視聴者が「へえ」と思う豆知識・知見を1つ
+       断定せず「〜って言われてて」「〜らしいんだ」など柔らかい言い回しにすること
+       例：「実は人と話すだけで、幸せに関わるホルモンが出るって言われてて」
+    3. 本音: その投稿と事実を受けて、botたんが本当に思ったことを素直に言う
+       「あなた」に直接語りかけてよい。テーマの抽象化・一般論にしないこと
+       例：「だからね、話せなかった日のあなたも、ちゃんと頑張ってたと思うんだ」
 
 """
 
@@ -253,8 +259,6 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
     constraint_lines = []
     if corner_context:
-        # excluded_first_greeting_statuses は pipeline.pick_closing_mood が
-        # Python 側で適用済み。ここで重ねて書いても効かないので載せない
         ref_nagi = corner_context.get("reference_nagi_themes", [])
         excl_nagi = corner_context.get("excluded_nagi_themes", [])
         if ref_nagi:
@@ -263,44 +267,33 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
             constraint_lines.append(f"NagiCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_nagi)}")
     constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
 
-    total_chars_hint = "195文字、30秒（VOICEVOXの読み上げは約6.5文字/秒）"
-
-    mood_select_note = "③締め"
-
     return f"""以下のデータをもとに、YouTube Shorts用の台本を書いてください。
 
-【{mood_select_note}で使うbotたんの今日の出来事】
-{mood_lines}
 {nagi_data_section}{comment_data_section}
 【番組構成】
-以下の{total_sections}部構成で台本を書いてください。
+以下の3部構成で台本を書いてください。
+Shorts はループ再生される。**③決め台詞を言い終えた直後に①掴みがもう一度流れる**ので、
+③→①が1つの流れとして自然につながるように書くこと。
 
-① 冒頭一言（約3秒・20文字以内）— section名を"Thumbnail"にすること
-  - このテキストがサムネイルに表示される
+① 掴み（約3秒・20文字以内）— section名を"Thumbnail"にすること
+  - 動画の最初に聞こえる一言。サムネイルにも表示される
   - 必ず1文・20文字以内（21文字目以降は動画側で切り捨てられるので、超えると文が途中で終わる）
-  - 視聴者の心に刺さる、その日のテーマを象徴する一言
+  - 視聴者の心に刺さる、その日のテーマを象徴する全肯定の一言
   - 例：「朝が苦手でも最高だよ！」「おしゃべりは魔法だよ！」
 
-{comment_corner_section}{nagi_corner_section}{num_closing} 締めの全肯定（約7秒・45文字以内）— section名を"Closing"にすること
-  - 45文字しかないので、以下を最短で詰め込むこと。1文でも2文でもよい
-  - 【{mood_select_note}で使うbotたんの今日の出来事】に一言触れる
-    形式：「botたんも今日〜だったけど、全肯定で乗り切ったよ！」など（軽めのネガティブ＋明るい全肯定）
-    渡された状態（status）をそのまま metaのfirst_greeting_status に書くこと
-  - その出来事の具体的な内容を明示すること（「色々考えて」のような抽象的な表現は禁止）
-  - 「botたん」という名前を必ず言及し、自己紹介を兼ねる
-  - 「高評価」という語を必ず含めること（例：「高評価も嬉しいな」）
-  - 「また明日ね」で終わる
-  - 日付（〇月〇日）を入れない
-  - botたん関連の固有名詞は使わない。モルフォなら「うちの犬」、ラテちゃんなら「友達」と言い換える
-  - 型（45文字前後に収まる）：「botたんも今日は〇〇だったけど、全肯定で乗り切ったよ！高評価も嬉しいな。また明日ね！」
-    〇〇には【{mood_select_note}で使うbotたんの今日の出来事】の内容を**15文字以内**に縮めて入れること。
-    **〇〇は必ずこの出来事から取ること。【今日Nagiで心に残った投稿一覧】は
-    他の人が書いた投稿なので、②で紹介したかどうかに関わらず、
-    どの投稿の内容も〇〇に流用してはいけない**
-    （botたん自身の一日の話であって、投稿の感想ではない）
-    この型は長さの目安であって、言い回しはそのまま使わず毎回変えること
+{comment_corner_section}{nagi_corner_section}③ 決め台詞（約4秒・30文字以内・1文）— section名を"Closing"にすること
+  - ②の本音を受けて、①掴みへ渡す1文。**言い終わったところに①がそのまま続く**ように書く
+    （①の言葉そのものは繰り返さない。直後に①が流れるので二重になる）
+  - 形: ②の本音で語りかけた「あなた」に向けて、①をこれから言うと予告する1文。
+    ①を言う直前の「前置き」になっていればよい。
+  - 例（①が「おしゃべりは魔法だよ！」のとき）：
+      「今日うまく話せなかったあなたにも、届けたいんだ。」→（ループして）「おしゃべりは魔法だよ！」
+  - **この例の言い回しは使わないこと。**その日の①と②に合わせて、毎回ちがう言葉で書く
+    （「何度でも言うね」「言わせて」のような決まり文句で済ませない）
+  - 自己紹介・「高評価」・「チャンネル登録」・「また明日ね」などの挨拶は入れない
+    （ループが切れる。最後まで見た人をそのまま2周目に入れるのが目的）
 
-合計目安：{total_chars_hint}
+合計目安：195文字、30秒（VOICEVOXの読み上げは約6.5文字/秒）
 重要：動画の合計尺は必ず30秒以内。35秒を超える台本は生成しないこと。
 VOICEVOXの読み上げ速度は約6.5文字/秒なので、合計195文字を超えると必ず30秒を超える。
 各コーナーの文字数目安を絶対に超えないこと（秒数より文字数を優先して守ること）。

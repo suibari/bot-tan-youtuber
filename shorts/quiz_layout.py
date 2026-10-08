@@ -273,11 +273,16 @@ def build_caption_filters(subtitles: list[dict], parts: set[str],
 # ──────────────────────────────────────────────
 
 def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict],
-                       theme: dict = DEFAULT_THEME) -> list[str]:
+                       theme: dict = DEFAULT_THEME, panel_captions: bool = True,
+                       draw_panel: bool = True) -> list[str]:
     """クイズ動画のフィルタチェーン全体を組む。
 
     seg: {"Q": {...}, "THINK": {...}, ...} パートIDをキーにした辞書
     theme: THEMES の1つ。抽選は呼び出し側（quiz_pipeline）で行う
+    panel_captions: False なら台詞の字幕をパネルに出さない（パネルの下に夜版と同じ
+                    縁取りの字幕を出すとき）。問題文は最後まで残す
+    draw_panel: False ならパネル・問題・選択肢・正解ハイライトを描かず、ゲージと
+                カウントダウンだけを返す（パネルを rich_panel_images の画像で重ねるとき）
     """
     t_q     = seg["Q"]["start"]
     t_think = seg["THINK"]["start"]
@@ -288,11 +293,15 @@ def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict],
     t_last  = seg["END"]["end"] + 1.0
 
     f = []
+    if not draw_panel:
+        return (build_gauge_filters(t_think, seg["THINK"]["duration"], theme=theme)
+                + build_countdown_filters(t_think, seg["THINK"]["duration"], theme=theme))
     # パネルは最初から最後まで
     f += build_panel_filters(0.0, t_last, theme)
 
-    # 問題文は Q 〜 解説開始まで（解説中は同じ場所に解説字幕を出す）
-    f += build_question_filters(quiz["問題"], t_q, t_expl)
+    # 問題文は Q 〜 解説開始まで（解説中は同じ場所に解説字幕を出す）。
+    # 字幕をパネルに出さないときは最後まで残す
+    f += build_question_filters(quiz["問題"], t_q, t_expl if panel_captions else t_last)
 
     # 選択肢は Q 〜 全肯定コメント開始まで
     f += build_choice_filters(quiz, t_q, t_aff, theme)
@@ -303,6 +312,9 @@ def build_quiz_filters(quiz: dict, seg: dict, subtitles: list[dict],
 
     # 正解発表以降のハイライト（選択肢の上に重ねる）
     f += build_answer_filters(quiz, t_a, t_aff, theme)
+
+    if not panel_captions:
+        return f
 
     # 字幕
     #   Q/THINK は問題文そのものが出ているので字幕は出さない
@@ -330,3 +342,119 @@ def render_preview(vf_parts: list[str], output_mp4: str, duration: float,
     ]
     subprocess.run(cmd, check=True, timeout=300)
     print(f"[Preview] 出力: {output_mp4} ({duration:.1f}秒, フィルタ{len(vf_parts)}個)")
+
+
+# ──────────────────────────────────────────────
+# リッチなパネル（画像で描く）
+# ──────────────────────────────────────────────
+# drawbox / drawtext で組んだパネルは、白い板に普通のゴシック体を置いただけだった。
+# 夜版の字幕と同じ丸ゴシックの極太で、角丸のカードと A/B の丸いバッジに描き直す。
+# 回答前と正解発表後の2枚を作り、正解発表の時刻で差し替える。
+# ゲージとカウントダウンは時間で動くので、今までどおり ffmpeg で上に描く
+# （位置 GAUGE_* / COUNT_* はこのパネルの中に収まるようにしてある）。
+
+PANEL_RADIUS = 28
+CHOICE_RADIUS = CHOICE_H // 2
+
+
+def _rich_font(size: int):
+    from PIL import ImageFont
+    import rich_text
+    return ImageFont.truetype(rich_text.FONT, size)
+
+
+def _rgb(c: str) -> tuple:
+    import rich_text
+    return rich_text._rgb(c.split("@")[0])
+
+
+def _choice_card(draw, y: int, label: str, text: str, fill, edge, badge, badge_text, ink):
+    draw.rounded_rectangle((CHOICE_X, y, CHOICE_X + CHOICE_W, y + CHOICE_H),
+                           radius=CHOICE_RADIUS, fill=fill, outline=edge, width=5)
+    r = CHOICE_H // 2 - 8
+    cx, cy = CHOICE_X + CHOICE_H // 2 + 4, y + CHOICE_H // 2
+    draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=badge)
+    f = _rich_font(44)
+    draw.text((cx, cy), label, font=f, fill=badge_text, anchor="mm")
+    draw.text((CHOICE_X + CHOICE_H + 24, cy), text, font=_rich_font(CHOICE_SIZE), fill=ink,
+              anchor="lm")
+
+
+def rich_panel_images(quiz: dict, theme: dict, out_dir) -> tuple:
+    """回答前と正解発表後のパネルを PNG にする。返り値は (回答前, 正解発表後) のパス。"""
+    from pathlib import Path
+    from PIL import Image, ImageDraw, ImageFilter
+    import rich_text
+
+    main, accent = _rgb(theme["main"]), _rgb(theme["accent"])
+    ink = _rgb(INK)
+
+    def base():
+        img = Image.new("RGBA", (W, PANEL_H + 24), (0, 0, 0, 0))
+        # 影
+        sh = Image.new("L", img.size, 0)
+        ImageDraw.Draw(sh).rounded_rectangle((16, 8, W - 16, PANEL_H + 4), radius=PANEL_RADIUS, fill=110)
+        img.paste(Image.new("RGBA", img.size, (20, 30, 60, 255)), (0, 0), sh.filter(ImageFilter.GaussianBlur(8)))
+        # 白からテーマ色へ薄く寄せたグラデーションのカード
+        card = Image.new("RGBA", (W - 32, PANEL_H - 8))
+        top, bottom = (255, 255, 255), rich_text._lighten(main, 0.88)
+        for yy in range(card.height):
+            k = yy / card.height
+            card.paste(tuple(round(a + (b - a) * k) for a, b in zip(top, bottom)) + (255,),
+                       (0, yy, card.width, yy + 1))
+        m = Image.new("L", card.size, 0)
+        ImageDraw.Draw(m).rounded_rectangle((0, 0, card.width - 1, card.height - 1),
+                                            radius=PANEL_RADIUS, fill=255)
+        img.paste(card, (16, 0), m)
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle((16, 0, W - 17, PANEL_H - 9), radius=PANEL_RADIUS, outline=main, width=6)
+        # コーナーラベル（リボン）
+        f = _rich_font(34)
+        tw = int(d.textlength(CORNER_LABEL, font=f))
+        d.rounded_rectangle((34, LABEL_Y, 34 + tw + 44, LABEL_Y + LABEL_H - 6),
+                            radius=(LABEL_H - 6) // 2, fill=accent)
+        d.text((34 + 22, LABEL_Y + (LABEL_H - 6) // 2), CORNER_LABEL, font=f,
+               fill=(255, 255, 255), anchor="lm")
+        # 問題文（最大2行。入らなければ小さくする）
+        size = Q_SIZE + 4
+        while True:
+            lines = wrap_cjk(quiz["問題"], max_units=(W - 140) * 2 // size)
+            if len(lines) <= 2 or size <= 40:
+                break
+            size -= 4
+        for i, line in enumerate(lines[:3]):
+            q = rich_text.outlined_line(line, size, "#2B2B2B", inner="white", inner_w=6,
+                                        outer_w=2, outline=(255, 255, 255), gradient=0.0,
+                                        shadow=False)
+            img.alpha_composite(q, ((W - q.width) // 2, Q_Y - 30 + i * (size + 8)))
+        return img
+
+    before = base()
+    d = ImageDraw.Draw(before)
+    for label, y in (("A", CHOICE_A_Y), ("B", CHOICE_B_Y)):
+        _choice_card(d, y, label, quiz[f"選択肢{label}"], fill=(255, 255, 255, 245), edge=main,
+                     badge=main, badge_text=(255, 255, 255), ink=ink)
+
+    after = base()
+    d = ImageDraw.Draw(after)
+    correct = quiz["正解"]
+    for label, y in (("A", CHOICE_A_Y), ("B", CHOICE_B_Y)):
+        if label == correct:
+            _choice_card(d, y, label, quiz[f"選択肢{label}"], fill=main + (255,), edge=(255, 255, 255),
+                         badge=(255, 255, 255), badge_text=main, ink=(255, 255, 255))
+        else:
+            _choice_card(d, y, label, quiz[f"選択肢{label}"], fill=(214, 214, 214, 235),
+                         edge=(170, 170, 170), badge=(160, 160, 160), badge_text=(255, 255, 255),
+                         ink=(130, 130, 130))
+    stamp = rich_text.outlined_line("せいかい！", 44, core.TOP_SUB_PEAK_COLOR, inner="#1E2B4F",
+                                    inner_w=6, outer_w=6, outline=(255, 255, 255), gradient=0.0,
+                                    shadow=False).rotate(8, expand=True, resample=Image.BICUBIC)
+    y_ok = CHOICE_A_Y if correct == "A" else CHOICE_B_Y
+    after.alpha_composite(stamp, (CHOICE_X + CHOICE_W - stamp.width + 30,
+                                  y_ok + CHOICE_H // 2 - stamp.height // 2))
+
+    out_dir = Path(out_dir)
+    p1, p2 = out_dir / "quiz_panel_q.png", out_dir / "quiz_panel_a.png"
+    before.save(p1)
+    after.save(p2)
+    return p1, p2

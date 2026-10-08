@@ -55,7 +55,7 @@ class ShortsOrderTest(unittest.TestCase):
                    generate_quiz_script=lambda quiz: {}, build_audio=audio,
                    # 英訳は ollama を使う。ACE-Step・ARDY が GPU を取る前に済ませること
                    translate_script=lambda quiz, script: events.append('translate'),
-                   build_subtitles=lambda segments: [], build_vrma_blocks=lambda *a: ['block'],
+                   build_subtitles=lambda segments, *a: [], build_vrma_blocks=lambda *a: ['block'],
                    build_emotions=finished)
         exec(compile(module, str(source), 'exec'), env)
         with tempfile.TemporaryDirectory() as tmp, patch.object(tempfile, 'gettempdir', return_value=tmp):
