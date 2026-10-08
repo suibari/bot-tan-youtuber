@@ -73,10 +73,18 @@ PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "EN
 VRMA_PARTS = ("Q", "THINK", "A", "EXPL", "AFF", "END")
 # 生成モーションが始まる THINK からカメラを引く。引く量[m]
 VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.7"))
+# Unity がカメラを引ききるまでの時間[秒]（VideoRecorder.PullbackDuration）
+PULLBACK_MOVE_SEC = 0.4
+# 強く寄るパート（山場）。字幕1枚ごとに寄り・傾きを変えたら多すぎた（2026-10-08）
+EMPHASIS_PARTS = {"A"}
 
 # Unityカメラを鉛直に上げる量[m]。quiz_layout.PANEL_H と連動しているので
 # 片方だけ変えないこと（実測 3647px/m、PANEL_H=470 → Δy≒0.11）
 CAMERA_OFFSET_Y = float(os.getenv("MORNING_CAMERA_OFFSET_Y", "0.11"))
+# カット割りで寄るときの中心（顔の画面座標）。CAMERA_OFFSET_Y を変えたら測り直すこと。
+# 2026-10-08 の録画のフレームから実測した値（目と口の中間）
+FACE_CLOSE = (540, 1540)
+FACE_WIDE  = (540, 1210)
 # 表情プリセット(Fcl_ALL_*)は口が開くモーフを含むため、発話していない間も口が開いたまま
 # になる。朝版はシンキングタイムなど無音区間が長いので、Unity 側で表情の口成分だけを
 # 打ち消す。眉と目の表情は残るので表情が抜けて見えることはない。
@@ -658,6 +666,7 @@ def main(argv=None):
         cleanup_targets.append(emotion_path)
 
         # ── Step 5: Unity録画
+        pullback_at = None
         if args.preview:
             print("[Unity] --preview のためスキップ")
             source_webm = ""
@@ -671,6 +680,7 @@ def main(argv=None):
             # フック(Q)はアップのまま＝サムネもアップで撮れる
             if vrma_motions and VRMA_PULLBACK > 0:
                 think_start = next(s["start"] for s in segments if s["id"] == "THINK")
+                pullback_at = think_start
                 extra += ["-cameraPullbackAt", f"{think_start:.2f}",
                           "-cameraPullbackZ", f"{VRMA_PULLBACK}"] + core.vrma_unity_args()
             core._retry("Step5 Unity録画", core.record_with_unity,
@@ -682,7 +692,8 @@ def main(argv=None):
 
         # ── Step 6: 合成
         core._timed("Step6 MP4合成", _render,
-                    quiz, segments, subtitles, source_webm, mp4_path, args.preview, bgm_path)
+                    quiz, segments, subtitles, source_webm, mp4_path, args.preview, bgm_path,
+                    pullback_at)
 
         # ── Step 7: サムネイル
         thumb_ok = False
@@ -723,8 +734,13 @@ def main(argv=None):
                     print(f"[Cleanup] 削除: {p}")
 
 
-def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm_path=None):
-    """クイズUIを合成してMP4を出力する"""
+def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm_path=None,
+            pullback_at=None):
+    """クイズUIを合成してMP4を出力する
+
+    パートが切り替わるたびに botたんの画角を変え、正解発表だけ強く寄る（core.plan_cuts）。
+    パネルや字幕はカットのあとに重ねるので、寄っても傾かない。
+    """
     seg = {s["id"]: s for s in segments}
     total = max(s["end"] for s in segments) + 1.0
 
@@ -735,7 +751,19 @@ def _render(quiz, segments, subtitles, source_webm, mp4_path, preview=False, bgm
     if preview or not source_webm:
         quiz_layout.render_preview(vf_parts, mp4_path, duration=total)
     else:
-        vf_parts = core.base_vf_parts() + vf_parts
+        end = max(s["end"] for s in segments)
+        # パートの切り替わりでカットを切り、正解発表だけ強く寄る
+        spans = [{"start": s["start"], "emphasis": s["id"] in EMPHASIS_PARTS} for s in segments]
+        if pullback_at is not None:
+            cuts = core.plan_cuts(spans, end, forced=[pullback_at + PULLBACK_MOVE_SEC],
+                                  wide_at=[pullback_at])
+        else:
+            cuts = core.plan_cuts(spans, end)
+        print(f"[カット] {len(cuts)}カット: "
+              + " ".join(f"{c['start']:.1f}s×{c['zoom']}/{c['angle']:+g}°" for c in cuts))
+        face_at = (lambda t: FACE_WIDE if pullback_at is not None and t >= pullback_at
+                   else FACE_CLOSE)
+        vf_parts = core.base_vf_parts() + core.build_cut_filters(cuts, face_at) + vf_parts
         core.run_ffmpeg_finalize(source_webm, mp4_path, vf_parts, timeout=300,
                                  bgm_path=bgm_path)
 

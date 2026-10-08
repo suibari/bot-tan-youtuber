@@ -263,38 +263,6 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
         print("pip install google-api-python-client google-auth-oauthlib")
 
 
-def fetch_recent_corners(limit: int = 2) -> dict:
-    """直近N件のcornersからClosingの除外statusを取得する"""
-    conn = connect_raw()
-    try:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT corners FROM affirmative_bot.youtube_shorts
-                WHERE corners IS NOT NULL
-                ORDER BY id DESC LIMIT %s
-            """, (limit,))
-            rows = cur.fetchall()
-    finally:
-        conn.close()
-
-    excluded_fg = set()
-    for row in rows:
-        corners_data = row.get("corners") or []
-        if isinstance(corners_data, str):
-            corners_data = json.loads(corners_data)
-        for corner in corners_data:
-            status = corner.get("status")
-            if not status:
-                continue
-            if corner.get("corner_name") == "Closing":
-                excluded_fg.add(status)
-    result = {
-        "excluded_first_greeting_statuses": list(excluded_fg),
-    }
-    print(f"[corners] 除外status: FG={result['excluded_first_greeting_statuses']}")
-    return result
-
-
 def get_recent_video_stats(n: int = 3) -> list[dict]:
     """DBの直近n本の動画について YouTube API で viewCount/commentCount を取得する"""
     conn = connect_raw()

@@ -24,6 +24,15 @@ import core
 
 
 class SplitSubtitleChunksTest(unittest.TestCase):
+    def test_an_even_cut_moves_to_a_word_boundary(self):
+        # 2026-10-08 夜版: 字数で均等に割ると「終えたっ」「ていう投稿を見たんだ。」になった
+        chunks = core.split_subtitle_chunks(
+            "視力検査で動揺しながらも無事に免許更新を終えたっていう投稿を見たんだ。", 16)
+        self.assertEqual(chunks, ["視力検査で動揺しながらも", "無事に免許更新を終えたっていう",
+                                  "投稿を見たんだ。"])
+        for c in chunks[1:]:
+            self.assertNotIn(c[0], core._NO_LINE_START)
+
     def test_a_chunk_one_over_the_limit_is_split_evenly(self):
         # 固定長スライスなら [15, 1]。均等割りなら [8, 8]
         chunks = core.split_subtitle_chunks("資格取得のために警察署に行って、", 15)

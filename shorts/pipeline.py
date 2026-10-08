@@ -17,12 +17,12 @@ botたん YouTube Shorts 自動投稿パイプライン
   BGM_PATH            : BGM音声ファイルのパス (省略可)
   YOUTUBE_PRIVACY     : YouTube動画の公開設定 (public/private/unlisted, デフォルト: public)
   VRMA_PULLBACK       : 生成モーション開始以降カメラを引く量[m] (既定 0.7)
+  KEEP_TEMP           : true で一時ファイル（音声・録画）を残す
   NIGHT_MOUTH_CLOSE   : 無音時に表情の口成分を打ち消す強さ 0〜1 (既定 1.0)
   （生成モーションの調整値 VRMA_GAIN / VRMA_HIPS_Y などは core.py 側を参照）
 """
 
 import os
-import random
 import json
 import time
 import urllib.parse
@@ -36,6 +36,7 @@ load_dotenv()
 from prompts import SYSTEM_PROMPT, build_user_prompt
 from description import build_description, build_title, _credits
 import english
+import chibi
 
 from thumbnail import capture_thumbnail_frame, generate_thumbnail
 
@@ -58,6 +59,7 @@ from core import (  # noqa: F401
     VRMA_BODY_TILT, VRMA_YAW_LIMIT, VRMA_HEAD_YAW, VRMA_HEAD_COUNTER,
     plan_vrma_from_sentences, vrma_unity_args, env_flag,
     esc_drawtext, base_vf_parts, build_subtitle_filters, build_target_filters,
+    build_top_subtitle_filters, TOP_SUB_MAX_CHARS, plan_cuts, build_cut_filters,
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
 
@@ -74,6 +76,14 @@ VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.7"))
 # 無音でも口が半開きのまま残る（2026-10-03 夜版で arousal が 1.0 まで上がり、
 # だんだん口が開いていくように見えた）。朝版・ライブと同じく無音時に口成分を打ち消す
 MOUTH_CLOSE = float(os.getenv("NIGHT_MOUTH_CLOSE", "1.0"))
+# カット割りで寄るときの中心（顔の画面座標）。冒頭のアップと、カメラを引いたあとで違う。
+# 2026-10-08 の録画のフレームから実測した値（目と口の中間）。冒頭は顔が画面いっぱい
+NIGHT_FACE_CLOSE = (500, 1080)
+NIGHT_FACE_WIDE  = (530, 990)
+# Unity がカメラを引ききるまでの時間[秒]（VideoRecorder.PullbackDuration）
+PULLBACK_MOVE_SEC = 0.4
+# 最後の発話のあと、ループの継ぎ目までに残す余韻[秒]
+LOOP_TAIL_SEC = 0.15
 
 # Gemini response_schema: 台本をJSONとして構造化出力させるスキーマ
 SCRIPT_SCHEMA = {
@@ -96,6 +106,10 @@ SCRIPT_SCHEMA = {
                                 # その文を話している間の体の動き（英語）。
                                 # 文に紐づけることで、台詞と動きが必ず対応する
                                 "motion":  {"type": "string"},
+                                # 山場の演出（ちびキャラの差分名）。山場の文にだけ付く
+                                "reaction": {"type": "string", "enum": [
+                                    "surprising", "down", "thinking", "shame",
+                                    "joyful", "smug", "sitting"]},
                             },
                             "required": ["text", "valence", "arousal"],
                         },
@@ -107,10 +121,9 @@ SCRIPT_SCHEMA = {
         "meta": {
             "type": "object",
             "properties": {
-                "first_greeting_status": {"type": "string"},
-                "nagi_themes":           {"type": "array", "items": {"type": "string"}},
+                "nagi_themes": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["first_greeting_status", "nagi_themes"],
+            "required": ["nagi_themes"],
         },
     },
     "required": ["sections", "meta"],
@@ -127,7 +140,11 @@ from common.db import connect_raw
 
 
 def fetch_from_bot_db() -> dict:
-    """ラズパイDBからNagiのポストとMood履歴を取得する"""
+    """ラズパイDBからNagiのポストを取得する
+
+    以前は締めで使う botたん自身の出来事（biorhythm_history）も取っていたが、
+    ループする台本にしたときに締めから外した（prompts.py の構成を参照）。
+    """
     print("[DB] ラズパイDBに接続中...")
 
     conn = connect_raw()
@@ -151,74 +168,23 @@ def fetch_from_bot_db() -> dict:
             """)
             interactions = cur.fetchall()
 
-            # 今週エネルギー
-            cur.execute("""
-                SELECT
-                    status,
-                    mood,
-                    mood_en,
-                    energy,
-                    created_at
-                FROM affirmative_bot.biorhythm_history
-                WHERE created_at >= NOW() - INTERVAL '1 days'
-                ORDER BY RANDOM()
-            """)
-            moods = cur.fetchall()
 
     finally:
         conn.close()
 
-    print(f"[DB] Nagiポスト: {len(interactions)}件, Mood履歴: {len(moods)}件")
-    all_moods = [dict(r) for r in moods]
-    # statusごとに1件ずつランダムサンプリング
-    seen_status = {}
-    for m in all_moods:
-        s = m.get("status")
-        if s not in seen_status:
-            seen_status[s] = m
-    sampled_moods = list(seen_status.values())
-    random.shuffle(sampled_moods)
-
-    return {
-        "interactions": [dict(r) for r in interactions],
-        "moods":        sampled_moods,
-    }
-
-
-def pick_closing_mood(moods: list[dict], corner_context: dict = None) -> dict | None:
-    """③締めで使う botたん自身のエピソードを1件だけ選ぶ。
-
-    **LLM に選ばせない。** 以前は Mood を20件並べて「この中から選んでください」と
-    書いていたが、同じプロンプトに他人の Nagi 投稿の一覧も並んでおり、どちらも
-    「一人称の日本語で書かれた具体的な出来事」の箇条書きだったので、LLM が
-    投稿のほうを botたんの体験として使ってしまった（2026-08-25 18:00 の
-    「資格取得のために警察署に行って」は、その日の Nagi 投稿そのもの）。
-    1件に確定して渡せば「選ぶ」余地が無くなり、混同そのものが起きなくなる。
-
-    直近2日で使った status（corner_context）は Python 側で避ける。避けた結果
-    候補が無くなったら、除外を無視して選ぶ（無人実行なので候補ゼロで落とさない）。
-    """
-    if not moods:
-        return None
-    excluded = set((corner_context or {}).get("excluded_first_greeting_statuses") or [])
-    candidates = [m for m in moods if m.get("status") not in excluded] or list(moods)
-    chosen = random.choice(candidates)
-    print(f"[Mood] ③締め: status={chosen.get('status')} / {str(chosen.get('mood'))[:40]}"
-          f"（候補{len(candidates)}件 / 除外status={sorted(excluded) or 'なし'}）")
-    return chosen
+    print(f"[DB] Nagiポスト: {len(interactions)}件")
+    return {"interactions": [dict(r) for r in interactions]}
 
 
 # ──────────────────────────────────────────────
 # Step 2: LLMで台本生成
 # ──────────────────────────────────────────────
 
-def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None,
-                    closing_mood: dict = None) -> str:
+def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None) -> str:
     """DBデータから台本を生成する"""
     print(f"[LLM] 台本生成中...")
 
-    user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context,
-                                    closing_mood=closing_mood)
+    user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
     # スキーマは経路によらず response_format で渡す。Gemini はそのまま
     # OpenAI 互換で受け、Ollama は common/llm.py が native の format へ写す。
     # （extra_body に response_mime_type/response_schema を渡すと Gemini は400になる。
@@ -340,25 +306,103 @@ def build_vrma_blocks(sentences: list[dict], durations: list[float],
 # Step 5: FFmpegでMP4に変換・仕上げ
 # ──────────────────────────────────────────────
 
+def sentence_spans(sentences: list[dict], durations: list[float],
+                   intro_duration: float) -> list[dict]:
+    """文ごとの区間と演出。山場（reaction のある文と決め台詞）は強く寄る。"""
+    spans = [{"start": 0.0, "end": intro_duration, "emphasis": False}] if intro_duration > 0 else []
+    t = intro_duration
+    for sent, dur in zip(sentences, durations):
+        reaction = sent.get("reaction") or None
+        spans.append({"start": round(t, 3), "end": round(t + dur, 3), "reaction": reaction,
+                      "emphasis": bool(reaction) or sent.get("_section") == "Closing"})
+        t += dur
+    return spans
+
+
+# 寄らない文がこれより長いときは、途中の字幕の切れ目で画角を1回変える
+CALM_SPLIT_SEC = 5.0
+
+
+def cut_spans(spans: list[dict], subtitles: list[dict]) -> list[dict]:
+    """文の区間から、カットの区間を作る。
+
+    山場の文は丸ごと寄るのではなく、普段の画で入って、オチの手前で強く寄る。
+    ちびキャラを出す文は最後の字幕1枚がイラストになるので、その1枚前の字幕で寄る
+    （寄り → イラスト の順に盛り上げる）。出さない文（決め台詞など）は最後の字幕で寄る。
+    寄らない長い文は、真ん中に近い字幕の切れ目で1回だけ画角を変える。
+    """
+    out = []
+    for sp in spans:
+        out.append({"start": sp["start"], "emphasis": False})
+        inside = [s for s in subtitles
+                  if s["start"] >= sp["start"] - 0.05 and s["end"] <= sp["end"] + 0.1]
+        if sp.get("emphasis"):
+            k = -2 if sp.get("reaction") else -1
+            if len(inside) >= -k:
+                peak = inside[k]["start"]
+                if peak - sp["start"] < 0.3:
+                    out[-1]["emphasis"] = True
+                else:
+                    out.append({"start": peak, "emphasis": True})
+            else:
+                out[-1]["emphasis"] = True
+        elif sp["end"] - sp["start"] > CALM_SPLIT_SEC and len(inside) >= 2:
+            mid = (sp["start"] + sp["end"]) / 2
+            out.append({"start": min(inside[1:], key=lambda s: abs(s["start"] - mid))["start"],
+                        "emphasis": False})
+    return out
+
+
 def finalize_video(input_webm: str, output_mp4: str,
-                   subtitles: list[dict] = None,
-                   target_text: str = "", bgm_path=None) -> None:
+                   subtitles: list[dict] = None, bgm_path=None,
+                   pullback_at: float = None, end: float = None,
+                   spans: list[dict] = None, work_dir=None) -> None:
     """FFmpegで縦型Shorts用MP4に変換・字幕合成する（夜版レイアウト）
 
-    target_text は「誰に向けた動画か」を示す一言（Thumbnail セクション＝サムネに
-    焼くのと同じ文言）。以前は左上にコーナー名（「今日のNagi」等）を出していたが、
-    Shorts はスワイプで途中から入るので、コーナー名より「自分向けの動画か」が
-    分かるほうが効く。
+    字幕は上部に大きく1枚ずつ出す（build_top_subtitle_filters）。以前は下の帯に
+    小さい字幕、上部にはテーマの一言（Thumbnail）を動画全体に出していた。
+    冒頭の字幕がテーマの一言そのものなので、入口でテーマが見えるのは変わらない。
+
+    カットは文の切り替わりで切り、山場の文だけ強く寄る（core.plan_cuts）。
+    reaction の付いた文では、ちびキャラに切り替えて効果音を鳴らす（chibi.py）。
+    end は最後の発話の終わり。そこで切ってループさせる。
     """
     print(f"[FFmpeg] MP4変換中...")
 
-    vf_parts = base_vf_parts()
-    if subtitles:
-        vf_parts += build_subtitle_filters(subtitles)
-    if target_text:
-        vf_parts += build_target_filters(target_text)
+    def face_at(t: float) -> tuple:
+        if pullback_at is not None and t >= pullback_at:
+            return NIGHT_FACE_WIDE
+        return NIGHT_FACE_CLOSE
 
-    run_ffmpeg_finalize(input_webm, output_mp4, vf_parts, bgm_path=bgm_path)
+    vf_parts = base_vf_parts()
+    overlays, sfx, post = [], [], []
+    if subtitles:
+        cut_end = end or subtitles[-1]["end"]
+        spans = spans or [{"start": s["start"]} for s in subtitles]
+        cspans = cut_spans(spans, subtitles)
+        if pullback_at is not None:
+            # 引いている 0.4秒は寄らない。引ききったところで次のカットへ
+            cuts = plan_cuts(cspans, cut_end, forced=[pullback_at + PULLBACK_MOVE_SEC],
+                             wide_at=[pullback_at])
+        else:
+            cuts = plan_cuts(cspans, cut_end)
+        print(f"[カット] {len(cuts)}カット: "
+              + " ".join(f"{c['start']:.1f}s×{c['zoom']}/{c['angle']:+g}°" for c in cuts))
+        vf_parts += build_cut_filters(cuts, face_at)
+
+        inserts = chibi.plan_inserts(spans, subtitles)
+        print("[ちびキャラ] " + (" ".join(f"{i['start']:.1f}-{i['end']:.1f}s {i['reaction']}"
+                                         for i in inserts) or "なし"))
+        overlays = chibi.build_overlays(inserts, work_dir or tempfile.gettempdir())
+        # ちびキャラを出さない山場（決め台詞など）は、寄ったカットの頭で音を鳴らす
+        emph = [c["start"] for c in cuts if c["zoom"] > 1.2
+                and not any(sp.get("reaction") and sp["start"] <= c["start"] < sp["end"]
+                            for sp in spans)]
+        sfx = chibi.build_sfx(inserts, emph)
+        post = build_top_subtitle_filters(subtitles)
+
+    run_ffmpeg_finalize(input_webm, output_mp4, vf_parts, bgm_path=bgm_path,
+                        max_duration=end, overlays=overlays, post_vf=post, sfx=sfx)
 
 
 # ──────────────────────────────────────────────
@@ -368,7 +412,6 @@ def finalize_video(input_webm: str, output_mp4: str,
 from youtube import (
     fetch_youtube_comments,
     upload_to_youtube,
-    fetch_recent_corners,
     get_recent_video_stats,
     should_enable_comment_corner,
     fetch_nagi_corner_context,
@@ -391,7 +434,7 @@ def main():
     try:
         # Step 1: DBからデータ取得
         data = _timed("Step1 DB取得", fetch_from_bot_db)
-        if not data["interactions"] and not data["moods"]:
+        if not data["interactions"]:
             print("[ERROR] データが取得できませんでした")
             return
 
@@ -406,19 +449,12 @@ def main():
         has_comments = bool(comments)
         print(f"[コメント] CommentCorner: {'あり (' + str(len(comments)) + '件)' if has_comments else 'なし → スキップ'}")
 
-        # corner_context取得（直近status除外・Nagi参考/除外リスト）
+        # corner_context取得（Nagi参考/除外リスト）
         corner_context = {}
         try:
-            recent_corners = fetch_recent_corners(limit=2)
-            nagi_context = fetch_nagi_corner_context()
-            corner_context = {**recent_corners, **nagi_context}
+            corner_context = fetch_nagi_corner_context()
         except Exception as e:
             print(f"[corner_context] 取得失敗（スキップ）: {e}")
-
-        # ③締めで使う botたん自身のエピソードは Python 側で1件に確定する。
-        # LLM に一覧から選ばせると、隣に並ぶ他人の Nagi 投稿を自分の体験として
-        # 使うことがある（README「他人の投稿を自分の体験にしない」）
-        closing_mood = pick_closing_mood(data["moods"], corner_context)
 
         # 音声が完成してから ARDY を起動する。
         ardy_proc = None
@@ -428,27 +464,21 @@ def main():
         if script_cache and Path(script_cache).exists():
             raw_script = open(script_cache).read()
             print(f"[LLM] キャッシュから台本読み込み: {script_cache}")
-            # 台本は別の Mood で書かれているので、いま選んだものは捨てる
-            closing_mood = None
         else:
             raw_script = _timed("Step2 台本生成", generate_script, data, comments,
-                                corner_context, closing_mood)
+                                corner_context)
 
         # Step 2.5: JSONパース、クリーン台本作成
         script_data = parse_script_json(raw_script)
         sections = {s["section"]: s["sentences"] for s in script_data["sections"]}
         script_meta = script_data["meta"]
-        # first_greeting_status は Python 側で確定した Mood のものを正とする。
-        # LLM の自己申告は、実際に使った Mood とズレることがある
-        closing_status = (closing_mood or {}).get("status") or script_meta.get("first_greeting_status", "")
-        print(f"[META] first_greeting_status={closing_status}, "
-              f"nagi_themes={script_meta.get('nagi_themes')}")
+        print(f"[META] nagi_themes={script_meta.get('nagi_themes')}")
         thumbnail_sentences = sections.get("Thumbnail", [])
         thumbnail_text = thumbnail_sentences[0]["text"][:20] if thumbnail_sentences else "今日も全肯定だよ！"
         print(f"[サムネイル] 一言: {thumbnail_text}")
         # Thumbnail以外の全文をフラットなリストに
         main_sentences = [
-            sent
+            {**sent, "_section": s["section"]}
             for s in script_data["sections"]
             if s["section"] != "Thumbnail"
             for sent in s["sentences"]
@@ -485,7 +515,10 @@ def main():
                   f"(目標30秒 / 警告閾値{NIGHT_DURATION_WARN_SEC}秒, 本文{len(clean_script)}文字)")
 
         # Step 3.5: 字幕・コーナータイミング生成
-        subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration, actual_duration=actual_main_duration)
+        # 字幕は上部に大きく出すので、1枚を短めに切る（core.TOP_SUB_MAX_CHARS）
+        subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration,
+                                             actual_duration=actual_main_duration,
+                                             max_chars=TOP_SUB_MAX_CHARS)
         if intro_duration > 0:
             # 冒頭一言も本編チャンクと同じ扱いにする（+0.05 の余韻を付け、
             # 本編1枚目との間隔を dedupe に通す）。以前は dedupe のあとに
@@ -564,6 +597,7 @@ def main():
         if vrma_motions:
             # 冒頭も生成モーションで動かすので、既定ステートの Blow A Kiss を飛ばす
             extra += ["-skipIntroClip", "1"]
+        pullback_at = None
         if vrma_motions and VRMA_PULLBACK > 0:
             pullback_at = max(corners[0]["start"], HOOK_CLOSEUP_SEC) if corners else HOOK_CLOSEUP_SEC
             extra += ["-cameraPullbackAt", f"{pullback_at:.2f}",
@@ -575,14 +609,16 @@ def main():
         # サムネ作成
         thumbnail_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
         # 生成モーションを使うときは、カメラが引く前（フック内）からサムネを撮る
-        thumb_before = (max(corners[0]["start"], HOOK_CLOSEUP_SEC)
-                        if (vrma_motions and corners and VRMA_PULLBACK > 0) else None)
+        thumb_before = pullback_at
         capture_thumbnail_frame(webm_path, screenshot_path, emotions, before=thumb_before)
         generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
 
         # Step 5: MP4変換
-        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles, thumbnail_text,
-               bgm_path)
+        # 最後の発話の直後で切る。録画の末尾にはモーションの余白（VRMA_RECORD_TAIL_SEC）
+        # があり、残すとループの継ぎ目で間が空く
+        _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles,
+               bgm_path, pullback_at, total_sec + LOOP_TAIL_SEC,
+               sentence_spans(main_sentences, sentence_durations, intro_duration), tmp_dir)
 
         # Step 6: YouTubeアップロード
         title = build_title(thumbnail_text)
@@ -606,7 +642,6 @@ def main():
             if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
                 corners_metadata = [
                     {"corner_name": "Thumbnail", "theme": thumbnail_text},
-                    {"corner_name": "Closing", "status": closing_status},
                 ]
                 nagi_themes = script_meta.get("nagi_themes", [])
                 if isinstance(nagi_themes, list) and nagi_themes:
@@ -626,7 +661,8 @@ def main():
     finally:
         #pass
         # 一時ファイル削除
-        for path in [wav_path, intro_wav_path, webm_path, bgm_path]:
+        # KEEP_TEMP=true なら残す（朝版と同じ。カット割りの顔の位置を録画から測り直すとき用）
+        for path in ([] if env_flag("KEEP_TEMP") else [wav_path, intro_wav_path, webm_path, bgm_path]):
             if path is None:
                 continue
             if Path(path).exists():

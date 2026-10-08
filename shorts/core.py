@@ -308,6 +308,44 @@ def wrap_subtitle_lines(text: str, max_units: int, max_lines: int = 2) -> list[s
 _CUT_SLACK = 4
 
 
+def _is_hiragana(ch: str) -> bool:
+    return "ぁ" <= ch <= "ゖ"
+
+
+def _is_word_head(ch: str) -> bool:
+    """漢字・カタカナ・ラテン文字。ひらがなの直後に来たら、たいてい新しい語の頭。"""
+    return ("一" <= ch <= "鿿") or ("ァ" <= ch <= "ヺ") or bool(_WORD_CHAR.match(ch))
+
+
+# 直後で切ると語が割れる文字（「終えたっ」「ていう」）。行頭禁則の _NO_LINE_START とは
+# 別物で、「ん」のように行末に来てよい文字は含めない
+_NO_CUT_AFTER = set("っッゃゅょャュョぁぃぅぇぉァィゥェォー")
+
+
+def _snap_kana_cut(text: str, cut: int, lo: int, hi: int) -> int:
+    """均等割りの切れ目を、[lo, hi] の中でいちばん近い語の切れ目へ寄せる。
+
+    字数だけで割ると「終えたっ」「ていう投稿を」のように語の途中で切れる
+    （2026-10-08 の夜版。字幕を上部に大きく出すために1枚を短くしたら目立った）。
+    ひらがな → 漢字・カタカナ の変わり目は、たいてい助詞のあとの語の頭なので
+    そこを優先する。見つからなければ、少なくとも行頭禁則の文字（っ・ー など）の
+    手前では切らない。
+    """
+    def good(p):
+        return (_is_hiragana(text[p - 1]) and text[p - 1] not in _NO_CUT_AFTER
+                and _is_word_head(text[p]))
+    for d in range(0, max(cut - lo, hi - cut) + 1):
+        for p in (cut - d, cut + d):
+            if lo <= p <= hi and 0 < p < len(text) and good(p):
+                return p
+    for d in range(0, max(cut - lo, hi - cut) + 1):
+        for p in (cut - d, cut + d):
+            if (lo <= p <= hi and 0 < p < len(text)
+                    and text[p] not in _NO_LINE_START and text[p - 1] not in _NO_CUT_AFTER):
+                return p
+    return cut
+
+
 def _snap_cut(text: str, cut: int, lo: int, hi: int) -> int:
     """cut がラテン文字・数字の連続の内側なら、語の境界へ寄せる。
 
@@ -319,7 +357,7 @@ def _snap_cut(text: str, cut: int, lo: int, hi: int) -> int:
     if cut <= 0 or cut >= len(text):
         return cut
     if not (_WORD_CHAR.match(text[cut - 1]) and _WORD_CHAR.match(text[cut])):
-        return cut
+        return _snap_kana_cut(text, cut, lo, hi)
     lo = max(1, lo - _CUT_SLACK)
     hi = min(len(text) - 1, hi + _CUT_SLACK)
     back = cut
@@ -1408,37 +1446,258 @@ def build_target_filters(text: str) -> list[str]:
     return parts
 
 
+# 上部の大字幕（夜版）。字幕そのものを画面上部に大きく1枚ずつ出す。
+# 以前は下の帯に 52px の字幕、上部にはテーマの一言（build_target_filters）を
+# 動画全体に出し続けていたが、字幕が小さく、上部は動画を通して同じ文字だった。
+# 見た目はテーマの一言の意匠（白箱 + カラー下線 + カラー文字）を引き継ぐ。
+# 口は y≈1086 より下にあり、y=40〜290 は髪にしかかからない（実測は確認スクリプトで）。
+TOP_SUB_FONT_SIZE = 80
+TOP_SUB_LINE_H    = 100
+TOP_SUB_Y         = 40
+TOP_SUB_PAD_X     = 28
+# 夜版の字幕1枚の上限文字数。語を割らないぶん _CUT_SLACK だけはみ出すので、
+# 16 + 4 = 20文字が 2行（1行 12文字 = 24単位）に必ず収まる
+TOP_SUB_MAX_CHARS = 16
+
+
+def _text_px(line: str, font_size: int) -> int:
+    return sum(_char_width(ch) for ch in line) * font_size // 2
+
+
+def _wrap_top_subtitle(text: str, max_units: int) -> list[str]:
+    """2行になるなら読点で割る。字数で均すと「こん/な」のように語の途中で割れる。"""
+    lines = wrap_subtitle_lines(text, max_units)
+    if len(lines) < 2:
+        return lines
+    best = None
+    for i, ch in enumerate(text[:-1]):
+        if ch in "、，！？":
+            a, b = text[:i + 1], text[i + 1:]
+            w = (sum(map(_char_width, a)), sum(map(_char_width, b)))
+            if max(w) <= max_units and (best is None or abs(w[0] - w[1]) < best[0]):
+                best = (abs(w[0] - w[1]), [a, b])
+    if best:
+        return best[1]
+    # 読点が無ければ、語の切れ目のうち、両方の行が幅に収まる範囲で中央に近いところ
+    widths = [_char_width(ch) for ch in text]
+    total = sum(widths)
+    fits = [p for p in range(1, len(text))
+            if sum(widths[:p]) <= max_units and total - sum(widths[:p]) <= max_units]
+    if not fits:
+        return lines
+    mid = min(fits, key=lambda p: abs(2 * sum(widths[:p]) - total))
+    p = _snap_kana_cut(text, mid, fits[0], fits[-1])
+    return [text[:p], text[p:]]
+
+
+def build_top_subtitle_filters(subtitles: list[dict], color: str = TARGET_COLOR) -> list[str]:
+    """字幕を画面上部に大きく出す。箱の幅と高さは字幕ごとに合わせる。
+
+    行ごとに drawtext を分けるのは build_target_filters と同じ理由
+    （ffmpeg 6 の drawtext は複数行を中央揃えにできない）。
+    """
+    max_units = (W - 40 - 2 * TOP_SUB_PAD_X) * 2 // TOP_SUB_FONT_SIZE
+    parts = []
+    for sub in subtitles:
+        lines = _wrap_top_subtitle(sub["text"], max_units)
+        if not lines:
+            continue
+        en = f":enable='between(t,{sub['start']},{sub['end']})'"
+        box_h = TOP_SUB_LINE_H * len(lines) + 28
+        box_w = min(max(_text_px(l, TOP_SUB_FONT_SIZE) for l in lines) + 2 * TOP_SUB_PAD_X, W - 40)
+        box_x = (W - box_w) // 2
+        parts += [
+            f"drawbox=x={box_x}:y={TOP_SUB_Y}:w={box_w}:h={box_h}:color=white@0.92:t=fill{en}",
+            f"drawbox=x={box_x}:y={TOP_SUB_Y + box_h}:w={box_w}:h=8:color={color}@1.0:t=fill{en}",
+        ]
+        for i, line in enumerate(lines):
+            parts.append(
+                f"drawtext=fontfile={FONT_PATH}:text='{esc_drawtext(line)}'"
+                f":expansion=none"
+                f":fontcolor={color}:fontsize={TOP_SUB_FONT_SIZE}"
+                f":x=(w-text_w)/2:y={TOP_SUB_Y + 14 + TOP_SUB_LINE_H * i}{en}"
+            )
+    return parts
+
+
+# ──────────────────────────────────────────────
+# カット割り（朝夜共通）
+# ──────────────────────────────────────────────
+# 文が変わるところでカットを切り、山場の文だけ強く寄る。Unity のカメラは固定
+# （夜版は冒頭のあと1回引くだけ）なので、何もしないと30秒間ずっと同じ画角になる。
+#
+# 2026-10-08 に字幕1枚ごとに寄り・傾きを変えたら「カットが多すぎる。寄りが内容と
+# 同期していない」となった。参考にした伸びている Shorts は、普段はほぼ同じ画角で、
+# 山場（驚き・決め台詞）だけ寄ったりイラストに切り替えたりして強弱を付けていた。
+#
+# 録画のあとに ffmpeg で付ける。寄りの中心は顔にして、寄っても顔が画面上で
+# 動かないようにする（口が字幕や Shorts の UI に潜り込まない）。
+# (倍率, 傾き[度])。普段の文は寄らない画とわずかに寄った画を交互に使い、傾けない。
+# 傾けるのは山場だけ。2°傾けた画で角に黒が出ないのは、画面の中央付近を中心に
+# したとき約 1.07 倍から
+CUT_CALM     = [(1.00, 0.0), (1.08, 0.0)]
+# 1.32 倍では、ARDY のモーションで体が横に揺れたときに顔が画面の端で切れた
+CUT_EMPHASIS = [(1.25, -2.0), (1.25, 2.0)]
+CUT_PRESETS  = CUT_CALM + CUT_EMPHASIS
+CUT_MIN_SEC = 0.8     # これより短いカットは前のカットに吸収する（せわしなくしない）
+CUT_FPS = 30
+
+
+def plan_cuts(spans: list[dict], end: float, rng: random.Random = None,
+              forced: list[float] = (), wide_at: list[float] = ()) -> list[dict]:
+    """文の切り替わりをカットの境目にして、カットごとの寄りと傾きを決める。
+
+    spans は文ごとの {"start", "emphasis"}。emphasis が真の文（山場）だけ強く寄る。
+    forced はカメラが動く時刻（夜版の引きの開始と終了）。顔の位置が変わるので、
+    そこでは必ずカットを切る。wide_at に入っている時刻から始まるカットは寄らない
+    （Unity のカメラが動いている最中に寄りの中心を固定すると、顔が流れる）。
+    最初のカットも寄らない（サムネと同じ画角で始める）。
+    """
+    rng = rng or random.Random()
+    spans = sorted(spans, key=lambda sp: sp["start"])
+    times = {round(sp["start"], 3) for sp in spans if 0 < sp["start"] < end}
+    wide = {round(t, 3) for t in wide_at}
+    must = {round(t, 3) for t in (*forced, *wide_at) if 0 < t < end}
+    starts = [0.0]
+    for t in sorted(times | must):
+        if t - starts[-1] >= CUT_MIN_SEC:
+            starts.append(t)
+        elif t in must:
+            # 必ず切る時刻が直前の境目に近いときは、直前の境目のほうを寄せる
+            if starts[-1] > 0 and starts[-1] not in must:
+                starts[-1] = t
+            else:
+                starts.append(t)
+    if len(starts) > 1 and end - starts[-1] < CUT_MIN_SEC and starts[-1] not in must:
+        starts.pop()
+
+    def emphasis_at(t):
+        cur = None
+        for sp in spans:
+            if sp["start"] <= t + 1e-6:
+                cur = sp
+        return bool(cur and cur.get("emphasis"))
+
+    cuts, prev = [], None
+    for i, t in enumerate(starts):
+        if i == 0 or t in wide:
+            preset = CUT_CALM[0]
+        elif emphasis_at(t):
+            preset = rng.choice(CUT_EMPHASIS)
+        else:
+            # 普段の文は寄らない画とわずかに寄った画を交互に
+            preset = CUT_CALM[1] if prev == CUT_CALM[0] else CUT_CALM[0]
+        cuts.append({"start": t, "end": starts[i + 1] if i + 1 < len(starts) else end,
+                     "zoom": preset[0], "angle": preset[1]})
+        prev = preset
+    return cuts
+
+
+def _piecewise(cuts: list[dict], values: list[float], var: str) -> str:
+    """カットごとに一定の値を返す ffmpeg の式。後ろから if を入れ子にする。"""
+    expr = f"{values[-1]:.5f}"
+    for c, v in zip(reversed(cuts[1:]), reversed(values[:-1])):
+        expr = f"if(lt({var},{c['start']}),{v:.5f},{expr})"
+    return expr
+
+
+def build_cut_filters(cuts: list[dict], face_at) -> list[str]:
+    """カットの寄り・傾きを ffmpeg のフィルタにする。base_vf_parts() の直後、
+    字幕などの重ね物より前に置くこと（重ね物まで傾くと読みにくい）。
+
+    face_at(t) はその時刻の顔の画面座標 (x, y)。カットの頭の値で固定する。
+    回転を先にかけるのは、寄ったあとで回すと必ず角に黒が出るため。
+    回転で出た黒い角は、寄りで画面の外へ押し出す。
+    fps で固定フレームレートにしてから zoompan を通す。zoompan は自分の fps で
+    時刻を振り直すので、入力が可変フレームレートだと音とずれる。
+    """
+    if not cuts or all(c["zoom"] == 1.0 and c["angle"] == 0.0 for c in cuts):
+        return []
+    zs = [c["zoom"] for c in cuts]
+    xs, ys = [], []
+    for c in cuts:
+        fx, fy = face_at(c["start"])
+        # 顔 (fx, fy) が画面上で動かない切り出し位置: fx - fx/z
+        xs.append(fx - fx / c["zoom"])
+        ys.append(fy - fy / c["zoom"])
+    angles = [c["angle"] * 3.141592653589793 / 180 for c in cuts]
+    return [
+        f"fps={CUT_FPS}",
+        f"rotate=a='{_piecewise(cuts, angles, 't')}':ow=iw:oh=ih:c=black",
+        f"zoompan=z='{_piecewise(cuts, zs, 'it')}'"
+        f":x='{_piecewise(cuts, xs, 'it')}':y='{_piecewise(cuts, ys, 'it')}'"
+        f":d=1:s={W}x{H}:fps={CUT_FPS}",
+    ]
+
+
 def run_ffmpeg_finalize(input_webm: str, output_mp4: str, vf_parts: list[str],
                         bgm_volume: float = 0.05, timeout: int = 120,
-                        bgm_path: str = None) -> None:
+                        bgm_path: str = None, max_duration: float = None,
+                        overlays: list[dict] = None, post_vf: list[str] = None,
+                        sfx: list[dict] = None, sfx_volume: float = 0.2) -> None:
     """フィルタチェーンを適用してMP4に変換する。BGMがあれば amix でミックスする。
 
     bgm_path はその回に生成した曲（common/bgm.py）。無ければ BGM_PATH の固定曲。
+    max_duration を渡すとそこで切る。夜版は最後の発話の直後で切ってループさせる
+    （録画にはモーションの余白が数秒あり、残すとループの継ぎ目で間が空く）。
+
+    overlays は vf_parts のあとに重ねる画像 {"path", "start", "end", "x", "y"}
+    （x / y は ffmpeg の式。t で動かせる）。post_vf は重ねたあとにかけるフィルタ
+    （字幕。画像の上に出す）。sfx は効果音 {"path", "start"}。
+    効果音は声と BGM を混ぜたあとに足す。最初の amix は入力数で音量を割るので、
+    効果音まで同じ amix に入れると声が小さくなる。
+    sfx_volume は、効果音ラボの素材（ピーク -5〜-13dB）が声のピークを超えない値。
+    0.5 では効果音のピークが声より 8dB 大きく、台詞が聞き取りにくかった。
     """
-    vf = ",".join(vf_parts)
     bgm = str(bgm_path) if bgm_path else BGM_PATH
+    overlays = overlays or []
+    sfx = [e for e in (sfx or []) if Path(e["path"]).exists()]
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", input_webm,
-    ]
+    cmd = ["ffmpeg", "-y", "-i", input_webm]
+    n_in = 1
+    has_bgm = bool(bgm and Path(bgm).exists())
+    if has_bgm:
+        cmd += ["-i", bgm]
+        bgm_idx, n_in = n_in, n_in + 1
 
-    if bgm and Path(bgm).exists():
-        cmd += ["-i", bgm,
-                "-filter_complex",
-                f"[0:v]{vf}[v];[1:a]volume={bgm_volume}[bgm];[0:a][bgm]amix=inputs=2:duration=first[a]",
-                "-map", "[v]", "-map", "[a]"]
+    graph = [f"[0:v]{','.join(vf_parts)}[b0]"]
+    for k, ov in enumerate(overlays):
+        cmd += ["-loop", "1", "-framerate", str(CUT_FPS), "-i", str(ov["path"])]
+        graph.append(
+            f"[b{k}][{n_in}:v]overlay=x='{ov.get('x', 0)}':y='{ov.get('y', 0)}':eval=frame"
+            f":enable='between(t,{ov['start']:.3f},{ov['end']:.3f})'[b{k + 1}]")
+        n_in += 1
+    graph.append(f"[b{len(overlays)}]{','.join(post_vf or ['null'])}[v]")
+
+    if has_bgm:
+        graph.append(f"[{bgm_idx}:a]volume={bgm_volume}[bgm];"
+                     f"[0:a][bgm]amix=inputs=2:duration=first[a0]")
     else:
-        cmd += ["-vf", vf]
+        graph.append("[0:a]anull[a0]")
+    labels = []
+    for j, e in enumerate(sfx):
+        cmd += ["-i", str(e["path"])]
+        ms = int(round(e["start"] * 1000))
+        graph.append(f"[{n_in}:a]adelay={ms}:all=1,volume={e.get('volume', sfx_volume)}[s{j}]")
+        labels.append(f"[s{j}]")
+        n_in += 1
+    if labels:
+        graph.append(f"[a0]{''.join(labels)}amix=inputs={len(labels) + 1}"
+                     f":duration=first:normalize=0[a]")
+    else:
+        graph.append("[a0]anull[a]")
 
+    cmd += ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "[a]"]
     cmd += [
         # "-c:v", "h264_nvenc", #NOTE: UnityスクショとGPUエンコードは両立不可
         "-c:v", "libx264",
         "-preset", "fast",
         "-c:a", "aac",
         "-shortest",
-        output_mp4
     ]
+    if max_duration:
+        cmd += ["-t", f"{max_duration:.3f}"]
+    cmd.append(output_mp4)
 
     # デバッグ用にコマンドを保存できるようにする（リファクタ前後の差分検証に使う）
     dump = os.getenv("FFMPEG_CMD_DUMP", "")
@@ -1455,10 +1714,11 @@ def run_ffmpeg_finalize(input_webm: str, output_mp4: str, vf_parts: list[str],
     # Unity の WebM はコンテナの尺が短いほうのストリームより 0.40〜0.45秒長く、
     # -shortest で出力はそのぶん必ず縮む。0.5秒の許容では 2026-10-07 に 0.511秒差で
     # 正常な変換を弾いたので、1.0秒まで許す（途中で切れた変換はこれより大きく欠ける）。
-    if output_duration < max(1.0, input_duration - 1.0):
+    expected = min(input_duration, max_duration) if max_duration else input_duration
+    if output_duration < max(1.0, expected - 1.0):
         raise RuntimeError(
             f"MP4変換結果が不完全です "
-            f"(尺 {output_duration:.3f}/{input_duration:.3f}秒): {output_mp4}"
+            f"(尺 {output_duration:.3f}/{expected:.3f}秒): {output_mp4}"
         )
     print(f"[FFmpeg] 変換完了: {output_mp4} (尺 {output_duration:.3f}秒)")
 

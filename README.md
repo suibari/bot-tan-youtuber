@@ -572,6 +572,32 @@ curl -X POST 127.0.0.1:2338/camera -d '{"x":-0.25,"y":1.35,"z":0.7}'
 
 背景の合わせ直しと体の向きの取り直しも `/camera` の中でやる。
 
+### 3.6 Shorts の山場の演出（ちびキャラ・効果音）
+
+夜版は、台本で `reaction` の付いた文（山場）で画面をちびキャラのイラストに
+切り替え、効果音を鳴らす（`shorts/chibi.py`）。どちらも無ければ黙って飛ばす。
+
+- ちびキャラ: `data/chibi/<差分名>.png`。差分名は `surprising` `down` `thinking`
+  `shame` `joyful` `smug` `sitting`。背景透過なら大きさ・余白はそろっていなくてよい
+  （描かれている部分の幅でそろえて縮める）
+- 効果音: `data/se/`。[効果音ラボ](https://soundeffect-lab.info/sound/anime/) の
+  素材を**手でダウンロードして**置く。規約で再配布が禁止されているので git には
+  入れない（`.gitignore` 済み）。サイトは直リンクを弾くので、ブラウザから落とすこと
+
+| ファイル | 効果音ラボの項目 | 鳴る場面 |
+|---|---|---|
+| `surprise1.mp3` | 驚く | surprising |
+| `cute-pose1.mp3` | 可愛く輝く1 | joyful |
+| `eye-shine1.mp3` | きらーん1 | smug |
+| `heart2.mp3` | 心臓の鼓動2 | shame |
+| `cute-sad1.mp3` | しょげる | down |
+| `recollection1.mp3` | 回想 | thinking |
+| `pa1.mp3` | パッ | sitting |
+| `kira2.mp3` | キラッ2 | ちびキャラを出さない山場（決め台詞）の寄り |
+
+本番は `~/work/bot-tan-youtuber` で動くので、`data/chibi/` と `data/se/` は
+**本番のチェックアウトにも置くこと**（ワークツリーに置いただけでは本番に出ない）。
+
 ### 4. YouTube
 
 トークンは Shorts パイプラインと共用（`~/.bottan_youtube_token.pickle`）。
@@ -1048,11 +1074,10 @@ bsky-affirmative-bot 側の `seasonalWorks.ts` / `dailyPlan.ts` が持ってい�
   掘り下げ（`build_followup_prompt`）には記憶ブロックが付かないので、
   ここが最後の砦になる
 
-Shorts 側（`shorts/prompts.py`）は**そもそも選ばせない**という形にしてある。
-締めで使う botたん自身のエピソードは `pipeline.pick_closing_mood()` が
-Python 側で1件に確定し、プロンプトにはそれだけを載せる。直近2日で使った status の
-除外も Python 側で適用する（除外しきったら除外を無視して1件返す。無人実行なので
-候補ゼロで落とさない）。
+Shorts 側（`shorts/prompts.py`）は**そもそも自分の出来事を渡さない**。
+2026-10 に夜版をループする台本（③決め台詞が①掴みへつながる）へ変えたときに、
+締めの「botたんも今日〜だったけど」を外した。台本で語る botたん自身の話は、
+投稿を読んだ**気持ち**（本音）だけにしてある。
 
 ### 話題を掘り下げる
 
