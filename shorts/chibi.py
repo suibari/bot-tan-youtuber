@@ -37,7 +37,7 @@ EMPHASIS_SE = "kira2.mp3"
 
 MAX_INSERTS   = 3      # 1本あたりの差し込みの上限。多いと山場が山場でなくなる
 INSERT_MIN    = 1.0    # 1回の差し込みの長さ[秒]
-INSERT_MAX    = 2.2
+INSERT_MAX    = 3.2    # 強調語句が字幕2枚にわたるとき、言い終わりまで出す
 CHIBI_W       = 940    # 画面上のちびキャラの幅[px]（髪の広がりまで含めた外接矩形）
 CHIBI_BOTTOM  = core.H - 300   # 足元の位置。下端 300px は Shorts のタイトル等が重なる
 BURST_CENTER  = (core.W // 2, 1150)
@@ -84,11 +84,18 @@ def burst_background(name: str, out_dir: Path) -> Path:
     return out
 
 
+def subtitles_in(span: dict, subtitles: list[dict]) -> list[dict]:
+    return [s for s in subtitles
+            if s["start"] >= span["start"] - 0.05 and s["end"] <= span["end"] + 0.1]
+
+
 def plan_inserts(spans: list[dict], subtitles: list[dict]) -> list[dict]:
     """reaction の付いた文ごとに、差し込む区間を決める。
 
-    文の最後の字幕1枚（オチ・感嘆の部分）に合わせる。短すぎれば手前へ広げ、
-    長すぎれば末尾から INSERT_MAX 秒だけにする。
+    強調する語句（台本の "peak"）の字幕に合わせる。字幕はその語句で区切ってあるので
+    （core.split_with_peaks）、ちょうどその語句を言っている間だけイラストになる。
+    peak が見つからなければ文の最後の字幕1枚に合わせる。
+    短すぎれば手前へ広げ、長すぎれば頭から INSERT_MAX 秒だけにする。
     """
     have = available()
     out = []
@@ -96,14 +103,18 @@ def plan_inserts(spans: list[dict], subtitles: list[dict]) -> list[dict]:
         name = sp.get("reaction")
         if not name or name not in have:
             continue
-        inside = [s for s in subtitles
-                  if s["start"] >= sp["start"] - 0.05 and s["end"] <= sp["end"] + 0.1]
-        end = inside[-1]["end"] if inside else sp["end"]
-        start = inside[-1]["start"] if inside else sp["start"]
+        inside = subtitles_in(sp, subtitles)
+        peak = [s for s in inside if s.get("peak")]
+        if peak:
+            start, end = peak[0]["start"], peak[-1]["end"]
+        elif inside:
+            start, end = inside[-1]["start"], inside[-1]["end"]
+        else:
+            start, end = sp["start"], sp["end"]
         if end - start < INSERT_MIN:
             start = max(sp["start"], end - INSERT_MIN)
         if end - start > INSERT_MAX:
-            start = end - INSERT_MAX
+            end = start + INSERT_MAX
         out.append({"start": round(start, 3), "end": round(end, 3), "reaction": name})
         if len(out) >= MAX_INSERTS:
             break

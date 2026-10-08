@@ -110,6 +110,8 @@ SCRIPT_SCHEMA = {
                                 "reaction": {"type": "string", "enum": [
                                     "surprising", "down", "thinking", "shame",
                                     "joyful", "smug", "sitting"]},
+                                # 山場の文のうち、いちばん強調する語句（text からそのまま抜き出す）
+                                "peak": {"type": "string"},
                             },
                             "required": ["text", "valence", "arousal"],
                         },
@@ -326,24 +328,23 @@ CALM_SPLIT_SEC = 5.0
 def cut_spans(spans: list[dict], subtitles: list[dict]) -> list[dict]:
     """文の区間から、カットの区間を作る。
 
-    山場の文は丸ごと寄るのではなく、普段の画で入って、オチの手前で強く寄る。
-    ちびキャラを出す文は最後の字幕1枚がイラストになるので、その1枚前の字幕で寄る
-    （寄り → イラスト の順に盛り上げる）。出さない文（決め台詞など）は最後の字幕で寄る。
+    山場の文は丸ごと寄るのではなく、普段の画で入って、強調語句の手前で強く寄る。
+    ちびキャラを出す文は強調語句の字幕がイラストになるので、その1枚前の字幕で寄る
+    （寄り → イラスト の順に盛り上げる）。出さない文（決め台詞など）は強調語句の
+    字幕（無ければ最後の字幕）で寄る。
     寄らない長い文は、真ん中に近い字幕の切れ目で1回だけ画角を変える。
     """
     out = []
     for sp in spans:
         out.append({"start": sp["start"], "emphasis": False})
-        inside = [s for s in subtitles
-                  if s["start"] >= sp["start"] - 0.05 and s["end"] <= sp["end"] + 0.1]
+        inside = chibi.subtitles_in(sp, subtitles)
         if sp.get("emphasis"):
-            k = -2 if sp.get("reaction") else -1
-            if len(inside) >= -k:
-                peak = inside[k]["start"]
-                if peak - sp["start"] < 0.3:
-                    out[-1]["emphasis"] = True
-                else:
-                    out.append({"start": peak, "emphasis": True})
+            # 強調語句（peak）の字幕を基準にする。無ければ最後の字幕
+            k = next((i for i, s in enumerate(inside) if s.get("peak")), len(inside) - 1)
+            if sp.get("reaction"):
+                k -= 1          # イラストになる1枚の手前で寄る
+            if k >= 0 and inside and inside[k]["start"] - sp["start"] >= 0.3:
+                out.append({"start": inside[k]["start"], "emphasis": True})
             else:
                 out[-1]["emphasis"] = True
         elif sp["end"] - sp["start"] > CALM_SPLIT_SEC and len(inside) >= 2:
@@ -516,9 +517,12 @@ def main():
 
         # Step 3.5: 字幕・コーナータイミング生成
         # 字幕は上部に大きく出すので、1枚を短めに切る（core.TOP_SUB_MAX_CHARS）
+        # 山場の強調語句（台本の "peak"）で字幕を区切り、ちびキャラをその1枚に合わせる
+        peaks = [s["peak"] for s in main_sentences if (s.get("peak") or "") in s["text"]
+                 and s.get("peak")]
         subtitles = generate_subtitle_timing(clean_script, time_offset=intro_duration,
                                              actual_duration=actual_main_duration,
-                                             max_chars=TOP_SUB_MAX_CHARS)
+                                             max_chars=TOP_SUB_MAX_CHARS, peaks=peaks)
         if intro_duration > 0:
             # 冒頭一言も本編チャンクと同じ扱いにする（+0.05 の余韻を付け、
             # 本編1枚目との間隔を dedupe に通す）。以前は dedupe のあとに

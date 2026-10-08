@@ -448,9 +448,31 @@ def _chunk_mora_bounds(chunks: list[str], n_sent_moras: int) -> list[tuple]:
     return bounds
 
 
+def split_with_peaks(sentence: str, max_chars: int, peaks: list[str] = ()) -> list[tuple]:
+    """文を字幕チャンクに割る。peaks（強調する語句）は独立した1枚（以上）にして印を付ける。
+
+    返り値は (チャンク, 強調か) の列。強調する語句がこの文に無ければ
+    split_subtitle_chunks と同じ。字幕の切れ目を強調語句に合わせておけば、
+    ちびキャラの差し込みとカットをその1枚にぴったり合わせられる。
+    """
+    for p in peaks or ():
+        p = p.strip()
+        i = sentence.find(p) if p else -1
+        if i < 0:
+            continue
+        before, after = sentence[:i], sentence[i + len(p):]
+        # 直後の句読点は強調側に含める（後ろに「、」1文字の字幕を作らない）
+        while after and after[0] in "、。！？」』）":
+            p, after = p + after[0], after[1:]
+        return ([(c, False) for c in split_subtitle_chunks(before, max_chars)]
+                + [(c, True) for c in split_subtitle_chunks(p, max_chars)]
+                + split_with_peaks(after, max_chars, [q for q in peaks if q != p]))
+    return [(c, False) for c in split_subtitle_chunks(sentence, max_chars)]
+
+
 def generate_subtitle_timing(script: str, time_offset: float = 0.0,
                              actual_duration: float = None,
-                             max_chars: int = 20) -> list[dict]:
+                             max_chars: int = 20, peaks: list[str] = ()) -> list[dict]:
     """文ごとにaudio_queryを発行してタイミングを取得し、字幕データを生成する。
 
     文単位で独立したモーラ計測を行うことで、漢字とかなの混在による
@@ -459,6 +481,7 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0,
     スケーリング基準にする。各文個別合成+concatの場合はこれを使うと正確になる。
     max_chars: 1字幕ブロックの最大文字数。朝版・夜版とも 20。
                夜版は build_subtitle_filters が2行に折り返して描く。
+    peaks: 強調する語句。その語句で字幕を区切り、"peak": True を付ける（split_with_peaks）。
     """
     print("[字幕] タイミング情報取得中...")
 
@@ -492,30 +515,32 @@ def generate_subtitle_timing(script: str, time_offset: float = 0.0,
         n_sent_moras = len(sent_moras)
         mora_scale = scaled_dur / sent_dur if sent_dur > 0 else 1.0
 
-        final_chunks = split_subtitle_chunks(sentence, max_chars)
+        pieces = split_with_peaks(sentence, max_chars, peaks)
+        final_chunks = [c for c, _ in pieces]
+        flags = [f for _, f in pieces]
         if not final_chunks:
             current_time += scaled_dur
             continue
 
         if n_sent_moras > 0:
             bounds = _chunk_mora_bounds(final_chunks, n_sent_moras)
-            for chunk, (s_idx, e_idx) in zip(final_chunks, bounds):
+            for chunk, flag, (s_idx, e_idx) in zip(final_chunks, flags, bounds):
                 start_t = current_time + sent_moras[s_idx]["start"] * mora_scale
                 end_t   = current_time + (sent_moras[e_idx]["start"]
                                           + sent_moras[e_idx]["duration"]) * mora_scale + 0.05
                 subtitles.append({"start": round(start_t + time_offset, 3),
                                   "end":   round(end_t + time_offset, 3),
-                                  "text":  chunk})
+                                  "text":  chunk, **({"peak": True} if flag else {})})
         else:
             sentence_chars = sum(len(c) for c in final_chunks)
             char_offset = 0
-            for chunk in final_chunks:
+            for chunk, flag in zip(final_chunks, flags):
                 ratio_s = char_offset / max(sentence_chars, 1)
                 ratio_e = (char_offset + len(chunk)) / max(sentence_chars, 1)
                 subtitles.append({
                     "start": round(current_time + ratio_s * scaled_dur + time_offset, 3),
                     "end":   round(current_time + ratio_e * scaled_dur + 0.05 + time_offset, 3),
-                    "text":  chunk})
+                    "text":  chunk, **({"peak": True} if flag else {})})
                 char_offset += len(chunk)
 
         current_time += scaled_dur
@@ -557,6 +582,9 @@ def _merge_short_subtitles(subtitles: list[dict], max_chars: int) -> None:
             i += 1
             continue
         side = min(cand, key=lambda c: c[1])[0]
+        if cur.get("peak"):
+            # 強調の印は結合先に引き継ぐ（印の付いた1枚が消えると、ちびキャラの置き場所が無くなる）
+            (prev if side == "prev" else nxt)["peak"] = True
         if side == "prev":
             prev["text"] += cur["text"]
             prev["end"] = cur["end"]
@@ -1449,14 +1477,26 @@ def build_target_filters(text: str) -> list[str]:
 # 上部の大字幕（夜版）。字幕そのものを画面上部に大きく1枚ずつ出す。
 # 以前は下の帯に 52px の字幕、上部にはテーマの一言（build_target_filters）を
 # 動画全体に出し続けていたが、字幕が小さく、上部は動画を通して同じ文字だった。
-# 見た目はテーマの一言の意匠（白箱 + カラー下線 + カラー文字）を引き継ぐ。
-# 口は y≈1086 より下にあり、y=40〜290 は髪にしかかからない（実測は確認スクリプトで）。
-TOP_SUB_FONT_SIZE = 80
-TOP_SUB_LINE_H    = 100
-TOP_SUB_Y         = 40
-TOP_SUB_PAD_X     = 28
+#
+# 見た目は伸びている Shorts の字幕に寄せる: 箱を敷かず、丸ゴシックの極太に
+# 色文字 + 白フチ + 濃いフチの二重の縁取りと影を付け、出るときに少し跳ねる。
+# 強調する語句（"peak"）の1枚はひと回り大きく、黄色の文字に紺フチ・白フチで出す
+# （ちびキャラの背景は赤・ピンク・橙なので、その色の文字だと沈んだ）。
+# 口は y≈1086 より下にあり、上部の字幕は髪にしかかからない。
+RICH_FONT = str(_REPO_ROOT / "data" / "fonts" / "ZenMaruGothic-Black.ttf")  # OFL
+TOP_SUB_FONT_SIZE  = 92
+TOP_SUB_PEAK_SIZE  = 112
+TOP_SUB_Y          = 90
+TOP_SUB_PAD_X      = 40     # 画面の左右に残す余白（縁取りの外側まで含める）
+TOP_SUB_COLOR      = "0x2F8FE8"   # botたんの髪の青
+TOP_SUB_PEAK_COLOR = "0xFFE14A"   # 強調の1枚。縁取りの内外を入れ替えて、どの背景でも浮かせる
+TOP_SUB_INNER_BORDER = 10   # 白フチの太さ
+TOP_SUB_OUTER_BORDER = 20   # 濃いフチ（白フチの外側）までの太さ
+TOP_SUB_OUTLINE    = "0x1E2B4F"
+TOP_SUB_POP_PX     = 22     # 出るときに上から落ちてくる量
+TOP_SUB_POP_SEC    = 0.12
 # 夜版の字幕1枚の上限文字数。語を割らないぶん _CUT_SLACK だけはみ出すので、
-# 16 + 4 = 20文字が 2行（1行 12文字 = 24単位）に必ず収まる
+# 16 + 4 = 20文字が 2行に必ず収まる
 TOP_SUB_MAX_CHARS = 16
 
 
@@ -1490,33 +1530,60 @@ def _wrap_top_subtitle(text: str, max_units: int) -> list[str]:
     return [text[:p], text[p:]]
 
 
-def build_top_subtitle_filters(subtitles: list[dict], color: str = TARGET_COLOR) -> list[str]:
-    """字幕を画面上部に大きく出す。箱の幅と高さは字幕ごとに合わせる。
+def _top_subtitle_layout(text: str, size: int) -> tuple[list[str], int]:
+    """行に割り、2行の幅に収まるまで文字を小さくする。返り値は (行, 文字サイズ)。"""
+    avail = W - 2 * TOP_SUB_PAD_X - 2 * TOP_SUB_OUTER_BORDER
+    # 2割まで小さくすれば1行に入るなら1行にする（「最後までやり／遂げた」を防ぐ）
+    for sz in range(size, int(size * 0.8) - 1, -4):
+        if _text_px(text, sz) <= avail:
+            return [text], sz
+    while True:
+        max_units = avail * 2 // size
+        # wrap_subtitle_lines は3行目以降を黙って捨てるので、収まるかは wrap_cjk で見る
+        if len(wrap_cjk(text, max_units)) <= 2:
+            lines = _wrap_top_subtitle(text, max_units)
+            if all(_text_px(l, size) <= avail for l in lines):
+                return lines, size
+        if size <= 60:
+            return _wrap_top_subtitle(text, max_units), size
+        size -= 4
 
+
+def build_top_subtitle_filters(subtitles: list[dict], color: str = TOP_SUB_COLOR,
+                               peak_color: str = TOP_SUB_PEAK_COLOR) -> list[str]:
+    """字幕を画面上部に大きく出す。1行を 影 → 濃いフチ → 白フチ付きの色文字 の3枚で描く。
+
+    強調の1枚（"peak"）は、文字色と縁取りの内外を入れ替える（黄色の文字 + 紺フチ + 白フチ）。
     行ごとに drawtext を分けるのは build_target_filters と同じ理由
     （ffmpeg 6 の drawtext は複数行を中央揃えにできない）。
     """
-    max_units = (W - 40 - 2 * TOP_SUB_PAD_X) * 2 // TOP_SUB_FONT_SIZE
+    font = RICH_FONT if Path(RICH_FONT).exists() else FONT_PATH
     parts = []
     for sub in subtitles:
-        lines = _wrap_top_subtitle(sub["text"], max_units)
+        peak = bool(sub.get("peak"))
+        lines, size = _top_subtitle_layout(sub["text"], TOP_SUB_PEAK_SIZE if peak else TOP_SUB_FONT_SIZE)
         if not lines:
             continue
-        en = f":enable='between(t,{sub['start']},{sub['end']})'"
-        box_h = TOP_SUB_LINE_H * len(lines) + 28
-        box_w = min(max(_text_px(l, TOP_SUB_FONT_SIZE) for l in lines) + 2 * TOP_SUB_PAD_X, W - 40)
-        box_x = (W - box_w) // 2
-        parts += [
-            f"drawbox=x={box_x}:y={TOP_SUB_Y}:w={box_w}:h={box_h}:color=white@0.92:t=fill{en}",
-            f"drawbox=x={box_x}:y={TOP_SUB_Y + box_h}:w={box_w}:h=8:color={color}@1.0:t=fill{en}",
-        ]
+        fill = peak_color if peak else color
+        inner, outer = ((TOP_SUB_OUTLINE, "white") if peak else ("white", TOP_SUB_OUTLINE))
+        s, e = sub["start"], sub["end"]
+        en = f":enable='between(t,{s},{e})'"
+        line_h = int(size * 1.18)
+        drop = f"{TOP_SUB_POP_PX}*pow(max(0,1-(t-{s})/{TOP_SUB_POP_SEC}),2)"
         for i, line in enumerate(lines):
-            parts.append(
-                f"drawtext=fontfile={FONT_PATH}:text='{esc_drawtext(line)}'"
-                f":expansion=none"
-                f":fontcolor={color}:fontsize={TOP_SUB_FONT_SIZE}"
-                f":x=(w-text_w)/2:y={TOP_SUB_Y + 14 + TOP_SUB_LINE_H * i}{en}"
-            )
+            y = TOP_SUB_Y + line_h * i
+            txt = f"fontfile={font}:text='{esc_drawtext(line)}':expansion=none:fontsize={size}"
+            parts += [
+                f"drawtext={txt}:fontcolor={TOP_SUB_OUTLINE}@0.45"
+                f":borderw={TOP_SUB_OUTER_BORDER}:bordercolor={TOP_SUB_OUTLINE}@0.45"
+                f":x=(w-text_w)/2+8:y='{y}+10-{drop}'{en}",
+                f"drawtext={txt}:fontcolor={outer}"
+                f":borderw={TOP_SUB_OUTER_BORDER}:bordercolor={outer}"
+                f":x=(w-text_w)/2:y='{y}-{drop}'{en}",
+                f"drawtext={txt}:fontcolor={fill}"
+                f":borderw={TOP_SUB_INNER_BORDER}:bordercolor={inner}"
+                f":x=(w-text_w)/2:y='{y}-{drop}'{en}",
+            ]
     return parts
 
 

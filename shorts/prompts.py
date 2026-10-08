@@ -57,7 +57,8 @@ _NIGHT_OUTPUT_RULES = """
         {"text": "文章1", "valence": 0.8, "arousal": 0.4,
          "motion": "A person ... in a feminine way."},
         {"text": "文章2", "valence": 0.6, "arousal": 0.8,
-         "motion": "A person ... in a feminine way.", "reaction": "surprising"},
+         "motion": "A person ... in a feminine way.", "reaction": "surprising",
+         "peak": "文章2のうち強調する語句"},
         ...
       ]
     },
@@ -89,6 +90,14 @@ _NIGHT_OUTPUT_RULES = """
 - "joyful"     … 喜ぶ・はしゃぐ（明るく盛り上がる文）
 - "smug"       … ドヤ顔で指差す（決め台詞）
 - "sitting"    … にっこり（上のどれでもない山場）
+
+"reaction" を付けた文には、必ず "peak" も付ける。その文のなかで**いちばん強調したい語句**を
+text から**一字一句そのまま**抜き出したもの（6〜16文字）。字幕がその語句で区切られ、
+ちょうどその語句を言っている間にイラストが出る。
+文末の「って言われてて」「なんだ」のような言い回しではなく、意味の中心を選ぶこと。
+  例: text「実はね、声を出して笑うだけで、ストレスが和らぐって言われてるんだ。」
+      → peak「声を出して笑うだけで、ストレスが和らぐ」
+  例: text「だからbotたん、何度でも言うね。」→ peak「何度でも言うね」
 
 【motion（体の動き）】
 "Thumbnail" を含む各sectionの**すべてのsentenceに "motion" を付ける**こと。

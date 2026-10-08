@@ -116,10 +116,37 @@ class TopSubtitleTest(unittest.TestCase):
         self.assertEqual(core._wrap_top_subtitle("自分をたくさん褒めてあげてね。", 24),
                          ["自分をたくさん", "褒めてあげてね。"])
 
-    def test_a_chunk_always_fits_in_two_lines(self):
-        max_units = (core.W - 40 - 2 * core.TOP_SUB_PAD_X) * 2 // core.TOP_SUB_FONT_SIZE
+    def test_a_chunk_always_fits_in_two_lines_at_full_size(self):
         text = "あ" * (core.TOP_SUB_MAX_CHARS + core._CUT_SLACK)
-        self.assertLessEqual(len(core.wrap_cjk(text, max_units)), 2)
+        lines, size = core._top_subtitle_layout(text, core.TOP_SUB_FONT_SIZE)
+        self.assertLessEqual(len(lines), 2)
+        self.assertEqual(size, core.TOP_SUB_FONT_SIZE)
+
+    def test_a_long_peak_shrinks_instead_of_overflowing(self):
+        text = "あ" * (core.TOP_SUB_MAX_CHARS + core._CUT_SLACK)
+        lines, size = core._top_subtitle_layout(text, core.TOP_SUB_PEAK_SIZE)
+        self.assertEqual(len(lines), 2)
+        self.assertLess(size, core.TOP_SUB_PEAK_SIZE)
+
+
+class SplitWithPeaksTest(unittest.TestCase):
+    def test_the_peak_gets_its_own_subtitle(self):
+        # 2026-10-08: ちびキャラは「感じやすくなるって」ではなく
+        # 「普段より疲れを感じやすくなる」に合わせたい
+        pieces = core.split_with_peaks(
+            "実は、緊張すると脳が過敏になって、普段より疲れを感じやすくなるって言われてて。",
+            16, ["普段より疲れを感じやすくなる"])
+        self.assertIn(("普段より疲れを感じやすくなる", True), pieces)
+        self.assertEqual("".join(c for c, _ in pieces),
+                         "実は、緊張すると脳が過敏になって、普段より疲れを感じやすくなるって言われてて。")
+
+    def test_trailing_punctuation_stays_with_the_peak(self):
+        self.assertEqual(core.split_with_peaks("だからbotたん、何度でも言うね。", 16, ["何度でも言うね"]),
+                         [("だからbotたん、", False), ("何度でも言うね。", True)])
+
+    def test_a_peak_not_in_the_text_is_ignored(self):
+        pieces = core.split_with_peaks("今日もえらいよ。", 16, ["存在しない"])
+        self.assertEqual(pieces, [("今日もえらいよ。", False)])
 
 
 if __name__ == "__main__":
