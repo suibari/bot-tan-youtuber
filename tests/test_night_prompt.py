@@ -67,15 +67,16 @@ class LoopStructureTest(unittest.TestCase):
         self.assertNotIn("botたんの今日の出来事", prompt)
         self.assertNotIn("first_greeting_status", prompts.SYSTEM_PROMPT)
 
-    def test_comment_days_keep_the_same_closing(self):
-        prompt = build(comments=[{"author": "a", "text": "かわいい"}])
-        self.assertIn('section名を"CommentCorner"', prompt)
-        self.assertNotIn('section名を"NagiCorner"', prompt)
-        self.assertIn("③ 決め台詞", prompt)
+    def test_no_comment_corner_anymore(self):
+        # 夜版は Bluesky に出すので、YouTube の前日動画のコメントは読まない
+        prompt = build()
+        self.assertNotIn("CommentCorner", prompt)
+        self.assertNotIn("CommentCorner", prompts.SYSTEM_PROMPT)
+        self.assertIn('section名を"NagiCorner"', prompt)
 
 
 class NagiMentionTest(unittest.TestCase):
-    """この動画は Nagi の紹介も兼ねているので、②に「Nagiで」が無ければ書き直させる。"""
+    """②に、どこで見た投稿か（「Blueskyで」「Nagiで」）が無ければ書き直させる。"""
 
     @classmethod
     def setUpClass(cls):
@@ -90,12 +91,41 @@ class NagiMentionTest(unittest.TestCase):
     def test_a_script_that_names_nagi_passes(self):
         self.assertTrue(self.check(self.script("実はね、Nagiで免許更新の投稿を見たんだ。")))
 
+    def test_a_script_that_names_bluesky_passes(self):
+        self.assertTrue(self.check(self.script("実はね、Blueskyで猫の投稿を見たんだ。")))
+
     def test_a_script_without_nagi_is_rejected(self):
         # 2026-10-08 の試し撮りで実際に出た文
         self.assertFalse(self.check(self.script("実はね、視力検査で動揺しつつも合格できたっていう投稿を見たんだ。")))
 
     def test_the_prompt_requires_it(self):
-        self.assertIn("「Nagiで」の一言は必ず入れる", build())
+        self.assertIn("「Blueskyで」か「Nagiで」の一言は必ず入れる", build())
+
+
+class PostListTest(unittest.TestCase):
+    def test_each_post_shows_network_and_name(self):
+        data = {"interactions": [
+            {"network": "bsky", "display_name": "ねこ", "post_text": "猫がかわいい", "score": 88},
+            {"network": "nagi", "display_name": "すいばり", "post_text": "働きすぎた", "score": 90},
+        ]}
+        prompt = prompts.build_user_prompt(data)
+        self.assertIn("1. [Bluesky] 名前:ねこ", prompt)
+        self.assertIn("2. [Nagi] 名前:すいばり", prompt)
+        self.assertIn("post_caption", prompts.SYSTEM_PROMPT)
+        self.assertIn("picked_post", prompts.SYSTEM_PROMPT)
+
+    def test_picked_post_numbers_match_the_prompt(self):
+        import pipeline
+        # 本文が空の行は一覧に載らないので、番号もそれを飛ばして数える
+        data = {"interactions": [
+            {"network": "nagi", "uri": "at://did:plc:a/com.suibari.nagi.post/1", "post_text": " "},
+            {"network": "bsky", "uri": "at://did:plc:b/app.bsky.feed.post/2", "post_text": "猫",
+             "display_name": "ねこ"},
+        ]}
+        picked = pipeline.pick_source_post(data, 1)
+        self.assertEqual(picked["url"], "https://bsky.app/profile/did:plc:b/post/2")
+        self.assertIsNone(pipeline.pick_source_post(data, 2))
+        self.assertIsNone(pipeline.pick_source_post(data, None))
 
 
 class ConstraintSectionTest(unittest.TestCase):

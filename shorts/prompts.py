@@ -96,17 +96,16 @@ _NIGHT_OUTPUT_RULES = """
     ...
   ],
   "meta": {
-    "nagi_themes": ["テーマ1", "テーマ2"]
+    "nagi_themes": ["テーマ1", "テーマ2"],
+    "picked_post": 3,
+    "post_caption": "動画ポストの添え文"
   }
 }
 
 【sectionの種類】
 - "Thumbnail"      → ①掴み（sentences は1要素のみ）
-- "NagiCorner"     → ②今日のNagi（状況 → 意外な事実 → 本音）
-- "CommentCorner"  → ②コメントコーナー（コメントデータが提供された場合のみ使用）
+- "NagiCorner"     → ②今日のSNS（Bluesky と Nagi の投稿から1件。状況 → 意外な事実 → 本音）
 - "Closing"        → ③決め台詞（1文。言い終わると①へ戻ってループする）
-"NagiCorner" と "CommentCorner" は排他。コメントデータが提供された日は
-"CommentCorner" だけを使い、"NagiCorner" は出力しないこと。
 
 "Thumbnail" の reaction は必ず "none"（サムネイルを撮るため）。
 
@@ -143,7 +142,7 @@ _NIGHT_OUTPUT_RULES = """
 連続するsentenceで同方向に変化し続けないこと（単調増加・単調減少を避ける）。
 
 【出どころの区別（最重要）】
-- 【今日Nagiで心に残った投稿一覧】は**他の人が書いた投稿**です。
+- 【今日BlueskyとNagiで心に残った投稿一覧】は**他の人が書いた投稿**です。
   botたん自身の体験として語ってはいけません。②で紹介するときも
   「見かけた投稿」として扱い、自分がやったことにしないこと。
 - 「本音」で語るのは、その投稿を読んだ botたんの**気持ち**です。
@@ -159,12 +158,29 @@ sentence の中も同じで、arousal → motion → peak → reaction → text 
 peak を書くこと。peak は、そのあと書く text に一字一句そのまま含まれていなければならない。
 
 【metaの各フィールド】
-- nagi_themes: Nagiコーナーで扱ったテーマのキーワード配列（コメントコーナーの日は []）。2〜5単語程度のキーワードを2〜3個"""
+- nagi_themes: ②で扱ったテーマのキーワード配列。2〜5単語程度のキーワードを2〜3個
+- picked_post: ②で紹介した投稿の番号（投稿一覧の行頭の数字）。整数で書く
+- post_caption: この動画を Bluesky に投稿するときの添え文（日本語・100文字以内）。
+  動画を見ていない人にも伝わる、単独で読める文にすること。
+  **紹介した投稿の書き手の名前（投稿一覧の「名前」をそのまま）と、投稿の要点を必ず入れる**
+  （例：「〇〇さんの『△△』という投稿を紹介したよ。□□なあなたにも届きますように」）。
+  URL・ハッシュタグ・@ は書かない（リンクはシステムが付ける）"""
 
 SYSTEM_PROMPT = CHARACTER_PROMPT + _NIGHT_OUTPUT_RULES
 
+NETWORK_LABELS = {"bsky": "Bluesky", "nagi": "Nagi"}
 
-def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dict] = None,
+
+def usable_interactions(data: dict, max_interactions: int = 30) -> list[dict]:
+    """プロンプトの投稿一覧に並べる投稿。picked_post の番号はこの並びの1始まり。
+
+    画像のみの投稿など本文が空のものは紹介できないので除外する。
+    pipeline 側が picked_post から紹介元を引くときも、必ずこれを通すこと（番号がずれる）。
+    """
+    return [r for r in data["interactions"] if (r.get("post_text") or "").strip()][:max_interactions]
+
+
+def build_user_prompt(data: dict, max_interactions: int = 30,
                       corner_context: dict = None) -> str:
     """夜版の台本プロンプト。①掴み → ②状況・意外な事実・本音 → ③決め台詞 の構成で、
     ③を言い終えると①へ自然につながる（Shorts はループ再生されるので、
@@ -173,56 +189,34 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
     以前の③締めは「botたんも今日〜だったけど…高評価も嬉しいな。また明日ね」で、
     botたん自身の出来事（biorhythm_history）を1件渡していた。ループしない締めと、
     他人の投稿を自分の体験として語る事故（2026-08-25）の両方の原因だったので外した。
+
+    2026-10 から夜版は Bluesky に投稿する。紹介する投稿も Bluesky と Nagi の両方から取り、
+    YouTube の前日動画のコメントを読むコメントコーナーはやめた。
     """
-    # 画像のみの投稿など本文が空のものは紹介できないので除外する
-    interactions = [r for r in data["interactions"] if (r.get("post_text") or "").strip()][:max_interactions]
+    interactions = usable_interactions(data, max_interactions)
 
     post_lines = ""
     for i, r in enumerate(interactions, 1):
         text = (r.get("post_text") or "")[:150]
         score = r.get("score", "?")
-        post_lines += str(i) + ". (score:" + str(score) + ") " + text + "\n"
+        network = NETWORK_LABELS.get(r.get("network"), "Nagi")
+        name = r.get("display_name") or ""
+        post_lines += (str(i) + ". [" + network + "] 名前:" + name
+                       + " (score:" + str(score) + ") " + text + "\n")
 
-    has_comments = bool(comments)
-
-    # コメントデータセクション（CommentCornerあり時のみ）
-    comment_data_section = ""
-    if has_comments:
-        comment_lines = "\n".join(
-            f"{i}. {c['author']}: {c['text']}" for i, c in enumerate(comments, 1)
-        )
-        comment_data_section = f"""
-【前日の動画へのコメント一覧】
-以下のコメントを②コメントコーナーで紹介してください（基本そのまま、60文字超の場合のみ要約）。
-{comment_lines}
-"""
-
-    # 常に3部構成。②が NagiCorner か CommentCorner かだけが変わる（排他）。
+    # 常に3部構成。
     # 尺は「秒 × 6.5 = 文字数」で必ず一致させること。
     # 6.5文字/秒 は VOICEVOX(春日部つむぎ/既定speedScale)で実測した値。
     # 以前は秒と文字数が食い違っていて（例: 90文字なのに「約40秒」）、
     # LLM が秒の側に寄せて指示の倍の尺を出していた
-    comment_corner_section = ""
-    if has_comments:
-        comment_corner_section = """
-② コメントコーナー（約22秒・145文字以内）— section名を"CommentCorner"にすること
-  - 「昨日の動画へのコメントを紹介するね」と切り出す
-  - 【前日の動画へのコメント一覧】のコメントを順番に紹介する
-    - 40文字以内のコメントはそのまま読む
-    - 40文字を超える場合は内容を損なわず20文字程度に要約する
-  - 1件につき「読む → 一言感想」で完結させる。掘り下げは不要
-  - 最後にコメントしてくれた視聴者への感謝を一言添える
-  - ①掴みのテーマと必ずつながること
-
-"""
-
-    nagi_data_section = f"""【今日Nagiで心に残った投稿一覧（すべて**他の人が書いた投稿**です。botたん自身の体験ではありません。②以外で使わないこと）】
+    nagi_data_section = f"""【今日BlueskyとNagiで心に残った投稿一覧（すべて**他の人が書いた投稿**です。botたん自身の体験ではありません。②以外で使わないこと）】
+行頭の [ ] はどちらのSNSの投稿か。「名前」は書き手の表示名で、meta.post_caption にだけ使う
+（読み上げにくい名前が多いので、台本の text では名前を言わないこと）。
 {post_lines}"""
 
-    # コメントコーナーの日は NagiCorner を出さない（排他）
-    nagi_corner_section = "" if has_comments else """
-② 今日のNagi（約22秒・145文字以内）— section名を"NagiCorner"にすること
-  - 【今日Nagiで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
+    nagi_corner_section = """
+② 今日のSNS（約22秒・145文字以内）— section名を"NagiCorner"にすること
+  - 【今日BlueskyとNagiで心に残った投稿一覧】からbotたんが最も心を打たれた・視聴者の励ましになると感じた投稿を1件だけ選ぶ
     * 選ぶ際は以下を優先すること：
       - 具体的な体験や感情が書かれている投稿（「なぜか泣いた」「急に怖くなった」など）
       - 弱さや迷いが正直に書かれている投稿
@@ -237,8 +231,8 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
   - 以下の3ステップで構成すること（145文字しかないので、これ以上増やさない）。
     **各ステップは1〜2文・50文字以内**にすること：
     1. 状況: 投稿の内容を紹介する
-       「実はね、Nagiで〇〇って投稿を見たんだ」のような形で切り出す
-       **「Nagiで」の一言は必ず入れる**（この動画は Nagi の紹介も兼ねている。
+       「実はね、Blueskyで〇〇って投稿を見たんだ」のような形で切り出す
+       **「Blueskyで」か「Nagiで」の一言は必ず入れる**（投稿一覧の [ ] に合わせる。
        「〇〇っていう投稿を見たんだ」だけだと、どこで見たのかが伝わらない）
        **投稿の文面をそのまま引用しないこと**。要点だけを25文字程度に言い換える
        英語の投稿はbotたんの言葉で日本語に意訳する
@@ -251,11 +245,7 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
 
 """
 
-    section_tags_note = (
-        "Thumbnail, CommentCorner, Closing"
-        if has_comments else
-        "Thumbnail, NagiCorner, Closing"
-    )
+    section_tags_note = "Thumbnail, NagiCorner, Closing"
 
     constraint_lines = []
     if corner_context:
@@ -267,12 +257,12 @@ def build_user_prompt(data: dict, max_interactions: int = 30, comments: list[dic
             constraint_lines.append(f"NagiCorner除外：直近3日間に取り上げたテーマ（選ばないこと）：{'、'.join(excl_nagi)}")
     constraint_section = ("\n【選択制約】\n" + "\n".join(constraint_lines)) if constraint_lines else ""
 
-    return f"""以下のデータをもとに、YouTube Shorts用の台本を書いてください。
+    return f"""以下のデータをもとに、縦型のショート動画（Bluesky に投稿する）の台本を書いてください。
 
-{nagi_data_section}{comment_data_section}
+{nagi_data_section}
 【番組構成】
 以下の3部構成で台本を書いてください。
-Shorts はループ再生される。**③決め台詞を言い終えた直後に①掴みがもう一度流れる**ので、
+ショート動画はループ再生される。**③決め台詞を言い終えた直後に①掴みがもう一度流れる**ので、
 ③→①が1つの流れとして自然につながるように書くこと。
 
 ① 掴み（約3秒・20文字以内）— section名を"Thumbnail"にすること
@@ -281,7 +271,7 @@ Shorts はループ再生される。**③決め台詞を言い終えた直後�
   - 視聴者の心に刺さる、その日のテーマを象徴する全肯定の一言
   - 例：「朝が苦手でも最高だよ！」「おしゃべりは魔法だよ！」
 
-{comment_corner_section}{nagi_corner_section}③ 決め台詞（約4秒・30文字以内・1文）— section名を"Closing"にすること
+{nagi_corner_section}③ 決め台詞（約4秒・30文字以内・1文）— section名を"Closing"にすること
   - ②の本音を受けて、①掴みへ渡す1文。**言い終わったところに①がそのまま続く**ように書く
     （①の言葉そのものは繰り返さない。直後に①が流れるので二重になる）
   - 形: ②の本音で語りかけた「あなた」に向けて、①をこれから言うと予告する1文。

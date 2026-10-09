@@ -1422,7 +1422,6 @@ SUBTITLE_BAND_H    = 160      # 1行のときの帯の高さ
 SUBTITLE_TEXT_Y    = H - 370  # 1行目のベースライン位置
 SUBTITLE_COLOR     = "0x00A88A"
 
-
 def build_subtitle_filters(subtitles: list[dict]) -> list[str]:
     """下部のミント帯 + 白文字の字幕フィルタを生成する（夜版レイアウト）。
 
@@ -1555,6 +1554,72 @@ TOP_SUB_POP_SEC    = 0.12
 # 夜版の字幕1枚の上限文字数。語を割らないぶん _CUT_SLACK だけはみ出すので、
 # 16 + 4 = 20文字が 2行に必ず収まる
 TOP_SUB_MAX_CHARS = 16
+
+
+# 英訳の字幕（夜版）。画面下部に縁取り文字で焼き込む（rich_text.english_overlays）。
+# 夜版は Bluesky に出すので YouTube の CC 字幕が使えず、動画の中に英語を持たせる。
+# YouTube のときに焼き込まなかったのは、下段が Shorts の UI（タイトル・チャンネル名）と
+# 重なるからで、Bluesky の動画にはその重なりが無い。日本語の字幕は上部にあり、
+# 顔は画面の中ほど（NIGHT_FACE_*、y≒1000）なので、下部なら何にも被らない。
+EN_SUB_FONT_SIZE = 50
+EN_SUB_LINE_H    = 64      # 縁取りぶんを含めた行送り
+EN_SUB_MAX_LINES = 2
+EN_SUB_BOTTOM    = H - 150  # 英語の最終行の下端。2行でも1行でもここに揃える
+EN_SUB_COLOR     = "0xFFFFFF"
+EN_SUB_MAX_W     = W - 2 * TOP_SUB_PAD_X - 2 * 14
+
+
+def wrap_english_lines(text: str, max_width: int = EN_SUB_MAX_W,
+                       font_size: int = EN_SUB_FONT_SIZE,
+                       max_lines: int | None = EN_SUB_MAX_LINES) -> list[str]:
+    """英文を単語単位で折り返す。幅は実際のフォントで測る（文字数だとiとWで倍違う）。
+
+    max_lines に収まらなければ最後の行を「…」で切る。max_lines=None なら切らない
+    （paginate_english_cues が時間で分けるときに使う）。
+    """
+    from PIL import ImageFont
+    font = ImageFont.truetype(RICH_FONT if Path(RICH_FONT).exists() else FONT_PATH, font_size)
+    words = (text or "").split()
+    lines, cur = [], ""
+    for w in words:
+        cand = f"{cur} {w}".strip()
+        if cur and font.getlength(cand) > max_width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = cand
+    if cur:
+        lines.append(cur)
+    if max_lines is not None and len(lines) > max_lines:
+        last = " ".join(lines[max_lines - 1:])
+        while last and font.getlength(last + "…") > max_width:
+            last = last[:-1]
+        lines = lines[:max_lines - 1] + [last.rstrip() + "…"]
+    return lines
+
+
+def paginate_english_cues(en_cues: list[dict],
+                          max_lines: int = EN_SUB_MAX_LINES) -> list[tuple[dict, list[str]]]:
+    """英語字幕を、max_lines 行ずつのページに分ける。
+
+    英語は文単位で訳すので、日本語の1文が長いと英文が3〜4行になる（2026-10-09 の初回で
+    文の後半が「…」で切れていた）。収まらない文は行のまとまりごとに分け、文の尺を
+    文字数で按分して順に出す。
+    """
+    pages = []
+    for cue in en_cues or []:
+        text = (cue.get("text") or "").strip()
+        if not text or cue["end"] <= cue["start"]:
+            continue
+        lines = wrap_english_lines(text, max_lines=None)
+        chunks = [lines[i:i + max_lines] for i in range(0, len(lines), max_lines)]
+        total = sum(len(" ".join(c)) for c in chunks) or 1
+        t, dur = cue["start"], cue["end"] - cue["start"]
+        for i, chunk in enumerate(chunks):
+            end = cue["end"] if i == len(chunks) - 1 else round(t + dur * len(" ".join(chunk)) / total, 3)
+            pages.append(({"start": round(t, 3), "end": end}, chunk))
+            t = end
+    return pages
 
 
 def _text_px(line: str, font_size: int) -> int:

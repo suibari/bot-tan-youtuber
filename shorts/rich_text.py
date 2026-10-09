@@ -129,3 +129,40 @@ def caption_overlays(subtitles: list[dict], top: int, out_dir: Path) -> list[dic
         out.append({"path": path, "start": s, "end": sub["end"],
                     "x": 0, "y": f"{top - pad}-{drop}"})
     return out
+
+
+def english_image(lines: list[str], out: Path) -> tuple[Path, int, int]:
+    """英語字幕1ページを PNG にする。白い文字に紺フチ（日本語の字幕より細く、控えめに）。
+
+    日本語の字幕は上部に大きく出るので、英語は下部に小さく添える。行は中央に置き、
+    最終行の下端を core.EN_SUB_BOTTOM に揃える（1行のページでも位置が跳ねない）。
+    """
+    imgs = [outlined_line(l, core.EN_SUB_FONT_SIZE, core.EN_SUB_COLOR, inner="#1E2B4F",
+                          inner_w=6, outer_w=0, gradient=0.0) for l in lines]
+    step = core.EN_SUB_LINE_H
+    h = step * (len(imgs) - 1) + max(i.height for i in imgs)
+    canvas = Image.new("RGBA", (core.W, h), (0, 0, 0, 0))
+    for k, im in enumerate(imgs):
+        canvas.alpha_composite(im, ((core.W - im.width) // 2, step * k))
+    canvas.save(out)
+    return out, canvas.width, canvas.height
+
+
+def english_overlays(en_cues: list[dict], out_dir: Path, end: float = None) -> list[dict]:
+    """英訳の字幕を core.run_ffmpeg_finalize の overlays にする。
+
+    長い英文は core.paginate_english_cues で2行ずつに分けて順に出す。
+    end（動画を切る時刻）より後ろのページは出さない。
+    """
+    pad = 6 + max(SHADOW_OFFSET) + 8   # outlined_line の上の余白（inner_w + 影 + 8）
+    out = []
+    for i, (cue, lines) in enumerate(core.paginate_english_cues(en_cues)):
+        if end is not None and cue["start"] >= end:
+            continue
+        path, _, h = english_image(lines, Path(out_dir) / f"english_{i:02d}.png")
+        n = len(lines)
+        top = core.EN_SUB_BOTTOM - core.EN_SUB_LINE_H * n
+        out.append({"path": path, "start": cue["start"],
+                    "end": min(cue["end"], end) if end is not None else cue["end"],
+                    "x": 0, "y": str(top - pad)})
+    return out

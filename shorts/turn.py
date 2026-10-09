@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""朝版と夜版を日替わりにする。今日がその版の番かを判定する。
+"""朝版（クイズ）を隔日にする。今日がその番かを判定する。
 
 2026-09-14 から Shorts フィードに一本も乗らなくなった（流入元にショートフィードが
 出てこない。見た人の7割は視聴を継続していて、中身が飛ばされているわけではない）。
 同じ型の自動生成を毎日2本出し続けたことで、量産コンテンツとして絞られていると見て、
-朝夜を1日おきの交互にして合計1日1本へ減らす。
+朝夜を1日おきの交互にして合計1日1本へ減らした。
+
+2026-10 からは夜版を YouTube に出さず Bluesky へ移した（YouTube AI に「いろいろ
+投稿しすぎ」と言われたため）。夜版は毎日撮るので、ここで判定するのは朝版だけ。
 
 タイマー（systemd）はそのままにして、起動スクリプトの頭でこれを呼ぶ。
 自分の番でない日は何もせず終わる。SHORTS_ALTERNATE_DAYS=false で毎日に戻る。
@@ -22,8 +25,8 @@ from common.env import env_flag  # noqa: E402  (.env もここで読まれる)
 
 JST = datetime.timezone(datetime.timedelta(hours=9))
 
-# JST の日付の通し番号が偶数の日は朝版、奇数の日は夜版
-KINDS = {"quiz": 0, "night": 1}
+# JST の日付の通し番号が偶数の日が朝版の番（夜版と交互だった頃の割り当てを保つ）
+KINDS = {"quiz": 0}
 
 
 def today_jst() -> datetime.date:
@@ -49,8 +52,7 @@ def main() -> int:
     today = today_jst()
     if is_my_turn(kind, today):
         return 0
-    other = next(k for k in KINDS if k != kind)
-    print(f"[turn] {today} は {other} の番なので {kind} は投稿しません"
+    print(f"[turn] {today} は {kind} の番ではないので投稿しません"
           f"（毎日に戻すには SHORTS_ALTERNATE_DAYS=false）")
     return 1
 

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-botたん YouTube Shorts 自動投稿パイプライン
+botたん 夜の動画 自動投稿パイプライン（毎日 18:00・Bluesky）
+
+Bluesky と Nagi の投稿から1件を紹介する縦動画を作り、Bluesky に投稿する（shorts/bluesky.py）。
+その夜のおやすみポスト（bsky-affirmative-bot）が RP とコメントで紹介する。
+YouTube には出さない（2026-10、YouTube は朝のクイズだけに絞った）。
 
 環境変数:
   GEMINI_API_KEY      : Gemini APIキー (USE_LOCAL_LLM=false時)
@@ -15,7 +19,8 @@ botたん YouTube Shorts 自動投稿パイプライン
   UNITY_EXE           : UnityエディタのパスまたはビルドされたPlayerのパス
   UNITY_PROJECT       : Unityプロジェクトのパス
   BGM_PATH            : BGM音声ファイルのパス (省略可)
-  YOUTUBE_PRIVACY     : YouTube動画の公開設定 (public/private/unlisted, デフォルト: public)
+  BSKY_DID, BSKY_APP_PASSWORD : 投稿する bot のアカウント
+  SKIP_BLUESKY        : true で投稿せず、mp4 と投稿用 JSON を残して止まる（SKIP_YOUTUBE も同じ意味）
   VRMA_PULLBACK       : 生成モーション開始以降カメラを引く量[m] (既定 0.7)
   KEEP_TEMP           : true で一時ファイル（音声・録画）を残す
   NIGHT_MOUTH_CLOSE   : 無音時に表情の口成分を打ち消す強さ 0〜1 (既定 1.0)
@@ -33,13 +38,10 @@ import tempfile
 from dotenv import load_dotenv
 load_dotenv()
 
-from prompts import SYSTEM_PROMPT, build_user_prompt
-from description import build_description, build_title, _credits
+from prompts import SYSTEM_PROMPT, build_user_prompt, usable_interactions
 import english
 import chibi
 import rich_text
-
-from thumbnail import capture_thumbnail_frame, generate_thumbnail
 
 # 共通処理は core.py に集約されている。
 # 既存の `from pipeline import ...` を壊さないよう、ここで再エクスポートする。
@@ -65,7 +67,7 @@ from core import (  # noqa: F401
     run_ffmpeg_finalize, cleanup_old_temp_files,
 )
 
-# 冒頭のアップ（カメラを引かない区間）の長さ[秒]。サムネはこの区間から撮る。
+# 冒頭のアップ（カメラを引かない区間）の長さ[秒]。
 # 以前は Animatorの既定ステート Blow A Kiss（4.57秒）の尺に合わせていた名残で、
 # いまは冒頭も生成モーションで動かす（-skipIntroClip で投げキッスを飛ばす）
 HOOK_CLOSEUP_SEC = 4.6
@@ -129,8 +131,12 @@ SCRIPT_SCHEMA = {
             "type": "object",
             "properties": {
                 "nagi_themes": {"type": "array", "items": {"type": "string"}},
+                # ②で紹介した投稿の番号（prompts.usable_interactions の1始まり）
+                "picked_post": {"type": "integer"},
+                # Bluesky の動画ポストの添え文（日本語）
+                "post_caption": {"type": "string"},
             },
-            "required": ["nagi_themes"],
+            "required": ["nagi_themes", "picked_post", "post_caption"],
         },
     },
     "required": ["sections", "meta"],
@@ -144,10 +150,19 @@ from psycopg2.extras import RealDictCursor
 
 from common import bgm
 from common.db import connect_raw
+import bluesky
+import night_videos
+
+# 1ネットワークあたりの候補数。プロンプトの投稿一覧が長くなりすぎないように絞る
+POSTS_PER_NETWORK = 15
 
 
 def fetch_from_bot_db() -> dict:
-    """ラズパイDBからNagiのポストを取得する
+    """ラズパイDBから Bluesky / Nagi の高得点ポストを取得する。
+
+    夜版は Bluesky に出すので、紹介する投稿も Bluesky と Nagi の両方から取る。
+    各行に network（"bsky" / "nagi"）と表示名（display_name）を付ける。
+    表示名は動画ポストの添え文に入れる（誰の投稿かが分かる単独のポストにするため）。
 
     以前は締めで使う botたん自身の出来事（biorhythm_history）も取っていたが、
     ループする台本にしたときに締めから外した（prompts.py の構成を参照）。
@@ -161,52 +176,105 @@ def fetch_from_bot_db() -> dict:
             # 今日のNagiの高得点ポスト
             cur.execute("""
                 SELECT
+                    'nagi'                AS network,
+                    p.uri,
                     p.did,
                     p.text                AS post_text,
                     s.score               AS score,
-                    p.record_created_at   AS created_at
+                    p.record_created_at   AS created_at,
+                    COALESCE(NULLIF(pr.display_name, ''), a.handle, p.did) AS display_name
                 FROM nagi.post_scores s
                 JOIN nagi.posts p ON s.post_uri = p.uri
+                LEFT JOIN nagi.profiles pr ON pr.did = p.did
+                LEFT JOIN nagi.actors a ON a.did = p.did
                 WHERE s.score >= 88
                   AND p.record_created_at >= NOW() - INTERVAL '1 days'
                   AND p.deleted_at IS NULL
                   AND p.kossori = false
                 ORDER BY s.score DESC
-            """)
-            interactions = cur.fetchall()
+                LIMIT %s
+            """, (POSTS_PER_NETWORK,))
+            nagi_rows = [dict(r) for r in cur.fetchall()]
 
-
+            # 今日の Bluesky の高得点ポスト（botたんが全肯定したもの。1人1行）
+            cur.execute("""
+                SELECT
+                    'bsky'      AS network,
+                    uri,
+                    did,
+                    post        AS post_text,
+                    score,
+                    created_at
+                FROM affirmative_bot.posts
+                WHERE score >= 88
+                  AND created_at >= NOW() - INTERVAL '1 days'
+                  AND uri IS NOT NULL
+                ORDER BY score DESC, created_at DESC
+                LIMIT %s
+            """, (POSTS_PER_NETWORK,))
+            bsky_rows = [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
 
-    print(f"[DB] Nagiポスト: {len(interactions)}件")
-    return {"interactions": [dict(r) for r in interactions]}
+    names = bluesky.fetch_display_names([r["did"] for r in bsky_rows])
+    for r in bsky_rows:
+        r["display_name"] = names.get(r["did"]) or r["did"]
+
+    # 両方を混ぜて並べる。どちらかに偏らないよう交互に置く（LLM は前のほうを選びやすい）
+    interactions = []
+    for i in range(max(len(nagi_rows), len(bsky_rows))):
+        for rows in (bsky_rows, nagi_rows):
+            if i < len(rows):
+                interactions.append(rows[i])
+
+    print(f"[DB] Blueskyポスト: {len(bsky_rows)}件, Nagiポスト: {len(nagi_rows)}件")
+    return {"interactions": interactions}
+
+
+def pick_source_post(data: dict, picked_post) -> dict | None:
+    """台本の meta.picked_post（1始まり）から紹介元の投稿を引く。
+
+    番号が範囲外・未指定なら None（添え文にリンクを付けないだけで、投稿は止めない）。
+    """
+    rows = usable_interactions(data)
+    if not isinstance(picked_post, int) or not 1 <= picked_post <= len(rows):
+        print(f"[紹介元] picked_post={picked_post!r} が投稿一覧（{len(rows)}件）にありません。リンクなしで続行")
+        return None
+    r = rows[picked_post - 1]
+    return {
+        "network": r.get("network") or "nagi",
+        "uri": r.get("uri"),
+        "did": r.get("did"),
+        "display_name": r.get("display_name") or "",
+        "url": bluesky.public_post_url(r.get("uri") or ""),
+    }
 
 
 # ──────────────────────────────────────────────
 # Step 2: LLMで台本生成
 # ──────────────────────────────────────────────
 
-# NagiCorner に「Nagi」が無いときに台本を書き直させる回数（ローカルLLMなので課金は無い）
+# NagiCorner に「Bluesky」「Nagi」が無いときに台本を書き直させる回数（ローカルLLMなので課金は無い）
 NAGI_MENTION_RETRIES = 2
 
 
 def mentions_nagi(raw_script: str) -> bool:
-    """NagiCorner の文に「Nagi」が入っているか。JSON が壊れていたら判定しない（真を返す）。"""
+    """NagiCorner の文に、どこで見た投稿か（「Bluesky」か「Nagi」）が入っているか。
+    JSON が壊れていたら判定しない（真を返す）。"""
     try:
         sd = parse_script_json(raw_script)
     except Exception:
         return True
     texts = [st.get("text", "") for sec in sd.get("sections", [])
              if sec.get("section") == "NagiCorner" for st in sec.get("sentences", [])]
-    return not texts or any("Nagi" in t or "ナギ" in t for t in texts)
+    return not texts or any(w in t for t in texts for w in ("Nagi", "ナギ", "Bluesky", "ブルースカイ"))
 
 
-def generate_script(data: dict, comments: list[dict] = None, corner_context: dict = None) -> str:
+def generate_script(data: dict, corner_context: dict = None) -> str:
     """DBデータから台本を生成する"""
     print(f"[LLM] 台本生成中...")
 
-    user_prompt = build_user_prompt(data, comments=comments, corner_context=corner_context)
+    user_prompt = build_user_prompt(data, corner_context=corner_context)
     # スキーマは経路によらず response_format で渡す。Gemini はそのまま
     # OpenAI 互換で受け、Ollama は common/llm.py が native の format へ写す。
     # （extra_body に response_mime_type/response_schema を渡すと Gemini は400になる。
@@ -240,17 +308,13 @@ def generate_corner_timing(
     subtitles: list[dict],
     intro_duration: float = 0.0,
     section_starts: dict[str, str] = None,
-    has_comments: bool = False,
 ) -> list[dict]:
     """セクションタグで確定したタイミングでコーナーラベルを生成する"""
     # label/color は画面に出さなくなった（左上のコーナーテロップは
     # ターゲットテロップに置き換えた）が、corners はカメラ引き・サムネ撮影・
     # DoThankful の探索開始位置を決めるのに使い続けるので残してある。
-    if has_comments:
-        corner_meta = [('CommentCorner', "コメントコーナー", "#ff9f43")]
-    else:
-        corner_meta = [('NagiCorner', "今日のNagi", "#00A88A")]
-    corner_meta.append(('Closing', "全肯定メッセージ", "#7ec8e3"))
+    corner_meta = [('NagiCorner', "今日のSNS", "#00A88A"),
+                   ('Closing', "全肯定メッセージ", "#7ec8e3")]
     total_duration = subtitles[-1]["end"] if subtitles else 90
 
     resolved_starts = []
@@ -377,7 +441,8 @@ def cut_spans(spans: list[dict], subtitles: list[dict]) -> list[dict]:
 def finalize_video(input_webm: str, output_mp4: str,
                    subtitles: list[dict] = None, bgm_path=None,
                    pullback_at: float = None, end: float = None,
-                   spans: list[dict] = None, work_dir=None) -> None:
+                   spans: list[dict] = None, work_dir=None,
+                   en_cues: list[dict] = None) -> None:
     """FFmpegで縦型Shorts用MP4に変換・字幕合成する（夜版レイアウト）
 
     字幕は上部に大きく1枚ずつ出す（build_top_subtitle_filters）。以前は下の帯に
@@ -387,6 +452,9 @@ def finalize_video(input_webm: str, output_mp4: str,
     カットは文の切り替わりで切り、山場の文だけ強く寄る（core.plan_cuts）。
     reaction の付いた文では、ちびキャラに切り替えて効果音を鳴らす（chibi.py）。
     end は最後の発話の終わり。そこで切ってループさせる。
+
+    en_cues は英訳の字幕（文単位）。画面下部に縁取り文字で焼き込む（rich_text.english_overlays）。
+    Bluesky には YouTube の CC 字幕が無いので、英語圏の人にも動画の中で読めるようにする。
     """
     print(f"[FFmpeg] MP4変換中...")
 
@@ -422,24 +490,14 @@ def finalize_video(input_webm: str, output_mp4: str,
         sfx = chibi.build_sfx(inserts, emph)
         # 字幕は画像で描いてイラストの上に重ねる（rich_text。文字の内側に紺が出ない）
         overlays += rich_text.caption_overlays(subtitles, TOP_SUB_Y, work_dir or tempfile.gettempdir())
+        if en_cues:
+            overlays += rich_text.english_overlays(en_cues, work_dir or tempfile.gettempdir(),
+                                                   end=cut_end)
 
     run_ffmpeg_finalize(input_webm, output_mp4, vf_parts, bgm_path=bgm_path,
                         max_duration=end, overlays=overlays, sfx=sfx)
 
 
-# ──────────────────────────────────────────────
-# Step 6: YouTubeにアップロード
-# ──────────────────────────────────────────────
-
-from youtube import (
-    fetch_youtube_comments,
-    upload_to_youtube,
-    get_recent_video_stats,
-    should_enable_comment_corner,
-    fetch_nagi_corner_context,
-    save_youtube_upload_to_db,
-    notify_discord,
-)
 
 def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -450,7 +508,6 @@ def main():
     webm_path      = str(tmp_dir / f"bottan_{ts}.webm")
     bgm_path       = None   # Step3.7 で生成できたときだけ入る
     mp4_path    = str(tmp_dir / f"bottan_{ts}.mp4")
-    screenshot_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
 
     total_start = time.time()
     try:
@@ -460,21 +517,10 @@ def main():
             print("[ERROR] データが取得できませんでした")
             return
 
-        # Step 1.5: コメントコーナー有効化判定 → コメント取得
-        recent_stats = get_recent_video_stats(n=3)
-        use_comment_corner = should_enable_comment_corner(recent_stats)
-        print(f"[コメント] コメントコーナー有効化条件: {'満たした' if use_comment_corner else '未達 → スキップ'}")
-
-        comments = fetch_youtube_comments() if use_comment_corner else None
-        if not comments:
-            comments = None
-        has_comments = bool(comments)
-        print(f"[コメント] CommentCorner: {'あり (' + str(len(comments)) + '件)' if has_comments else 'なし → スキップ'}")
-
-        # corner_context取得（Nagi参考/除外リスト）
+        # corner_context取得（直近に扱ったテーマの除外リスト）
         corner_context = {}
         try:
-            corner_context = fetch_nagi_corner_context()
+            corner_context = night_videos.fetch_recent_context()
         except Exception as e:
             print(f"[corner_context] 取得失敗（スキップ）: {e}")
 
@@ -487,18 +533,16 @@ def main():
             raw_script = open(script_cache).read()
             print(f"[LLM] キャッシュから台本読み込み: {script_cache}")
         else:
-            raw_script = _timed("Step2 台本生成", generate_script, data, comments,
-                                corner_context)
-            # Nagi の紹介を兼ねているので「Nagiで見かけた」は外せない。抜けたら書き直させる
+            raw_script = _timed("Step2 台本生成", generate_script, data, corner_context)
+            # どこで見た投稿かは外せない（Nagi の紹介も兼ねている）。抜けたら書き直させる
             for retry in range(NAGI_MENTION_RETRIES):
-                if has_comments or mentions_nagi(raw_script):
+                if mentions_nagi(raw_script):
                     break
-                print(f"[LLM] NagiCorner に「Nagi」が無いので書き直します（{retry + 1}回目）")
-                raw_script = _timed("Step2 台本生成", generate_script, data, comments,
-                                    corner_context)
+                print(f"[LLM] NagiCorner に「Bluesky」「Nagi」が無いので書き直します（{retry + 1}回目）")
+                raw_script = _timed("Step2 台本生成", generate_script, data, corner_context)
             else:
-                if not has_comments and not mentions_nagi(raw_script):
-                    print("[警告] 書き直しても NagiCorner に「Nagi」が入りませんでした。このまま続けます")
+                if not mentions_nagi(raw_script):
+                    print("[警告] 書き直しても NagiCorner に「Bluesky」「Nagi」が入りませんでした。このまま続けます")
 
         # Step 2.5: JSONパース、クリーン台本作成
         script_data = parse_script_json(raw_script)
@@ -521,10 +565,21 @@ def main():
         section_starts = {k: v[0]["text"][:8] if v else "" for k, v in sections.items()}
         print(f"[セクション] 検出: {list(sections.keys())}")
 
-        # Step 2.5: 英訳（英語字幕トラックと英語タイトル用）。ollama が載っているうちに済ませる。
+        # 紹介元の投稿（動画ポストの添え文にリンクを付ける）
+        picked = pick_source_post(data, script_meta.get("picked_post"))
+        caption_ja = bluesky.strip_links(script_meta.get("post_caption") or "") or thumbnail_text
+        print(f"[紹介元] {picked and (picked['network'], picked['display_name'], picked['uri'])}")
+        print(f"[添え文] {caption_ja}")
+
+        # Step 2.5: 英訳（動画に焼き込む英語字幕と、動画ポストの添え文の英語版）。
+        # ollama が載っているうちに済ませる。添え文は最後の行として一緒に訳す（呼び出しは1回）。
         # 失敗したら None で、日本語だけで公開する
         en = _timed("Step2.5 英訳", english.translate,
-                    [thumbnail_text] + [s["text"] for s in main_sentences], thumbnail_text)
+                    [thumbnail_text] + [s["text"] for s in main_sentences] + [caption_ja],
+                    thumbnail_text)
+        if en is None:
+            from common import notify
+            notify.warn("夜の動画: 英訳に失敗しました。日本語字幕だけで投稿します（logs/pipeline_*.log を確認）")
 
         # Step 3: 音声生成。各文の実測尺を受け取り、モーションを文に紐づけるのに使う
         sentence_durations = _timed("Step3 音声生成", generate_voice,
@@ -563,7 +618,7 @@ def main():
             subtitles = [{"start": 0.0, "end": round(intro_duration + 0.05, 3),
                           "text": thumbnail_text}] + subtitles
             _dedupe_subtitle_overlaps(subtitles)
-        corners   = generate_corner_timing(clean_script, subtitles, intro_duration, section_starts, has_comments)
+        corners   = generate_corner_timing(clean_script, subtitles, intro_duration, section_starts)
 
         # 感情タイムライン生成
         emotions, wave_time = build_emotion_timeline(main_sentences, subtitles, intro_duration)
@@ -643,50 +698,46 @@ def main():
                extra_args=extra or None,
                catch=(RuntimeError, TimeoutError), delay=15)
 
-        # サムネ作成
-        thumbnail_path = str(tmp_dir / f"bottan_{ts}_thumbnail.png")
-        # 生成モーションを使うときは、カメラが引く前（フック内）からサムネを撮る
-        thumb_before = pullback_at
-        capture_thumbnail_frame(webm_path, screenshot_path, emotions, before=thumb_before)
-        generate_thumbnail(screenshot_path, thumbnail_path, thumbnail_text)
+        # 英語字幕は文単位。冒頭一言 + 本編の各文を、音声の実測尺で並べる（build_vrma_blocks と同じ）
+        en_cues = None
+        if en:
+            en_cues, t = [{"start": 0.0, "end": intro_duration, "text": en["lines"][0]}], intro_duration
+            for line, dur in zip(en["lines"][1:1 + len(sentence_durations)], sentence_durations):
+                en_cues.append({"start": t, "end": t + dur, "text": line})
+                t += dur
 
         # Step 5: MP4変換
         # 最後の発話の直後で切る。録画の末尾にはモーションの余白（VRMA_RECORD_TAIL_SEC）
         # があり、残すとループの継ぎ目で間が空く
         _timed("Step5 MP4変換", finalize_video, webm_path, mp4_path, subtitles,
                bgm_path, pullback_at, total_sec + LOOP_TAIL_SEC,
-               sentence_spans(main_sentences, sentence_durations, intro_duration), tmp_dir)
+               sentence_spans(main_sentences, sentence_durations, intro_duration), tmp_dir,
+               en_cues)
 
-        # Step 6: YouTubeアップロード
-        title = build_title(thumbnail_text)
-        description = build_description(bgm_generated=bgm_path is not None)
-        en_upload = None
-        if en:
-            # 字幕は文単位。冒頭一言 + 本編の各文を、音声の実測尺で並べる（build_vrma_blocks と同じ）
-            cues, t = [{"start": 0.0, "end": intro_duration, "text": en["lines"][0]}], intro_duration
-            for line, dur in zip(en["lines"][1:], sentence_durations):
-                cues.append({"start": t, "end": t + dur, "text": line})
-                t += dur
-            en_upload = {
-                "title": english.build_title(en["title"]),
-                "description": english.build_description(
-                    "night", _credits(bgm_generated=bgm_path is not None)),
-                "srt": english.build_srt(cues),
-            }
-        if not env_flag("SKIP_YOUTUBE"):
-            yt_url = _timed("Step6 YT投稿", upload_to_youtube, mp4_path, title, description,
-                            thumbnail_path, en_upload)
-            if yt_url and os.getenv("YOUTUBE_PRIVACY", "public") == "public":
-                corners_metadata = [
-                    {"corner_name": "Thumbnail", "theme": thumbnail_text},
-                ]
-                nagi_themes = script_meta.get("nagi_themes", [])
-                if isinstance(nagi_themes, list) and nagi_themes:
-                    corners_metadata.append({"corner_name": "NagiCorner", "theme": nagi_themes})
-                save_youtube_upload_to_db(yt_url, title, corners_metadata)
-                notify_discord(yt_url, title)
+        # Step 6: Bluesky へ投稿する。投稿に要るものはすべて JSON に書き出し、
+        # 投稿は bluesky.post_from_job が JSON だけを見て行う。
+        # SKIP_BLUESKY=true のときは JSON と mp4 を残して止まる（確認してから手で投稿できる）
+        job = {
+            "mp4": mp4_path,
+            "date": night_videos.bot_day(),
+            "hook_ja": thumbnail_text,
+            "hook_en": en["title"] if en else "",
+            "caption_ja": caption_ja,
+            "caption_en": bluesky.strip_links(en["lines"][-1]) if en else "",
+            "source": picked,
+            "themes": script_meta.get("nagi_themes") or [],
+            "width": W, "height": H,
+        }
+        job_path = mp4_path.replace(".mp4", "_bluesky.json")
+        with open(job_path, "w") as f:
+            json.dump(job, f, ensure_ascii=False, indent=2, default=str)
+        print(f"[Bluesky] 投稿用データ: {job_path}")
+
+        if env_flag("SKIP_BLUESKY") or env_flag("SKIP_YOUTUBE"):
+            print(f"[Bluesky] スキップ (SKIP_BLUESKY=true)。投稿するには:\n"
+                  f"  ./venv/bin/python shorts/bluesky.py --from {job_path}")
         else:
-            print("[YouTube] スキップ (SKIP_YOUTUBE=true)")
+            _timed("Step6 Bluesky投稿", bluesky.post_from_job, job_path)
 
         elapsed = time.time() - total_start
         print(f"\n✅ パイプライン完了: {mp4_path}  (合計: {elapsed:.1f}秒)")

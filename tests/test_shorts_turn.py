@@ -1,4 +1,4 @@
-"""朝版と夜版が日替わりで、どの日もちょうど片方だけが番になること。"""
+"""朝版が隔日で番になること。"""
 
 import datetime
 import os
@@ -15,13 +15,12 @@ from shorts import turn  # noqa: E402
 
 
 class TurnTest(unittest.TestCase):
-    def test_exactly_one_kind_each_day(self):
+    def test_quiz_every_other_day(self):
         start = datetime.date(2026, 10, 1)
         with mock.patch.dict(os.environ, {"SHORTS_ALTERNATE_DAYS": "true"}):
-            for i in range(14):
-                day = start + datetime.timedelta(days=i)
-                turns = [k for k in turn.KINDS if turn.is_my_turn(k, day)]
-                self.assertEqual(len(turns), 1, day)
+            turns = [turn.is_my_turn("quiz", start + datetime.timedelta(days=i)) for i in range(14)]
+        self.assertEqual(turns.count(True), 7)
+        self.assertTrue(all(a != b for a, b in zip(turns, turns[1:])))
 
     def test_alternates_across_month_boundary(self):
         with mock.patch.dict(os.environ, {"SHORTS_ALTERNATE_DAYS": "true"}):
@@ -33,7 +32,6 @@ class TurnTest(unittest.TestCase):
         day = datetime.date(2026, 10, 7)
         with mock.patch.dict(os.environ, {"SHORTS_ALTERNATE_DAYS": "false"}):
             self.assertTrue(turn.is_my_turn("quiz", day))
-            self.assertTrue(turn.is_my_turn("night", day))
 
 
 if __name__ == "__main__":

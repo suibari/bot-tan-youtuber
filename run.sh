@@ -34,12 +34,8 @@ for arg in "$@"; do
     fi
 done
 
-# 朝版と夜版は日替わり（shorts/turn.py）。番でない日は何もしない。
-# 量産コンテンツ扱いで Shorts フィードから外れたため、1日2本 → 1本に減らした。
-# 手動で今すぐ撮るときは SHORTS_ALTERNATE_DAYS=false を引数に渡す
-if ! "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/shorts/turn.py" night; then
-    exit 0
-fi
+# 夜版は毎日撮る（Bluesky に出すので、YouTube の量産判定とは関係ない）。
+# 隔日にしているのは YouTube に出す朝版だけ（run_quiz.sh / shorts/turn.py）
 
 # 録画パイプラインは配信と違って待てるので、LLM の上限を伸ばす。
 # 配信側（live/）は .env の LLM_TIMEOUT_SEC のまま短く縛る

@@ -36,8 +36,8 @@ for arg in "$@"; do
     fi
 done
 
-# 朝版と夜版は日替わり（shorts/turn.py）。番でない日は何もしない。
-# 量産コンテンツ扱いで Shorts フィードから外れたため、1日2本 → 1本に減らした。
+# 朝版は隔日（shorts/turn.py）。番でない日は何もしない。
+# 量産コンテンツ扱いで Shorts フィードから外れたため。夜版は Bluesky に移した。
 # 手動で今すぐ撮るときは SHORTS_ALTERNATE_DAYS=false を引数に渡す
 if ! "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/shorts/turn.py" quiz; then
     exit 0

@@ -79,3 +79,11 @@ def youtube_uploaded(yt_url: str, title: str) -> None:
         return          # 統合前はここで黙って返っていた。挙動を変えない
     if send(f"✅ YouTube投稿完了！\n**{title}**\n{yt_url}"):
         print("[Discord] 通知送信完了")
+
+
+def bluesky_posted(url: str, caption: str) -> None:
+    """夜の動画を Bluesky に投稿した。"""
+    if not _webhook():
+        return
+    if send(f"✅ Bluesky に夜の動画を投稿しました！\n**{caption[:80]}**\n{url}"):
+        print("[Discord] 通知送信完了")

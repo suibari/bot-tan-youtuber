@@ -5,8 +5,8 @@
 
 | | 中身 | 起動 | 時刻 |
 |---|---|---|---|
-| `shorts/` | 夜の Shorts（Nagi のポスト紹介）| `run.sh` | 隔日 18:00 JST（朝版と日替わり）|
-| `shorts/` | 朝の勘違いクイズ Shorts | `run_quiz.sh` | 隔日 06:00 JST（夜版と日替わり）|
+| `shorts/` | 夜の動画（Bluesky / Nagi のポスト紹介）→ **Bluesky** に投稿 | `run.sh` | 毎日 18:00 JST |
+| `shorts/` | 朝の勘違いクイズ Shorts → YouTube | `run_quiz.sh` | 隔日 06:00 JST |
 | `live/` | 次の2回の配信枠を先行作成 | `live/prepare_broadcast.py` | 毎日 04:00 JST |
 | `live/` | YouTube ライブ配信（AITuber）| `run_live.sh` | 毎週土曜 20:40 起動 / 21:00–22:00 配信 |
 | `common/` | 上記が共有する処理 | — | — |
@@ -28,6 +28,7 @@ common/           両方から呼ばれるもの。ここを直すと両方に�
 shorts/           Shorts の生成と投稿
   core.py           収録・字幕・ffmpeg 仕上げ。common/ の再輸出ファサードでもある
   pipeline.py       夜版 / quiz_pipeline.py 朝版
+  bluesky.py        夜版の Bluesky 投稿 / night_videos.py おやすみポストへ渡す記録
 live/             ライブ配信
   config.py         配信の設定。common/ の再輸出ファサードでもある
   schedule.py       JSTの開始・終了時刻と配信タイトル
