@@ -113,40 +113,8 @@ def close_unity_hub(grace_sec: float = 5.0) -> int:
     なった前例がある（run_live.sh の flock の説明を参照）。ここは
     /opt/unityhub/ で始まるコマンドラインだけを見る。
     """
-    pids = []
-    for proc in Path("/proc").glob("[0-9]*"):
-        try:
-            cmdline = (proc / "cmdline").read_bytes().split(b"\0")[0].decode()
-        except (OSError, UnicodeDecodeError):
-            continue          # 見ている間に消えたプロセス
-        if cmdline.startswith(UNITY_HUB_PREFIX):
-            try:
-                pids.append(int(proc.name))
-            except ValueError:
-                continue
-    if not pids:
-        return 0
-
-    print(f"[Unity] Unity Hub が起動しています。閉じます（{len(pids)}プロセス）")
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
-    # Electron は親を落とすと子も畳まれる。少し待ってから残りを見る
-    deadline = time.time() + grace_sec
-    while time.time() < deadline:
-        alive = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
-        if not alive:
-            return len(pids)
-        time.sleep(0.2)
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    print("[Unity] SIGTERM で閉じなかったぶんを強制終了しました")
-    return len(pids)
+    from common.unity_license import close_hub
+    return close_hub(grace_sec, prefix=UNITY_HUB_PREFIX)
 
 
 class UnityLive:
@@ -171,6 +139,7 @@ class UnityLive:
     def start(self, ready_timeout: float = 300.0) -> dict:
         """Unity を起動し、LiveController が応答するまで待つ。"""
         current_log_path = self._next_log_path()
+        current_log_path.unlink(missing_ok=True)
         env = os.environ.copy()
         env.pop("XAUTHORITY", None)          # 仮想ディスプレイには不要
 
@@ -276,6 +245,12 @@ class UnityLive:
         print(f"[Unity] LiveController の応答を待っています（最大{ready_timeout:.0f}秒）...")
         deadline = time.time() + ready_timeout
         while time.time() < deadline:
+            from common.unity_license import raise_if_license_error
+            try:
+                raise_if_license_error(current_log_path)
+            except RuntimeError:
+                self.stop()
+                raise
             if self.proc.poll() is not None:
                 raise RuntimeError(
                     f"Unity が起動直後に終了しました (code={self.proc.returncode})。"

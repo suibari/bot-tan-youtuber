@@ -283,6 +283,9 @@ def retry(label: str, fn, *args, attempts: int = 3, catch=(Exception,),
         try:
             return fn(*args, **kwargs)
         except catch as e:
+            from common.unity_license import UnityLicenseError
+            if isinstance(e, UnityLicenseError):
+                raise
             if attempt == attempts:
                 raise
             print(f"[{label}] 試行{attempt}失敗、リトライします... ({e})")

@@ -734,6 +734,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
     NOTE: 冒頭で全Unityプロセスを pkill -9 するため、夜版と朝版を同時に走らせてはならない。
           起動スクリプト側で flock により直列化すること。
     """
+    from common.unity_license import raise_if_license_error
     print(f"[Unity] 録画開始...")
     # 既存のUnityプロセスとXvfbを終了
     import subprocess as sp
@@ -758,6 +759,8 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
         _unity_lock.unlink(missing_ok=True)
 
     output_base = output_webm.replace(".webm", "")
+    unity_log = output_base + "_unity.log"
+    Path(unity_log).unlink(missing_ok=True)
     # リトライ時に前回の未完成ファイルを検出しないよう、起動前に必ず消す。
     Path(output_webm).unlink(missing_ok=True)
 
@@ -773,6 +776,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
         cmd = [
             UNITY_EXE,
             "-projectPath", UNITY_PROJECT,
+            "-logFile", unity_log,
             "-wavFile", wav_path,
             "-outputFile", output_base,
             "-emotionFile", emotion_path,
@@ -791,6 +795,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
         started = time.time()
         deadline = started + UNITY_RECORD_TIMEOUT_SEC
         while time.time() < deadline:
+            raise_if_license_error(unity_log)
             if Path(output_webm).exists() and os.path.getsize(output_webm) > 0:
                 print(f"[Unity] ファイル検出: {output_webm}")
                 # ファイルサイズが安定し、かつ有効な尺が書き込まれるまで待つ。
@@ -869,8 +874,7 @@ def record_with_unity(wav_path: str, output_webm: str, emotion_path: str,
                 pass
             # タイムアウト時にeditor.logを出力（診断用）
             # プロジェクト名から導出する（bottan-video / bottan-video-dev の両対応）
-            _editor_log = (Path.home() / ".config/unity3d/DefaultCompany"
-                           / Path(UNITY_PROJECT).name / "Editor.log")
+            _editor_log = Path(unity_log)
             if _editor_log.exists():
                 _lines = _editor_log.read_text(errors="replace").splitlines()
                 print("[Unity] Editor.log (最後50行):")

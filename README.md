@@ -1205,3 +1205,33 @@ Shorts・クイズ・ライブは既定で `~/work/bot-tan-tts` の Irodori を�
 公開時の声・クレジットの確認事項は `bot-tan-tts/README.md` の「ライセンス」を参照。
 同READMEでは、参照音声を使ったYouTube公開の扱いが未確認とされている。
 現在の `VOICEVOX:春日部つむぎ` 表記は維持している。
+
+### Unity ライセンスの確認と自動更新
+
+夜の動画・朝のクイズ・配信は重い準備の前に Licensing Client で Editor 権限を
+確認する。期限まで7日以内なら Unity Hub を一時起動し、保存済み認証で更新を試す。
+Hub は更新後に閉じる。更新できなくてもライセンスが有効なら警告して続行し、
+期限切れ・確認不能なら開始前に中止する。認証トークンやパスワードは保存・抽出しない。
+
+本番チェックアウトから、本番ユーザーで実行する（sudo は不要）:
+
+```bash
+bash setup/install_unity_license.sh
+./venv/bin/python -m common.unity_license --check
+systemctl --user start bottan-unity-license.service
+journalctl --user -u bottan-unity-license.service --no-pager
+```
+
+ユーザーtimerが毎日12:00 JSTに確認する。無人運用にはユーザーのlingerが必要。
+録画・配信が共通ロックを使用中なら定期確認は見送り、各ジョブの開始前に確認する。
+`UNITY_LICENSE_REFRESH_DAYS`（既定7日）と
+`UNITY_LICENSE_REFRESH_TIMEOUT_SEC`（既定120秒）で調整できる。
+
+保存済み認証での更新はユーザーのD-Busと鍵保管庫に依存する。再サインインが必要に
+なったら既存Discord通知へ警告する（同じ未復旧状態は1日1回、復旧も通知）。
+通知に失敗した場合は次回も通知を試す。ユーザーtimerのログはjournalに残る。
+`--force-refresh` は有効期間に関係なく更新を試す手動検証用。
+
+Unityの録画ログは動画と同じ接頭辞の `_unity.log` に保存し、ライセンス不良なら
+600秒待つ前に中止する。朝クイズの台本・音声だけの生成、プレビュー、既存動画の
+再合成・投稿ではUnity確認を行わない。

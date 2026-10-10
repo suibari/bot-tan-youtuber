@@ -170,6 +170,8 @@ class LiveSession:
 
         # ARDY（読み込みで十数GB）と Unity を起こす前に、要らないものを退かす。
         # 順番が大事で、あとから閉じても ARDY が swap に落ちたあとでは遅い
+        from common.unity_license import ensure
+        ensure(unity_live.UNITY_EXE)
         unity_live.close_unity_hub()
 
         print("[準備] DB を確認します")

@@ -500,6 +500,9 @@ def finalize_video(input_webm: str, output_mp4: str,
 
 
 def main():
+    from common.unity_license import ensure
+    from core import UNITY_EXE
+    ensure(UNITY_EXE)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmp_dir = Path(tempfile.gettempdir())
 

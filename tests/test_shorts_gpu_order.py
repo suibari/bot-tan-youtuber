@@ -58,7 +58,7 @@ class ShortsOrderTest(unittest.TestCase):
                    build_subtitles=lambda segments, *a: [], build_vrma_blocks=lambda *a: ['block'],
                    build_emotions=finished)
         exec(compile(module, str(source), 'exec'), env)
-        with tempfile.TemporaryDirectory() as tmp, patch.object(tempfile, 'gettempdir', return_value=tmp):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(tempfile, 'gettempdir', return_value=tmp), patch('common.unity_license.ensure'):
             try:
                 env['main']([])
             except EndProbe:

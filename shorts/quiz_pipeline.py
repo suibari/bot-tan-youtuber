@@ -603,6 +603,10 @@ def main(argv=None):
             print(f"\n✅ 再合成完了: {mp4_path}  ({time.time()-total_start:.1f}秒)")
             return 0
 
+        if args.stage == "all" and not args.preview and not args.dry_run:
+            from common.unity_license import ensure
+            ensure(core.UNITY_EXE)
+
         # ── Step 1: クイズ選択
         quiz = core._timed("Step1 クイズ選択", quiz_data.next_quiz, quiz_id=args.quiz_id)
         print(f"[クイズ] id={quiz['id']} 「{quiz['問題']}」 正解={quiz['正解']}")

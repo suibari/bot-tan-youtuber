@@ -1,0 +1,9 @@
+[Unit]
+Description=botたん Unityライセンス確認・自動更新
+
+[Service]
+Type=oneshot
+WorkingDirectory=__INSTALL_DIR__
+ExecStart=__INSTALL_DIR__/venv/bin/python -u -m common.unity_license
+TimeoutStartSec=240
+KillMode=control-group
