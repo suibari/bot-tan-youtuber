@@ -91,7 +91,7 @@ OBS のシーンはファイルを絶対パスで掴むので、これらをリ�
 ### energy ゲージ
 
 画面左下の `energy` ブラウザソースは `file://.../obs/energy.html` を読む。
-`live/gauge.py` が `energy.get_energy()`（共有DBの `bot_state`）の値で
+`live/gauge.py` が `energy.get_energy()`（biorhythm_server の記憶の内部 API `GET /bot/presence`）の値で
 HTML を書き直し、HTML 側に埋めたスクリプトが
 `ENERGY_REFRESH_SEC`（既定30秒）ごとに自分を読み直す。
 **ブラウザソースはローカルファイルの変更を自前では監視しない**ので、この
@@ -668,7 +668,7 @@ curl localhost:2338/status
 |---|---|
 | ARDY | プールのモーションだけで継続。プールも空なら Animator の Idle |
 | LLM | `FALLBACK_LINES` の定型で返す |
-| biorhythm_server | 配信側は DB の `bot_state` を読むだけなので影響なし。落ちている間はコメントぶんの加算が溜まり、復帰時にまとめて入る |
+| biorhythm_server | 気分・energy・直近の行動（`/bot/presence`・`/bot/activities`）が読めなくなる。返事は直前の値か既定値で続け、ゲージは更新が止まるだけ。落ちている間はコメントぶんの加算が溜まり、復帰時にまとめて入る |
 | チャット取得 | フリートークで場をつなぐ |
 | VOICEVOX | その回の発話を諦めて次へ。Discord に通知 |
 | Unity | 配信を終了する（映像が無いので続ける意味がない） |
@@ -704,7 +704,7 @@ Unity も詰まっていて、1文ごとにタイムアウトを待つと片付�
 | YouTube がコメントを配る | 次回配信で実測 | `liveChatMessages.streamList` のgRPC持続接続で新着を受信する。定期ポーリングの待ち時間をなくす。YouTube側の配信遅延は残る |
 | コメント欄への反映 | 最大10秒 | `ChatPoller._accept` が受信と同時に `comments.txt` を書く。以前は10秒ごとの雑務に任せていた |
 | 直前の発話が終わるのを待つ | 5〜15秒 | **ここがいちばん効いている。** フリートークは `interruptible=True` で、文と文の切れ目でコメントの有無を見て切り上げる。コメントへの返信は途中で切らない方針なので、ここは残る |
-| DB（気分・energy） | 0〜数秒 | `_bot_context()` は `BOT_CONTEXT_TTL_SEC`（既定20秒）キャッシュし、DB は1往復だけ。以前は同じ行を2回引いて接続を2本張っていた |
+| 気分・energy | 数ms〜3秒 | `_bot_context()` は `BOT_CONTEXT_TTL_SEC`（既定20秒）キャッシュし、記憶の内部 API の `/bot/presence` を1往復だけ。待つのは `BIORHYTHM_STATE_TIMEOUT_SEC`（既定3秒）まで |
 | LLM | 約2秒 | 実測（gemini-2.5-flash、2〜3文の構造化出力）。`LLM_TIMEOUT_SEC`（既定20秒）で頭を打たせる。会話履歴（`LIVE_HISTORY_TURNS` ぶん）は入力トークンだけを増やす。1ターン100〜150字で、system prompt の約8500字に対して6ターンでも1割ほど |
 | VOICEVOX + 送信 | 0.1〜0.7秒 | 全文まとめてではなく**1文ずつ**合成して Unity のキューへ流し込む。喋り出しまで実測 0.12秒 |
 | ARDY のモーション生成 | 4.6〜12.8秒 | **待たない。** プールから即座に1本引いて再生し、生成は別スレッドで走らせて次回以降に回す（`live/motion.py`） |

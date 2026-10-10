@@ -16,7 +16,7 @@ def _default_transport(method: str, url: str, headers: dict,
                        payload: dict, timeout: float) -> dict:
     request = urllib.request.Request(
         url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        data=None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers=headers,
         method=method,
     )
@@ -52,6 +52,32 @@ class BotMemoryClient:
             payload,
             self.timeout,
         )
+
+    def _get(self, path: str) -> dict:
+        if not self.enabled:
+            raise RuntimeError("Bot Memory API is not configured")
+        return self._transport(
+            "GET",
+            f"{self.base_url}{path}",
+            {"Authorization": f"Bearer {self.secret}"},
+            None,
+            self.timeout,
+        )
+
+    def presence(self) -> dict:
+        """いまの様子（status・energy 0〜100・mood・moodEn・weather）。取れなければ例外。"""
+        body = self._get("/bot/presence")
+        if not isinstance(body, dict):
+            raise ValueError("unexpected /bot/presence response")
+        return body
+
+    def activities(self, hours: float = 18, limit: int = 8) -> list:
+        """直近の行動（新しい順）。各要素は status・mood・energy（0〜100）・createdAt。取れなければ例外。"""
+        body = self._get(f"/bot/activities?hours={hours:g}&limit={max(1, min(20, int(limit)))}")
+        items = body.get("activities") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("unexpected /bot/activities response")
+        return [item for item in items if isinstance(item, dict)]
 
     def search(self, query: str, exclude_document_ids=None, limit: int = 10,
                sources=None, purpose: str = "live_filler") -> list:

@@ -1,7 +1,7 @@
 """energy（biorhythm）の読み出し。
 
-energy の実体は共有DBの `affirmative_bot.bot_state` にある `biorhythm` で、
-更新するのは bsky-affirmative-bot の biorhythm_server。配信側は読むだけでよい。
+energy を持っているのは bsky-affirmative-bot の biorhythm_server。配信側は記憶の内部 API の
+GET /bot/presence（0〜100）を読むだけでよい（memory.get_biorhythm）。
 
 コメント1件ぶんの加算も配信側からは行わない。biorhythm_server の
 `liveCommentEnergySync`（apps/biorhythm_server/src/liveCommentEnergySync.ts）が

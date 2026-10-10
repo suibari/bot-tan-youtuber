@@ -139,11 +139,15 @@ LIVE_GROUNDING_GATE_LOAD_SEC    = _grounding.LIVE_GROUNDING_GATE_LOAD_SEC
 
 # ── DB（botたんの記憶） ───────────────────────────
 # ── biorhythm（energy） ──────────────────────────
-# energy は共有DBの bot_state を読むだけ（live/energy.py 参照）。加算は
-# biorhythm_server が bottan_live.comments を見て自分でやるので、
-# 配信側から biorhythm_server の HTTP を叩くことはない
+# いまの様子（energy・mood・status）と直近の行動は、biorhythm_server の記憶の内部 API
+# （GET /bot/presence・/bot/activities）から読む（live/memory.py）。以前は共有DBの bot_state と
+# biorhythm_history を直接読んでいた。energy の加算は biorhythm_server が bottan_live.comments を
+# 見て自分でやるので、配信側から加算の API（POST /energy）を叩くことはない
 BIORHYTHM_MEMORY_API_URL = os.getenv("BIORHYTHM_MEMORY_API_URL", "").rstrip("/")
 BIORHYTHM_INTERNAL_SECRET = os.getenv("BIORHYTHM_INTERNAL_SECRET", "")
+# いまの様子と直近の行動を読むときの待ち時間。メモリ上の値を返すだけなので速い（LAN内で数ms）。
+# コメントへの返事の直前（_bot_context）でも読むので、検索APIの15秒とは分ける
+BIORHYTHM_STATE_TIMEOUT_SEC = env_float("BIORHYTHM_STATE_TIMEOUT_SEC", 3.0)
 # 検索APIはクエリが長いほど遅くなる。サーバがクエリ全文を埋め込んだうえ、
 # pg_trgm の similarity と ilike をクエリ全文で全行に当てるため。
 # 実測（LAN内）: 100文字 1.9秒 / 300文字 3.2秒 / 600文字 5.2秒 / 1000文字 9.1秒
