@@ -215,42 +215,39 @@ def ensure_schema() -> None:
 
 # ── botたんの現在の状態 ──────────────────────────────
 
+def _bot_memory_client():
+    # live/ の config を使うので、使うときに読む（shorts からこのモジュールを読んでも config を要求しない）
+    from bot_memory_client import BotMemoryClient
+    from config import BIORHYTHM_STATE_TIMEOUT_SEC
+    return BotMemoryClient(timeout=BIORHYTHM_STATE_TIMEOUT_SEC)
+
+
 def get_biorhythm() -> dict:
-    """いまの気分・行動・energy。
+    """いまの気分・行動・energy（0〜100）。
 
-    bot_state の energy は 0〜10000 の内部スケールなので 0〜100 に直して返す
-    （biorhythm_history 側は最初から 0〜100 で入っており、スケールが揃っていない）。
+    biorhythm_server の記憶の内部 API（GET /bot/presence）から読む。以前は共有DBの
+    bot_state を直接読み、energy の内部の単位（0〜10000）を自分で直していた。
+    取れなければ例外（呼び出し側が直前の値や既定値で続ける）。
     """
-    with connect() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT value FROM affirmative_bot.bot_state WHERE key = 'biorhythm'")
-            row = cur.fetchone()
-
-    value = (row or {}).get("value") or {}
-    if isinstance(value, str):
-        value = json.loads(value)
-
-    raw = value.get("energy", 5000)
+    value = _bot_memory_client().presence()
     return {
-        "energy": max(0.0, min(100.0, float(raw) / 100.0)),
-        "mood":    value.get("mood", ""),
-        "mood_en": value.get("mood_en", ""),
-        "status":  value.get("status", ""),
+        "energy": max(0.0, min(100.0, float(value.get("energy", 50.0)))),
+        "mood":    value.get("mood", "") or "",
+        "mood_en": value.get("moodEn", "") or "",
+        "status":  value.get("status", "") or "",
     }
 
 
 def get_today_activities(limit: int = 8) -> list:
-    """今日の行動ログ。フリートークのネタ元になる。"""
-    with connect() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                SELECT status, mood, energy, created_at
-                FROM affirmative_bot.biorhythm_history
-                WHERE created_at >= NOW() - INTERVAL '18 hours'
-                ORDER BY created_at DESC
-                LIMIT %s
-            """, (limit,))
-            return [dict(r) for r in cur.fetchall()]
+    """今日の行動ログ（直近18時間・新しい順）。フリートークのネタ元になる。
+
+    biorhythm_server の記憶の内部 API（GET /bot/activities）から読む。
+    """
+    return [
+        {"status": a.get("status", ""), "mood": a.get("mood", ""),
+         "energy": a.get("energy"), "created_at": a.get("createdAt")}
+        for a in _bot_memory_client().activities(hours=18, limit=limit)
+    ]
 
 
 # ── SNS で見かけた投稿 ───────────────────────────────
