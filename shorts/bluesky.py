@@ -300,11 +300,13 @@ def post_from_job(job_path: str) -> dict:
     同じ JSON を二度投稿しないよう、投稿できたら JSON に posted を書き戻す。
     """
     from common import notify
-    import night_videos
 
     job = json.loads(Path(job_path).read_text())
     if job.get("posted"):
         print(f"[Bluesky] 投稿済みです: {job['posted']['uri']}")
+        if not job.get("recorded"):
+            # 投稿はできたが DB に書けなかった回。もう一度叩けば記録だけやり直せる
+            _record(job, job_path)
         return job["posted"]
     if not Path(job["mp4"]).exists():
         raise FileNotFoundError(job["mp4"])
@@ -318,9 +320,17 @@ def post_from_job(job_path: str) -> dict:
     job["posted"] = {**root, "url": url, "at": _now_iso()}
     Path(job_path).write_text(json.dumps(job, ensure_ascii=False, indent=2, default=str))
 
-    night_videos.save(job, root["uri"], root["cid"])
     notify.bluesky_posted(url, job.get("caption_ja") or "")
+    _record(job, job_path)
     return job["posted"]
+
+
+def _record(job: dict, job_path: str) -> None:
+    """おやすみポストへ渡す記録（night_videos）。失敗したら投げる（記録が無いと紹介されない）。"""
+    import night_videos
+    night_videos.save(job, job["posted"]["uri"], job["posted"]["cid"])
+    job["recorded"] = True
+    Path(job_path).write_text(json.dumps(job, ensure_ascii=False, indent=2, default=str))
 
 
 def main() -> int:
