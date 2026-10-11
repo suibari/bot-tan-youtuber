@@ -1,1237 +1,342 @@
 # bot-tan-youtuber
 
-全肯定botたんの YouTube 運用一式。Shorts の自動生成・投稿と、AITuber ライブ配信を
-1つのリポジトリで扱う。
+全肯定botたんの動画生成・投稿と、YouTube LiveでのAITuber配信を運用するシステムです。SNSの投稿を紹介する夜の縦動画、朝のクイズShorts、視聴者と会話するライブ配信を、共通の音声合成・モーション生成・記憶基盤で実行します。
 
-| | 中身 | 起動 | 時刻 |
+本書は、本リポジトリの現行実装に基づく機能仕様と導入・運用手順を定義します。Unityプロジェクト、音声合成サーバー、記憶基盤は別リポジトリで管理します。
+
+## 目次
+
+- [1. システムの範囲](#1-システムの範囲)
+- [2. システム構成](#2-システム構成)
+- [3. 機能仕様](#3-機能仕様)
+- [4. データと設定](#4-データと設定)
+- [5. 導入手順](#5-導入手順)
+- [6. 実行と動作確認](#6-実行と動作確認)
+- [7. 障害時の動作と運用](#7-障害時の動作と運用)
+- [8. 関連資料とライセンス](#8-関連資料とライセンス)
+
+## 1. システムの範囲
+
+| 機能 | 入力・処理 | 出力先 | 標準スケジュール（JST） |
 |---|---|---|---|
-| `shorts/` | 夜の動画（Bluesky / Nagi のポスト紹介）→ **Bluesky** に投稿 | `run.sh` | 毎日 18:00 JST |
-| `shorts/` | 朝の勘違いクイズ Shorts → YouTube | `run_quiz.sh` | 隔日 06:00 JST |
-| `live/` | 次の2回の配信枠を先行作成 | `live/prepare_broadcast.py` | 毎日 04:00 JST |
-| `live/` | YouTube ライブ配信（AITuber）| `run_live.sh` | 毎週土曜 20:40 起動 / 21:00–22:00 配信 |
-| `common/` | 上記が共有する処理 | — | — |
+| 夜の縦動画 | Bluesky / Nagiの投稿を選び、紹介台本・音声・映像を生成 | Bluesky | 毎日18:00 |
+| 朝のクイズShorts | クイズデータから出題・解答の動画を生成 | YouTube | 隔日06:00 |
+| 配信枠の事前準備 | 次の2回の配信枠を作成・再利用し、視聴URLを保存 | YouTube / 共有DB | 毎日04:00 |
+| ライブ配信 | コメントへの返答、フリートーク、字幕・モーションの制御 | YouTube Live | 土曜20:40起動、21:00–22:00配信 |
+| Unityライセンス確認 | 有効期限の確認と保存済み認証による更新 | ログ / Discord通知 | 毎日12:00、および各ジョブ開始前 |
 
-## ディレクトリ構成
+夜の縦動画はYouTubeへ投稿しません。朝のクイズはtimer自体が毎日起動し、`shorts/turn.py`がJSTの日付の通し番号が偶数の日だけ実行を許可します。`SHORTS_ALTERNATE_DAYS=false`で毎日実行へ切り替えられます。
 
-```
-common/           両方から呼ばれるもの。ここを直すと両方に効く
-  env.py            パス解決（ROOT/DATA_DIR/LOGS_DIR）と環境変数の読み取り
-  llm.py            LLM クライアント・モデルのフォールバック・JSON 取得
-  grounding.py      配信で聞かれたことを Google 検索で調べる（native REST）
-  voice.py          Irodori 合成・VOICEVOX フォールバック・結合・モーラタイミング
-  ardy.py           ARDY サーバの起動/待機/停止と .vrma 生成
-  motion_safety.py  モーション指示文の禁止語・主語の正規化・待機動作
-  db.py             PostgreSQL 接続
-  youtube_auth.py   YouTube OAuth（トークンは Shorts と配信で共用）
-  xvfb.py           仮想ディスプレイの起動
-  notify.py         Discord 通知
-shorts/           Shorts の生成と投稿
-  core.py           収録・字幕・ffmpeg 仕上げ。common/ の再輸出ファサードでもある
-  pipeline.py       夜版 / quiz_pipeline.py 朝版
-  bluesky.py        夜版の Bluesky 投稿 / night_videos.py おやすみポストへ渡す記録
-live/             ライブ配信
-  config.py         配信の設定。common/ の再輸出ファサードでもある
-  schedule.py       JSTの開始・終了時刻と配信タイトル
-  prepare_broadcast.py  当日枠だけを作り共有DBへ保存する4時ジョブ
-  live.py           配信のメインループ
-tools/            手動で使う道具（プール構築・OBS シーン構築・Unity 単体確認）
-setup/            systemd ユニットと Xorg/openbox の設定＋インストーラ
-data/             quiz.csv / bgm/ / motions/（生成物）
-                  ※ OBS が読む字幕などは SUBTITLE_DIR（リポジトリの外）に書く
-logs/             pipeline_* quiz_* live_* ardy_*
-.env              **リポジトリのルートに1本だけ**。shorts と live が同じものを読む
+スケジュールの定義は[setupのtimer](./setup/)と[live/schedule.py](./live/schedule.py)です。配信枠の事前準備は、インストール済みの配信timerの曜日を参照します。未インストール時はリポジトリ内のtimerを参照します。
+
+## 2. システム構成
+
+### 2.1 処理と外部サービス
+
+```mermaid
+flowchart LR
+    SNS[Bluesky / Nagi] --> Shorts[動画生成パイプライン]
+    Quiz[クイズCSV] --> Shorts
+    Shorts --> Upload[Bluesky / YouTube]
+    YouTube[YouTube Liveチャット] --> Live[ライブ制御]
+    Live --> Unity[Unity]
+    Unity --> OBS[OBS Studio]
+    OBS --> YouTube
+    Shorts --> Shared[共通処理]
+    Live --> Shared
+    Shared --> TTS[Irodori / VOICEVOX]
+    Shared --> LLM[Ollama / Gemini]
+    Shared --> ARDY[ARDY]
+    Shared --> DB[PostgreSQL / Bot Memory API]
+    Live --> Presence[biorhythm_server]
 ```
 
-```
-                    YouTube Live
-                   ↗ RTMP      ↖ liveChatMessages.streamList
-              [OBS Studio]          │
-                   ↑ ウィンドウキャプチャ │
-        [Unity 常駐 :99]             │
-                   ↑ HTTP :2338      │
-                   └──────────┬──────┘
-                       [live/live.py]
-                              ├→ Irodori-TTS   localhost:10110 (bot-tan-tts)
-                              ├→ VOICEVOX      localhost:10101 (フォールバック・字幕時刻, CPU)
-                              ├→ ollama        localhost:11434 /api/chat（返答生成）
-                              ├→ Gemini        native REST + googleSearch（調べもの）
-                              ├→ ollama        localhost:11434（調べるか否かの判定）
-                              ├→ ARDY          127.0.0.1:2337（非同期）
-                              ├→ PostgreSQL    192.168.1.200:5432
-                              ├→ biorhythm     localhost:3002
-                              └→ $SUBTITLE_DIR/*.txt（OBS が読む字幕・コメント欄）
+| 依存先 | 用途 | 標準接続先・管理元 |
+|---|---|---|
+| Unity | VRMの収録・ライブ描画、音声再生 | ライブHTTP API: `localhost:2338` |
+| OBS Studio | 映像・字幕・音声の合成とRTMP送出 | obs-websocket。接続情報は`.env` |
+| Irodori-TTS | 標準の音声合成 | `localhost:10110`、`bot-tan-tts` |
+| VOICEVOX | 音声合成の代替、字幕用モーラ時刻の取得 | `localhost:10101` |
+| Ollama | ローカルLLMによる台本・返答・分類 | `localhost:11434` |
+| Gemini | LLM切り替え先、Google検索を伴う調査 | APIキーを設定 |
+| ARDY | テキストからVRMAモーションを生成 | `127.0.0.1:2337`、`text-to-vrma` |
+| PostgreSQL / Bot Memory API | 投稿、会話、配信枠、記憶・読み辞書の参照と保存 | `.env`で接続先を設定 |
+| biorhythm_server | 気分・活動・energyの取得 | `localhost:3002`、`bsky-affirmative-bot` |
+| Discord | ジョブ失敗・復旧・配信品質の通知 | Webhookを設定 |
+
+### 2.2 リポジトリ構成
+
+```text
+common/           設定、LLM、音声、ARDY、DB、OAuth、ライセンス確認の共通処理
+shorts/           夜の縦動画・朝のクイズの生成と投稿
+live/             配信枠、チャット、会話、記憶、Unity・OBSの制御
+setup/            systemd、Xorg、openboxの設定とインストーラ
+  patches/        外部サーバーに必要な互換性修正
+tools/           OBSシーン構築、背景導入、モーションプール構築など
+data/            クイズ、BGM、演出素材、モーションなど
+docs/            調査記録と参照資料
+tests/           自動テスト
+run.sh           夜の縦動画の起動
+run_quiz.sh      朝のクイズの起動
+run_live.sh      ライブ配信の起動
+.env.example     環境設定のテンプレート
 ```
 
-## 関連リポジトリ
+### 2.3 関連リポジトリ
 
-| | 役割 |
+| リポジトリ | 管理する内容 |
 |---|---|
-| `bsky-affirmative-bot` | ペルソナ（`SYSTEM_INSTRUCTION`）・energy・記憶DB の**原典** |
-| `bottan-video` | Unity プロジェクト（Shorts の収録用） |
-| `bottan-video-dev` | Unity プロジェクト（配信用。`-liveMode` で常駐させる） |
-| `text-to-vrma` | ARDY エンジン本体 |
+| `bsky-affirmative-bot` | ペルソナの原典、記憶DB、Bot Memory API、biorhythm、SNS運用 |
+| `bottan-video` | Shorts収録用Unityプロジェクト |
+| `bottan-video-dev` | `-liveMode`で常駐する配信用Unityプロジェクト |
+| `text-to-vrma` | ARDYエンジン |
+| `bot-tan-tts` | Irodori-TTSサーバー、参照音声、音声利用条件 |
 
-## OBS が読むファイルの置き場
+## 3. 機能仕様
 
-字幕・コメント欄・時計・BGM は **`~/.local/share/bottan-live/`**（リポジトリの外）に置く。
+### 3.1 夜の縦動画
 
-OBS のシーンはファイルを絶対パスで掴むので、これらをリポジトリの中に置くと
-「systemd は本番から起動しているのに、OBS は dev のファイルを見ている」状態になる。
-統合前に実際にそうなっていて、本番の配信では字幕とコメント欄が出ない状態だった。
+1. Bluesky / Nagiの投稿と関連情報を取得し、紹介対象を選択します。
+2. 掴み・紹介・決め台詞がループにつながる台本を生成します。他人の投稿は他人の話として扱い、botたん自身の体験に置き換えません。
+3. 音声と字幕時刻を生成し、IrodoriのGPU解放を確認してからARDYでモーションを生成します。
+4. ARDYを停止してUnityで収録し、ffmpegで字幕、BGM、カット、山場の演出を合成します。
+5. MP4と投稿用JSONを作成し、Blueskyへ投稿します。投稿記録は別システムのおやすみポストでも利用します。
 
-```
-~/.local/share/bottan-live/
-├── obs/     subtitle_ja.txt / subtitle_en.txt / comments.txt / clock.txt
-│            energy.html（すべて実行時に書かれる）
-└── bgm/     ohirusugi.mp3（data/bgm/ からのコピー。差し替えたら両方直すこと）
-```
+`data/chibi/`のPNGと`data/se/`の効果音を使って山場を演出します。素材がない演出は省略します。`SKIP_BLUESKY=true`では投稿を省略し、MP4と投稿用JSONを残します。夜版では`SKIP_YOUTUBE=true`も同じ意味です。
 
-`.env` の `SUBTITLE_DIR` がここを指す。本番と dev の両方で同じ値にしておくこと。
+### 3.2 朝のクイズShorts
 
-### energy ゲージ
+クイズCSVから問題を選択し、出題・思考時間・解答を含む台本、音声、モーション、縦動画を生成してYouTubeへ投稿します。使用済み問題は`data/quiz_used.csv`で管理します。
 
-画面左下の `energy` ブラウザソースは `file://.../obs/energy.html` を読む。
-`live/gauge.py` が `energy.get_energy()`（biorhythm_server の記憶の内部 API `GET /bot/presence`）の値で
-HTML を書き直し、HTML 側に埋めたスクリプトが
-`ENERGY_REFRESH_SEC`（既定30秒）ごとに自分を読み直す。
-**ブラウザソースはローカルファイルの変更を自前では監視しない**ので、この
-自己リロードが無いと数値が固まったままになる。
+`--quiz-id`で問題を指定でき、`--stage`で台本・音声・動画再合成の段階を選べます。`--preview`はUnity収録を単色背景に置き換えます。投稿抑止と問題の消費抑止は、それぞれ`SKIP_YOUTUBE=true`と`QUIZ_NO_CONSUME=true`で指定します。
 
-数値は**小数第一位まで**出す。配信コメント1件あたりの加算が +0.1% なので、
-整数だと視聴者から見て変化が分からない。
+### 3.3 配信枠とライブのライフサイクル
 
-色は energy で変わる: 70以上=橙 / 35以上=緑 / それ未満=青。
-背景が明るい日でも読めるよう、半透明のパネルを敷いてある。
+事前準備ジョブは次の2回の枠を用意します。DBに保存した枠、またはYouTube上の再利用可能な枠を確認し、重複作成を避けます。この段階ではUnity・OBS・RTMP送出を起動しません。
 
-## セットアップ
+| 時刻（JST） | ライブの動作 |
+|---|---|
+| 20:40 | ディスプレイの再初期化・描画確認、ライセンス確認、モデル読み込み、Unity・OBS起動、当日枠への送出準備 |
+| 開始前 | YouTubeの`testing`遷移とUnityの実測fpsを確認 |
+| 21:00 | `live`へ遷移し、挨拶とコメント対応を開始 |
+| 21:55 | 通常の会話ループを終了し、クロージングを開始 |
+| 22:00 | 配信を終了し、送出停止・終了処理を実行 |
 
-### 1. Python
+時刻は`LIVE_START_HHMM`、`LIVE_CLOSING_HHMM`、`LIVE_END_HHMM`で設定します。起動時刻はtimer側で変更します。クロージング開始後に届くコメントは通常の返答処理の対象外です。
+
+### 3.4 会話と記憶
+
+- YouTubeチャットを取得し、優先度と受信時刻に従って返答します。キューの上限は200件です。
+- 一般コメントは既定180秒を超えて滞留すると破棄します。スパチャ・メンバー・オーナーのコメントは古さだけでは破棄しません。
+- コメントがない場合は、記憶・SNS投稿・近況などからフリートークを生成します。既定の待機時間は25秒です。
+- 話題の続きは既定8秒の間隔で、最大2段階まで掘り下げます。コメントが来た場合は、割り込み可能な発話を文の切れ目で切り上げます。
+- 話題の重複と同じ近況への偏りを抑制します。在庫を使い切った場合は再利用します。
+- 自分の出来事と他人の投稿をプロンプト内で分け、会話履歴にも出どころを保持します。
+- 調査が必要な語は分類・記録し、後続の記憶検索に利用します。返答のたびに外部検索の完了を待つ運用にはしません。
+
+記憶はSQLとBot Memory APIを併用します。energyのコメント加算は`bsky-affirmative-bot`側が保存済みコメントを取り込んで行い、配信側では二重加算しません。
+
+### 3.5 音声・字幕・モーション
+
+標準音声はIrodori-TTSです。読み辞書を適用し、300字以内に分割して合成します。復旧できない合成エラーは文全体をVOICEVOXで再合成します。`TTS_ENGINE=voicevox`でVOICEVOXを主エンジンにできます。
+
+字幕・モーションの尺はWAVの実測時間に合わせます。モーラ時刻はVOICEVOXから取得し、Irodoriの実測尺へ伸縮するため、Irodori使用時もVOICEVOXが必要です。読み辞書は共有DBで管理し、字幕の日本語表記は置換しません。
+
+ライブはOllama・Irodori・ARDYを同時稼働させます。GPU OOMやIrodoriの読み込み容量不足が発生した場合、その配信中のARDYを停止し、保存済みモーションで継続します。モーション指示の安全化と見た目の調整は共通処理で管理します。
+
+## 4. データと設定
+
+### 4.1 設定の管理
+
+リポジトリルートの`.env`を動画とライブで共有します。設定項目の説明は[.env.example](./.env.example)、共通パスは[common/env.py](./common/env.py)、ライブ固有の既定値は[live/config.py](./live/config.py)を参照してください。起動スクリプトへ渡した`KEY=VALUE`は環境変数として適用されます。
+
+| 分類 | 主な設定 |
+|---|---|
+| Unity | `UNITY_EXE`、`UNITY_PROJECT`、`UNITY_LIVE_PROJECT`、`LIVE_DISPLAY` |
+| LLM | `USE_LOCAL_LLM`、`LOCAL_LLM_MODEL`、`GEMINI_API_KEY` |
+| 音声 | `TTS_ENGINE`、`IRODORI_URL`、`IRODORI_VOICE`、`VOICEVOX_URL` |
+| 投稿・配信 | YouTube OAuth、Bluesky資格情報、`LIVE_YOUTUBE_PRIVACY` |
+| OBS | `OBS_HOST`、`OBS_PORT`、`OBS_PASSWORD`、`OBS_COLLECTION`、`OBS_PROFILE` |
+| 表示・音声経路 | `SUBTITLE_DIR`、`LIVE_AUDIO_SINK` |
+| 検証 | `SKIP_BLUESKY`、`SKIP_YOUTUBE`、`QUIZ_NO_CONSUME`、`DRY_RUN`、`FAKE_COMMENTS` |
+
+資格情報は`.env`やOAuthトークンで管理し、リポジトリへ追加しません。YouTube OAuthトークンは動画とライブで共有します。
+
+### 4.2 OBSの参照先
+
+本番と開発環境で字幕の参照先がずれないよう、`SUBTITLE_DIR`にはリポジトリ外の共通の絶対パスを設定します。`.env.example`は`~/.local/share/bottan-live/obs`に相当するパスを指定しています。未設定時のコードの既定値は`data/obs`です。
+
+| 表示・音声 | 現行のシーン構築ツールが設定する参照先 |
+|---|---|
+| 日本語・英語字幕 | `SUBTITLE_DIR/subtitle_ja.txt`、`subtitle_en.txt` |
+| コメント・時計 | `SUBTITLE_DIR/comments.txt`、`clock.txt` |
+| energy | `http://localhost:3002/image.png` |
+| botたんの声 | `LIVE_AUDIO_SINK`のmonitor（既定`bottan_live.monitor`） |
+| BGM | リポジトリ内の`data/bgm/ohirusugi.mp3` |
+
+`live/gauge.py`は`SUBTITLE_DIR/energy.html`も生成しますが、`tools/build_scene.py`のブラウザソースは上記のURLを使用します。字幕ファイルに加え、発話中はobs-websocket経由の表示更新も行います。
+
+### 4.3 成果物と記録
+
+動画パイプラインはMP4、音声、タイムライン、投稿用データなどを生成します。夜版の投稿抑止時はログに表示されるMP4と`*_bluesky.json`を確認してください。一時ファイルの保持は`KEEP_TEMP`、クイズでは`--keep-temp`でも指定できます。
+
+ジョブログは`logs/pipeline_*`、`logs/quiz_*`、`logs/live_*`に保存します。Unity収録ログは動画と同じ接頭辞の`_unity.log`へ保存します。会話・コメント・配信枠などの記録は共有DBで管理します。
+
+## 5. 導入手順
+
+### 5.1 前提環境
+
+Linux、systemd、Pythonのvenv、ffmpeg、Unityと対象プロジェクトを用意してください。ライブ配信にはNVIDIA GPUと対応ドライバ、Xorg、openbox、GL診断ツール、OBS Studio、PulseAudioまたは互換のPipeWire環境が必要です。シーン用フォントはNoto Sans CJK JPを使用します。
+
+音声サーバー、ARDY、LLM、共有DB・APIは別途構築し、接続可能な状態にします。GPU・RAMの必要量は使用モデルと同居サービスで変わるため、過去の測定値を固定の容量要件にはしません。外部サーバーの互換性修正は[setup/patches](./setup/patches/README.md)を参照してください。
+
+### 5.2 Pythonと環境設定
+
+リポジトリルートで実行します。`.env`のコピーは初回のみ行い、既存設定を上書きしないでください。
 
 ```sh
 python3 -m venv venv
 ./venv/bin/pip install -r requirements.txt
-cp .env.example .env      # Shorts と配信で同じ .env を読む。キーは1本にまとまっている
+cp .env.example .env
 ```
 
-### 2. GPU 仮想ディスプレイ（必須）
+`.env`内のパス、資格情報、各サービスの接続先を環境に合わせて編集します。Ollamaのコンテキスト長は`common/llm.py`の`OLLAMA_NUM_CTX`と[サーバー設定](./setup/ollama-override.conf)の`OLLAMA_CONTEXT_LENGTH`を合わせます。
 
-**Xvfb では配信できない。** Mesa の llvmpipe（CPU 描画）になり、1920x1080 の
-URP + VRM では実測 **1.7fps** しか出ない。NVIDIA ドライバでモニタ非接続の
-仮想スクリーンを作って GPU に描かせる。
+### 5.3 ライブ用ディスプレイ
+
+[setup/xorg-bottan-live.conf](./setup/xorg-bottan-live.conf)のGPU BusIDを確認してから導入します。`:99`は配信用に確保し、他の仮想ディスプレイ用途では別番号を使用します。
 
 ```sh
 sudo bash setup/install_xorg.sh
-```
-
-既存デスクトップ（GDM が管理する `:0`）には触らない。`/etc/X11/xorg.conf.d/` ではなく
-`/etc/X11/xorg-bottan-live.conf` を置き、`Xorg -config` で明示的に読ませている。
-
-確認:
-```sh
-DISPLAY=:99 glxinfo -B | grep -i renderer   # NVIDIA GeForce ... と出れば成功
-# 数千〜数万 fps 出れば成功。__GL_SYNC_TO_VBLANK=0 を落とすと 1fps に見える
+DISPLAY=:99 glxinfo -B
 DISPLAY=:99 __GL_SYNC_TO_VBLANK=0 timeout 12 stdbuf -o0 glxgears
 ```
 
-**`glxinfo` が NVIDIA と答えても、絵が出ているとは限らない。** レンダラも GL
-コンテキストも正常なまま、GL クライアントだけが 1fps に落ちることがある。
-2026-09-10 の配信はこれで、最初から最後まで 0.1〜1.9fps の止まった絵を14分流している。
+NVIDIAレンダラと実測の描画速度を確認します。プロセスの生存や公称リフレッシュレートだけでは判定しません。ライブ用Unityはソフトウェアレンダラを拒否します。Xvfbは動画収録には使用しますが、ライブの描画環境には使用しません。
 
-このとき何が正常に見えていたか:
+配信前は`bottan-live-display.service`がディスプレイを再初期化します。手動復旧には`setup/reset_display.sh`を使用します。Xorg再起動は`:99`上のUnity・OBSに影響するため、配信停止後に行います。
 
-| 見たもの | 出た値 | 実態 |
-|---|---|---|
-| `glxinfo -B` のレンダラ | NVIDIA GeForce RTX 5070 Ti | GL 自体は GPU に載っている |
-| `xrandr --current` | 59.95Hz | モードの公称値。絵が出ている保証にならない |
-| `nvidia-smi` | Xid なし・クロック定格・スロットリングなし | GPU の計算は正常 |
-| OBS の出力フレーム数 | 30fps・skip 89 | 止まった窓を正しくキャプチャし続ける |
-| Unity のプロセス | 生存 | `is_alive()` は真を返す |
+### 5.4 OBSと素材
 
-**原因は「GPU が1枚しかないのに X サーバが2つある」こと。** `:99` は gdm より後に
-起動していないと描画を締め出され、GPU が空いていても 1.0fps に張り付く。
-2026-09-11 の実測:
-
-| 条件 | `:99` の glxgears |
-|---|---|
-| gdm 停止 | 56,142fps |
-| gdm 起動・`:99` は gdm より前に起動 | 1.0fps |
-| gdm 起動・`:99` を gdm の後に作り直す | 59,485fps |
-
-起動順は保証できない（`bottan-live-xorg` も gdm も `multi-user.target`）。だから
-配信の直前に必ず作り直す。`bottan-live-display.service` が `setup/reset_display.sh` を
-呼び、`:99` を入れ直して実測してから配信へ通す。手で直すときも同じ。
-
-```sh
-sudo bash setup/reset_display.sh          # 作り直して実測まで見る
-sudo systemctl restart bottan-live-xorg   # 最小限でよければこれだけ
-```
-
-**`__GL_SYNC_TO_VBLANK=0` を落とさないこと。** `:99` は NoScanout で表示クロックを
-持たないので、vblank を待つ GL クライアントは描けていても 1fps を返す。手で測るときも
-必ず渡す。Unity には `live/unity_live.py` が渡している。
-
-```sh
-DISPLAY=:99 __GL_SYNC_TO_VBLANK=0 timeout 12 stdbuf -o0 glxgears
-```
-
-**`:0`（デスクトップ）の fps は判定に使わないこと。** ロックされた X11 セッションの
-GL は正常時も進まない。`:99` が 60fps で健全なときに `:0` は13秒で1フレームも
-進まず、`loginctl` は `Active=no LockedHint=yes` を返していた。無人運用の 21:00 に
-画面はロックされているので、`:0` は常に遅く出る。
-
-**`nvidia-smi` の瞬間値ではなく `nvidia-smi pmon` で見ること。** ollama が SM を
-87〜92% 使っている時間帯があり、そのあいだは描画が本当に締め出される。
-`utilization.gpu` の1サンプルでは掴めない。
-
-切り分けの全文と、潰した仮説の一覧は
-`docs/investigations/2026-09-11-display-starvation.md`。
-
-この状態の Unity は `PresentContextGL` の中で abort する（`WindowGLES::EndRendering`
-→ NVIDIA ドライバ内で `SIGABRT`）。2026-09-10 は同じスタックで2回落ちた。
-配信スクリプト側は `LIVE_MIN_FPS` で live へ入る前に実測して止める。
-
-**`:99` はこのサービスの予約番号。** 他のプロセスに先に取られると Xorg が起動できず、
-`Restart=always` で永久にリトライする状態になる（実際に踏んだ）。
-`unity_live._start_xvfb` のフォールバック用 Xvfb は 120 番以降から探すようにしてある。
-
-**ただし番号を予約する仕組みは無い。** 2026-09-10 22:39 には Orca IDE が
-`Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp -terminate` を起こして先に取り、
-`bottan-live-xorg` が上がれなくなった。このとき `glxgears` は **5694fps** を返す。
-速い値が出るので一見よさそうに見えるが llvmpipe（CPU 描画）で、配信の
-URP + VRM では 1.7fps しか出ない。**レンダラ名まで見ること。**
-
-```sh
-fuser -v /tmp/.X11-unix/X99            # 誰が :99 を掴んでいるか
-DISPLAY=:99 glxinfo -B | grep -i renderer
-```
-
-`unity_live.start()` は llvmpipe / softpipe / swrast / zink を見つけたら起動を断る。
-
-**Orca IDE 側の対処。** `orca-ide serve` の表示番号 99 はバンドルに焼き込まれた
-定数で、環境変数でもフラグでも変えられない（`app.asar` 内の `M4=99`）。ただし
-**`DISPLAY` が設定されていて、その番号が生きていれば、Orca はそれを使って
-`:99` には一切触らない。** 逃げ道はここだけなので、専用の Xvfb を別番号で
-先に上げておく。
-
-```ini
-# ~/.config/systemd/user/orca-xvfb.service
-[Service]
-ExecStart=/usr/bin/Xvfb :97 -screen 0 1280x1024x24 -nolisten tcp
-Restart=always
-```
-
-```ini
-# ~/.config/systemd/user/orca-serve.service
-[Unit]
-Requires=orca-xvfb.service
-After=orca-xvfb.service
-[Service]
-Environment=DISPLAY=:97
-ExecStart=%h/.local/bin/orca-ide serve --pairing-address <アドレス>
-Restart=always
-```
-
-`-terminate` は付けないこと。Orca が自前で起こす Xvfb には付いているが、
-それだと Orca を再起動するたびに Xvfb が落ちて番号が空き、次の起動で
-`:99` を取りに行く余地ができる。ログインしていない間も走らせるなら
-`loginctl enable-linger suibari` も要る。
-
-**`DISPLAY` を渡さない場合、Orca は `:99` が生きていればそのクライアントとして
-入り込む。** Xvfb を起こさないので配信は 1fps にはならないが、Electron の窓が
-配信用ディスプレイに乗る。`:99` から追い出しておくほうが安全。
-
-**配信用の Xorg はデスクトップのセッションが動いている間は起動し直せない。**
-NVIDIA の X ドライバが `(EE) Failed to acquire modesetting permission` で
-初期化に失敗する。`:99` が上がれるのは GDM の Xorg より先に走る起動時だけなので、
-落ちたときの復旧手段は `systemctl restart` ではなく**再起動**。
-
-### 3. OBS
-
-**OBS は `:99` 側で起動すること。** X11 のウィンドウキャプチャは
-「OBS 自身が接続している X ディスプレイ」の窓しか列挙できない。デスクトップ（`:0`）で
-起動した OBS のプルダウンに `:99` の Unity は**絶対に出てこない**。
+OBSはUnityと同じ`:99`で起動します。obs-websocketを有効にし、`.env`へパスワードを設定します。配信用のプロファイル・シーンコレクションの標準名は`bottan-live`です。
 
 ```sh
 DISPLAY=:99 flatpak run --env=DISPLAY=:99 com.obsproject.Studio
 ```
 
-配信時は `live.py` が `obs.launch()` で自動的にこの形で起動する（`OBS_LAUNCH=false` で抑止）。
-
-**`:99` にはウィンドウマネージャが必須。** OBS の XComposite キャプチャは EWMH 準拠の
-WM が居ないと起動時に
-
-```
-window manager does not support Extended Window Manager Hints (EWMH).
-XComposite capture disabled.
-```
-
-と言ってプラグインごと読み込みを諦め、「ウィンドウキャプチャ」という選択肢自体が
-消える。`setup/install_xorg.sh` が `bottan-live-wm.service`（openbox）まで入れる。
-
-`obs-websocket`（[ツール]→[WebSocket サーバー設定]）を有効にし、パスワードを
-`.env` の `OBS_PASSWORD` に書く。
-
-**配信用の設定は普段使いの OBS と分けてある。** シーンコレクションとプロファイルは
-どちらも `bottan-live`（`.env` の `OBS_COLLECTION` / `OBS_PROFILE`）で、`obs.launch()` が
-`--collection` / `--profile` で名指しして開く。デスクトップ側で OBS を触って別の
-コレクションを開いたままでも、配信は必ず `bottan-live` で始まる。
-
-ただし **OBS を2つ同時に起動しないこと。** 設定ディレクトリは共有なので、
-後から終了したほうがシーンのファイルを上書きする。`:99` の様子を見たいときは
-OBS をもう一つ起動するのではなく `tools/obs_shot.py` を使う。
-
-**シーンは `tools/build_scene.py` が組む。**
+Unityが起動し、WebSocketへ接続できる状態でシーンを構築します。このコマンドは対象シーンを作り直します。
 
 ```sh
-./venv/bin/python tools/build_scene.py     # 何度でも実行できる（作り直す）
-./venv/bin/python tools/obs_shot.py /tmp/now.png   # 出力を PNG で確認
+./venv/bin/python tools/build_scene.py
+./venv/bin/python tools/obs_shot.py /tmp/bottan-live.png
 ```
 
-配信中にプログラムが触るのは RTMP 設定と配信の開始・停止だけ。
+映像は1920×1080のシーンに合成します。Unityの音声は専用null sinkへ出力し、OBSがmonitorから取り込みます。BGMは-20dBを基準とし、声をサイドチェイン入力にしてダッキングします。配信エンコーダは起動前にx264へ設定します。OBSを複数同時に起動すると共有設定が上書きされるため、画面確認には撮影ツールを使用します。
 
-| レイヤ | ソース | 中身 |
-|---|---|---|
-| 最背面 | ウィンドウキャプチャ (XComposite) | Unity の Game View（`DISPLAY=:99`） |
-| 字幕(日) | テキスト (FreeType 2) | `data/obs/subtitle_ja.txt` をファイル読み込み |
-| 字幕(英) | テキスト (FreeType 2) | `data/obs/subtitle_en.txt`（日本語より小さめ） |
-| コメント欄 | テキスト (FreeType 2) | `data/obs/comments.txt` |
-| energy | ブラウザ | `http://localhost:3002/image.png`（biorhythm_server が公開済み） |
-| 時計 | テキスト (FreeType 2) | `data/obs/clock.txt` |
-| botたんの声 | 音声入力キャプチャ (PulseAudio) | `bottan_live.monitor`（下記） |
-| BGM | メディア | `data/bgm/ohirusugi.mp3` をループ（-20dB）+ botたんの声にダッキング |
+背景は`tools/install_background.py`で導入できます。BGM、ちびキャラ、効果音は実行するチェックアウトへ配置し、必要な素材クレジットを概要欄へ記載します。
 
-#### 音声の経路
+### 5.5 YouTube認可とUnityライセンス
 
-**Unity の声は OBS のシーンに音声ソースを1本置かないと配信に乗らない。**
-BGM は OBS の中（ffmpeg_source）で完結しているので鳴るが、Unity の音は
-OS のサウンドサーバを経由する。初回の配信は「BGM は流れるのに声だけ出ない」で
-これが原因だった。
-
-```
-Unity ──(PULSE_SINK=bottan_live)──▶ bottan_live ──▶ bottan_live.monitor ──▶ OBS
-```
-
-配信専用の null シンクを1本使う（`audio.ensure_sink()` が `live.py` から自動で作る。
-名前は `.env` の `LIVE_AUDIO_SINK`）。既定の出力をそのまま拾わない理由は2つ:
-
-- PipeWire は実デバイスが1つも無いときだけ `auto_null` を自動生成する。実デバイスが
-  現れると消えるので、OBS 側で名前を決め打ちできない
-- 既定の出力を拾うと、ブラウザの音や通知音まで配信に乗る
-
-BGM のダッキング（botたんが喋る間だけ BGM を沈める）は、この音声ソースを
-サイドチェイン入力にしたコンプレッサーで `tools/build_scene.py` が仕込む。
-
-切り分けは `pactl list short sink-inputs`（Unity がシンクに繋がっているか）と
-OBS のログの `pulse-input: Started recording from 'bottan_live.monitor'`。
-
-Linux の OBS にテキスト(GDI+)は無い（Windows 専用）。**テキスト (FreeType 2)** を使う。
-テキストソースは**「テキストファイルから読み取る」**に設定すること。Python 側は
-一時ファイル→`os.replace` でアトミックに差し替えるので、書き込み途中の
-空ファイルを読まれることはない。
-
-#### エンコーダは x264（CPU）固定
-
-`obs.launch()` が起動前にプロファイルの `basic.ini` へ書き込む。**websocket 経由で
-書いても効かない**（OBS は「シンプル」出力のエンコーダをプロファイル読み込み時に
-一度だけ決めるため）。
-
-既定の NVENC を使うと、この機械では配信開始が失敗する:
-
-```
-cuda_ctx_init: ... CUDA_ERROR_OUT_OF_MEMORY (2): out of memory
-Already in non_texture encoder, can't fall back further!
-Stream output type 'rtmp_output' failed to start!
-```
-
-GPU が ARDY・Unity・ollama で埋まっていて NVENC のぶんが残らない。
-**OBS はここからソフトウェアエンコーダへ落ちてくれない**ので、はじめから x264 を
-指定する。1080p30 なら CPU 側に余裕がある。
-
-VRAM の内訳（RTX 5070 Ti / 16,303 MiB）:
-
-| | VRAM |
-|---|---|
-| ollama `llama-server`（gemma-4-12B QAT UD-Q4_K_XL, num_ctx 32768, KV q8_0） | 約7,100 MiB（2026-09-05。26B UD-IQ3_S のときは約11,470 MiB） |
-| ARDY engine（テキストエンコーダは CPU） | 1,102 MiB |
-| Unity（**配信のみ**。`:99` の実GPU Xorg） | 408 MiB |
-| Xorg(:0 + :99) + gnome-shell | 251 MiB |
-| **配信中の単純合計 / 総容量** | **約13,231 / 16,303 MiB** |
-
-**配信構成は 16GB に収まる**。32768 + 画像対応 runner、ARDY、Unity の同居でも
-2026-09-01 の起動ログでも、Ollamaを載せた後に約2.2GBの余裕が残った。
-OBS を NVENC にすると足りなくなるので x264 のままにすること（下の「OBS」を参照）。
-別ホストの bsky-affirmative-bot が使う埋め込みモデル（snowflake-arctic-embed2, 1.2GB）は
-**配信中は載らない**。
-
-システム RAM（32GB）の内訳と、**足りないと何が起きるか**:
-
-| | RSS |
-|---|---|
-| ollama `llama-server` | 約9.4GB |
-| ARDY engine（8Bのテキストエンコーダを CPU に載せる） | 約15GB（`ARDY_MIN_AVAIL_GB` 参照） |
-| VOICEVOX（CPU 推論） | 約450MB |
-| OBS | 約1.1GB |
-
-配信中に要らないものは、配信の準備が自分で退かす（以前は手で落とす運用で、
-2026-09-09 は Unity Hub が開いたままだった）。
-
-| 何を | どこで |
-|---|---|
-| `bot-tan-imagegen` の uvicorn（RSS 543MB＋swap 1.0GB） | `setup/bottan-live.service` の `Conflicts=imagegen.service`。`ExecStopPost` で戻す |
-| Unity Hub（Electron + Chromium が常駐する） | `prepare()` の先頭で `unity_live.close_unity_hub()`。ARDY と Unity を起こす前に退かす |
-
-**chrome はまだ手動なので、配信前に落としておくこと。** 足りなくなると OBS が
-スワップアウトし、配信開始でエンコーダを作るときにページインを待たされ、
-描画スレッドも 33ms に間に合わなくなる。
-OBS 起動時の空き RAM と描画落ちの相関:
-
-| 起動時の空き | lagged frames due to rendering lag/stalls |
-|---|---|
-| 503MB | 96.7%（21分間ずっと。出力はほぼ止まっていた） |
-| 1.8GB | 0.1〜0.3% と 26.2%／68.5% が混在 |
-| 1.7GB | 0.0〜0.3%（1時間走りきった回が7本） |
-
-**スワップは SSD に置くこと。** 2026-09-09 まで 16GB ぶんが `/mnt/data`
-（WDC WD20EARX = 5400rpm の HDD）に載っていた。優先度は SSD 側の 2GB が -2、
-HDD 側が -3 なので、2GB を超えたぶんは全部 HDD へ落ちる。この日は 9.1GB まで
-使い、7GB 前後が HDD 上だった。ランダム読みでこのディスクは振り切れ、
-VOICEVOX・Unity・OBS が同じ1本のスピンドルを取り合った。デスクトップも
-GNOME の5分無操作で消灯したあと復帰できず、モニターが「信号なし」のまま
-再起動するまで戻らなかった（gnome-shell を HDD から読み戻せなかった）。
-`setup/move_swap_to_ssd.sh` が SSD 上の 18GB 1本にまとめる。
-
-`vm.swappiness` は `setup/99-bottan-live.conf` で 10 に下げている
-（既定の 60 では OBS のページまで退避される）。
-
-`setup/quiet_desktop.sh` は、配信枠で目を覚ますものを退かせる。掴んでいる
-RAM（実測で合計 900MB 前後）より、**寝ていたものが配信中に起きてディスクを
-触ること**が問題で、そのとき OBS の送出と同じディスクを取り合う。実際
-`apt-daily.timer` は既定が `*-*-* 6,18:00` に `RandomizedDelaySec=12h` で、
-18:00 の回が 18:00〜翌06:00 へ散る——配信枠のど真ん中で、2026-09-18 は
-21:14:21 に起動していた。これを 6時と13時に寄せ、gnome-software などの
-autostart を止める。**GUI で座って使うぶんには何も失わない**（アプリは
-今までどおり開ける。消えるのは更新の自動確認と通知だけで、自動更新そのものは
-`apt-daily-upgrade.timer` が 6〜7時に走らせ続ける）。`--undo` で全部戻る。
-
-配信開始の直前にメモリを
-点検して Discord に警告するが、**枠はもう作ってあるので止めはしない**。
-開始30秒後・60秒後に `stream_stats()` を見て、フレームが出ていなければ
-これも警告する（2026-09-07 は37秒で出力3フレームだった）。
-
-点検は3つを見る。**空き RAM だけを見てはいけない。**
-
-| 見るもの | 既定 | なぜ |
-|---|---|---|
-| `MemAvailable` | `OBS_MIN_AVAIL_GB` 3GB | 上の表のとおり、これが小さいと描画が落ちる |
-| swap 使用率 | `OBS_MAX_SWAP_RATIO` 55% | このホストでは常に高い（21時台の実測 31〜54%、どれも完走あり）。単独では良し悪しを分けられないので線は高め |
-| PSI `io/some avg10` | `OBS_MAX_IO_PRESSURE` 50 | swap の**量**ではなく**詰まり**。平常時は 1 前後、**2026-09-09 の最中は 72〜76** |
-
-2026-09-09 の配信がこの点検を素通りした。`MemAvailable` は 15.3GB あったが、
-**これは回収できるページキャッシュを含む**ので、匿名ページで RAM が埋まって
-いても大きく出る。その裏で swap は 6.2GB 使われていた。
-21:00 の配信開始と同時に swap への書き出しが 1320ページ/秒まで跳ね、
-`%iowait` 28.8%、空き RAM 1.0GB まで落ちて OBS の送出が止まり、
-21:08 に YouTube が `enableAutoStop` で配信を切った。
-
-### commit 比で判定するのをやめた経緯（2026-09-19）
-
-この点検には以前 `Committed_AS ÷ (RAM+swap)`（`OBS_MAX_COMMIT_RATIO`、目安
-100%）があり、09/09 を拾えた唯一の指標として入れたものだった。実測を並べると
-**良し悪しの順序が逆転していた**ので外した。
-
-| 日 | commit | swap | 結果 |
-|---|---|---|---|
-| 09/09 | **110%** | 33→48% | 21:08 に YouTube に切られた |
-| 09/17 | 130〜133% | 48% | `skipped_frames: 0 / 131,157` で完走 |
-| 09/18 | 125〜132% | 36〜50% | `skipped_frames: 0 / 131,036` で完走 |
-
-落ちた日のほうが commit は低い。`Committed_AS` は**触られもしない予約まで
-全部数える**ので、claude・codex・chrome・orca-ide といった配信と無関係な
-作業環境が同居しているだけで十数GB 積まれ、このホストでは常時 100% を超える。
-閾値を上げても黙るだけで判別力は戻らない。毎晩鳴る警告は読まれなくなるので、
-判定から外して `memory_note()` の診断欄にだけ残した。
-
-09/09 の真因は commit ではなく swap の**レイテンシ**で、当時 9.1GB のうち 7GB が
-5400rpm の HDD 上にあった（`setup/move_swap_to_ssd.sh` の冒頭に経緯）。SSD へ
-寄せた今は同じ使用率でも詰まらない。詰まりそのものを測るのが PSI。
-
-配信中も `MEMORY_LOG_SEC`（既定300秒）ごとに同じ内容をログへ残す。
-09/09 は記録が開始時の1行しかなく、swap がいつ膨らんだかは `sar` が
-別にあったから追えただけだった。
-
-**収録パイプラインの Unity は VRAM を使わない。** `:100` の Xvfb（Mesa llvmpipe＝
-CPUソフトウェアラスタライザ）へ描くので `nvidia-smi` に出てこない。
-代わりに CPU を食い切る（実測 load average 9.6）ので、**収録中はローカルLLMの
-応答が遅くなる**。配信の Unity は `:99` の実GPU Xorg なので、そちらだけ VRAM を使う。
-
-**実害が出るのは容量ではなく runner の作り直しのほう。** 容量は上表のとおり足りていて、
-CUDA OOM は一度も出ていない。壊れるのは **`num_ctx` が呼び出しごとに食い違ったとき**で、
-Ollama は同じモデルでも runner を作り直すため 11GB を読み直しにいく。
-2026-09-02 の実測では 32768 と 4096 が交互に来て `load_tensors` が **1時間に114回**、
-`%iowait 36%` に対し `%user 17%`（計算が進まず待っている状態）になり、ARDY の生成が
-17秒 → 129秒 → 300秒超（タイムアウト）と崩れて朝夜の Shorts からモーションが消えた。
-
-揃える場所は2つあり、**両方**要る。片方だけでは `num_ctx` を送らない呼び元が既定値で
-作り直しを起こす（OpenAI互換の `/v1/chat/completions` は `options` を黙って捨てるので、
-そういう呼び元は自覚なく既定値を要求する）:
-
-| | |
-|---|---|
-| `common/llm.py` の `OLLAMA_NUM_CTX` | このリポジトリが送る値 |
-| `setup/ollama-override.conf` の `OLLAMA_CONTEXT_LENGTH` | ollama のサーバ側の既定値 |
-
-疑ったときに見るコマンド:
-
-```bash
-journalctl -u ollama --since "1 hour ago" | grep -c load_tensors            # 0 が正常
-journalctl -u ollama --since "1 hour ago" | grep -oE "n_ctx_slot = [0-9]+" | sort | uniq -c
-```
-
-収録ログにも `[ARDY] 生成前の GPU: VRAM 空き ... / ollama 常駐 ...(ctx=...)` が出る。
-
-**ollama のモデルが常駐しているぶん、余裕は限られる。** 苦しくなったら上から順に:
-
-1. `LIVE_GROUNDING_GATE=regex`（判定に GPU を使わなくなる。ただし返答生成は
-   同じモデルなので、これだけではモデルは降りない）
-2. `USE_LOCAL_LLM=false` で Gemini へ戻す（返答生成のぶん 7GB がまるごと空く）
-
-（26B UD-IQ3_S だった頃は `options.num_gpu` を絞って MoE エキスパートを CPU へ
-逃がす手が使えた。12B は dense なのでこの手は効かない代わり、常駐が 11.5GB →
-7.1GB へ減って余裕そのものが増えている。）
-
-**VOICEVOX は 2026-08-30 から CPU。** 同梱の ONNX Runtime が cuDNN 8 で、
-sm_120（Blackwell）のカーネルを持っていないため GPU では推論できない。
-詳細と実測は `setup/voicevox-compose.yml` の冒頭。
-
-`obsws` の `StartStream` はリクエストが通っただけで成功を返すので、
-`Obs.start_stream()` は実際に `output_active` になるまで確かめる。これを見て
-いなかったせいで、YouTube 側の 180秒 タイムアウトまで原因が分からなかった。
-
-**待つ時間は `OBS_START_TIMEOUT`（既定60秒）。短くしないこと。** 通常は
-StartStream から `==== Streaming Start ====` まで 0.5〜6秒だが、裾は長い。
-15秒にしていた 2026-09-07 は 28.6秒かかり（x264 の初期化から libfdk_aac の
-生成まで20秒、RTMP のハンドシェイクに7秒）、配信は立ち上がっていたのに
-こちらが先に諦めた。しかも諦めたあとに OBS が走り出し、誰も見ていない配信が
-29秒ぶん流れた（`teardown()` の `stop_stream()` は、その時点でまだ
-`output_active` が false なので何もしない）。今は
-`Obs._cancel_start()` が StopStream を投げて取り消す。
-
-### 3.5 背景（フリー素材）
-
-背景は Unity のシーン内 Quad に貼る。配信モードでは `LiveStage.cs` が実行時に
-`Assets/background_live.jpg` を読むので、**Unity を開かずに差し替えられる**。
+YouTubeの事前認可は次のコマンドで行います。無人配信中に対話認可は行いません。
 
 ```sh
-./venv/bin/python tools/install_background.py ~/ダウンロード/room_night.png \
-    --credit "作者名 / 配布元URL"
+./venv/bin/python shorts/youtube_reauth.py
+./venv/bin/python -m common.unity_license --check
 ```
 
-1920x1080 に中央基準で切り抜いて入れる。クレジットは `data/background_credit.txt`
-に残るので、要クレジットの素材なら配信の概要欄に転記すること。素材を選ぶときは
-**商用利用の可否・加工の可否・クレジット表記の要否**の3点を必ず確認する。
-
-このファイルが無いときは既存の `background_classroom.jpg` のままになる（配信は
-止まらない）。
-
-現在使っている素材は `data/background_credit.txt`、BGM は `data/bgm/CREDIT.md` を見ること。
-
-背景の色みに合わせてライトの色も変えられる（既定は電球色）:
-
-| キー | 意味 |
-|---|---|
-| `LIVE_LIGHT_COLOR` | キーライトの色（`#RRGGBB`）。月明かりの部屋なら寒色に |
-| `LIVE_AMBIENT_COLOR` | 環境光の色（`#RRGGBB`） |
-
-構図と明るさは `.env` で振れる:
-
-| キー | 意味 |
-|---|---|
-| `LIVE_CAMERA_X` | 負にすると botたんが画面の左へ寄る（右にコメント欄の余白ができる） |
-| `LIVE_CAMERA_Z` | 大きくすると引きの画になる（既定 0.5） |
-| `LIVE_LIGHT_INTENSITY` | 平行光の明るさ（既定 0.85、色は電球色に固定） |
-| `LIVE_CHARACTER_YAW` | 体の向きの補正（度）。既定はカメラの方を向く。負にするとさらに画面の内側（コメント欄側）へ振れる |
-| `LIVE_MOUTH_CLOSE` | 無音時に表情の口成分を打ち消す強さ 0〜1（既定 1.0） |
-
-**カメラを左へ寄せたら体の向きも直すこと。** カメラを平行移動しても
-モデルの向きは +Z のままなので、寄せたぶんだけ「画面の外を向いている」ように
-見える（視線だけは LookAtOffset がカメラの子なので追従するが、首から下が
-付いてこない）。`LiveStage.AimCharacter()` がルートをヨーだけ回して
-カメラを向かせる。`LIVE_CAMERA_X=-0.25 / Z=0.70` なら yaw は -19.7度 になる。
-
-**`LIVE_MOUTH_CLOSE` を渡さないと、喋り終わったあと口が開いたままになる。**
-`ApplyEmotion` は常に合計 `_maxEmotionWeight` を5表情に配分するので「無表情」が
-存在せず、表情に含まれる口成分がそのまま残る。`VRM1FaceAnimation` 側には
-`Fcl_MTH_*` に負のウェイトを与えて口成分だけを差し引く補正が入っている
-（朝版パイプラインの `MORNING_MOUTH_CLOSE` と同じ仕組み）が、
-`-mouthCloseOnSilence` を渡さない限り無効のままになる。
-
-配信中に追い込むときは Unity を再起動せず HTTP で動かせる:
+Unityライセンスの定期確認は本番ユーザーで導入します。
 
 ```sh
-curl -X POST 127.0.0.1:2338/camera -d '{"x":-0.25,"y":1.35,"z":0.7}'
+bash setup/install_unity_license.sh
 ```
 
-背景の合わせ直しと体の向きの取り直しも `/camera` の中でやる。
+期限まで既定7日以内の場合、保存済み認証でUnity Hubを一時起動して更新します。確認不能・期限切れなら収録や配信を開始しません。有効なライセンスの更新だけに失敗した場合は警告して続行します。無人のユーザーtimer運用にはlingerが必要です。
 
-### 3.6 Shorts の山場の演出（ちびキャラ・効果音）
+### 5.6 自動実行
 
-夜版は、台本で `reaction` の付いた文（山場）で画面をちびキャラのイラストに
-切り替え、効果音を鳴らす（`shorts/chibi.py`）。どちらも無ければ黙って飛ばす。
-
-- ちびキャラ: `data/chibi/<差分名>.png`。差分名は `surprising` `down` `thinking`
-  `shame` `joyful` `smug` `sitting`。背景透過なら大きさ・余白はそろっていなくてよい
-  （描かれている部分の幅でそろえて縮める）
-- 効果音: `data/se/`。[効果音ラボ](https://soundeffect-lab.info/sound/anime/) の
-  素材を**手でダウンロードして**置く。規約で再配布が禁止されているので git には
-  入れない（`.gitignore` 済み）。サイトは直リンクを弾くので、ブラウザから落とすこと
-
-| ファイル | 効果音ラボの項目 | 鳴る場面 |
-|---|---|---|
-| `surprise1.mp3` | 驚く | surprising |
-| `cute-pose1.mp3` | 可愛く輝く1 | joyful |
-| `eye-shine1.mp3` | きらーん1 | smug |
-| `heart2.mp3` | 心臓の鼓動2 | shame |
-| `cute-sad1.mp3` | しょげる | down |
-| `recollection1.mp3` | 回想 | thinking |
-| `pa1.mp3` | パッ | sitting |
-| `kira2.mp3` | キラッ2 | ちびキャラを出さない山場（決め台詞）の寄り |
-
-本番は `~/work/bot-tan-youtuber` で動くので、`data/chibi/` と `data/se/` は
-**本番のチェックアウトにも置くこと**（ワークツリーに置いただけでは本番に出ない）。
-
-### 4. YouTube
-
-トークンは Shorts パイプラインと共用（`~/.bottan_youtube_token.pickle`）。
-スコープに `youtube.force-ssl` が含まれているので追加の認可は要らない。
-無い場合は `shorts/youtube_reauth.py` で通しておくこと
-（配信は無人なので、実行時に対話フローへは入らない）。
-
-### 5. 自動起動
+実際に運用するチェックアウトから導入します。インストーラは、そのディレクトリをsystemdの実行先として登録します。
 
 ```sh
 sudo bash setup/install_units.sh
+sudo systemctl start bottan-pipeline.timer bottan-quiz.timer bottan-live-prepare.timer bottan-live.timer
+systemctl list-timers 'bottan-*' --no-pager
 ```
 
-毎日04:00に次の2回の配信枠と視聴URLを用意する。毎週土曜20:40の本配信が当日の枠へ
-ストリームを紐づける。OBS・Unity・RTMP送出は20:40まで起動しない。
-20:40 起動 → 21:00 live → 21:55 クロージング → 22:00 complete。
-`Persistent=false` にしてあるので、起動に失敗した日を後から取り返さない
-（変な時刻に配信枠が増えるのを防ぐ）。
+インストーラはtimerを有効化しますが、起動は別途行います。動画timerは`Persistent=true`で停止中の実行を補います。配信・枠準備timerは`Persistent=false`で、過去の予定を後から実行しません。
 
-> **`systemctl start bottan-quiz.service` / `bottan-pipeline.service` は本番そのもの。**
-> 通し切ると YouTube に投稿され、クイズは `data/quiz_used.csv` を1問消費する。
-> 投稿せずに service 経由で動かしたいなら drop-in で環境変数を渡す:
-> ```sh
-> sudo systemctl edit bottan-quiz.service   # [Service] Environment=SKIP_YOUTUBE=true
-> ```
-> 手元で試すだけなら `./run_quiz.sh SKIP_YOUTUBE=true QUIZ_NO_CONSUME=true --preview`。
+## 6. 実行と動作確認
 
-## 動作確認
+### 6.1 投稿せずに動画を確認する
 
 ```sh
-# Unity 単体（HTTP・発話キュー・モーション・表情・時計の追随）
+./run.sh SKIP_BLUESKY=true
+./run_quiz.sh SHORTS_ALTERNATE_DAYS=false SKIP_YOUTUBE=true QUIZ_NO_CONSUME=true --preview
+```
+
+夜版はUnity収録まで実行します。クイズの例は投稿・問題消費を抑止し、レイアウト確認用の動画を生成します。台本だけを確認する場合はクイズに`--dry-run`を指定します。
+
+### 6.2 ローカルでライブを確認する
+
+```sh
 ./venv/bin/python tools/test_unity.py
-
-# 一気通貫（YouTube・OBS・ARDY 抜き、偽コメントを流し込む）
-./run_live.sh DRY_RUN=true SKIP_ARDY=true FAKE_COMMENTS=data/fake_comments.json
-
-# 会話が続くか（同じ人が話しかけ続ける偽コメント）。前のやりとりを受けた返事に
-# なっているか、同じ人の2件目が60秒待たずに返っているかをログで見る
-./run_live.sh DRY_RUN=true SKIP_ARDY=true \
-              FAKE_COMMENTS=data/fake_comments_conversation.json
-
-# 同上を「いま」から数分で一周させる。LIVE_START_HHMM の既定は 21:00 で、
-# 未来だとその時刻まで sleep するので、3つとも近い時刻に上書きすること
-S=$(date -d '+5 min' +%H:%M); C=$(date -d '+11 min' +%H:%M); E=$(date -d '+13 min' +%H:%M)
-./run_live.sh DRY_RUN=true FAKE_COMMENTS=data/fake_comments.json \
-              LIVE_START_HHMM=$S LIVE_CLOSING_HHMM=$C LIVE_END_HHMM=$E
-
-# 本番と同じ経路で限定公開の配信を1本
-./run_live.sh LIVE_YOUTUBE_PRIVACY=private
+./run_live.sh DRY_RUN=true SKIP_ARDY=true FAKE_COMMENTS=data/fake_comments_conversation.json
 ```
 
-Unity の HTTP は `curl` でも叩ける:
+`DRY_RUN=true`はYouTube・OBSを使わず、Unityと偽コメントで会話を確認します。音声・LLM・Unityなどのローカル依存は必要です。短時間で確認する場合は、JSTの近い時刻を`LIVE_START_HHMM`、`LIVE_CLOSING_HHMM`、`LIVE_END_HHMM`のすべてに指定します。
+
+確認項目は、同じ視聴者との会話の継続、コメントの優先処理、発話の割り込み、音声・字幕・モーションの同期です。本番経路の確認は`LIVE_YOUTUBE_PRIVACY=private`で非公開配信を作成します。`unlisted`は限定公開です。
+
+### 6.3 本番の手動実行
+
 ```sh
-curl -X POST localhost:2338/speak   -d '{"wav_path":"/tmp/a.wav","valence":0.8,"arousal":0.4}'
-curl -X POST localhost:2338/motion  -d '{"vrma_path":"/path/to.vrma"}'
-curl -X POST localhost:2338/emotion -d '{"valence":-0.5,"arousal":0.2}'
-curl localhost:2338/status
+./run.sh
+./run_quiz.sh
+./run_live.sh
 ```
 
-## 設計上の注意
+これらは実際の投稿・配信を行います。`systemctl start bottan-pipeline.service`や`bottan-quiz.service`も同じ本番処理です。各スクリプトは`/tmp/bottan-render.lock`で直列化し、録画と配信がUnityを同時操作することを防ぎます。
 
-### 配信は落とさない
+自動テストはリポジトリルートから実行できます。
 
-コメント1件の処理が失敗しても、LLM が応答しなくても、ARDY が使えなくても配信は続ける。
+```sh
+./venv/bin/python -m unittest discover -s tests
+```
 
-| 落ちたもの | 動作 |
+## 7. 障害時の動作と運用
+
+| 障害・状態 | 動作 |
 |---|---|
-| ARDY | プールのモーションだけで継続。プールも空なら Animator の Idle |
-| LLM | `FALLBACK_LINES` の定型で返す |
-| biorhythm_server | 気分・energy・直近の行動（`/bot/presence`・`/bot/activities`）が読めなくなる。返事は直前の値か既定値で続け、ゲージは更新が止まるだけ。落ちている間はコメントぶんの加算が溜まり、復帰時にまとめて入る |
-| チャット取得 | フリートークで場をつなぐ |
-| VOICEVOX | その回の発話を諦めて次へ。Discord に通知 |
-| Unity | 配信を終了する（映像が無いので続ける意味がない） |
-| 配信そのもの | **クロージングを省いて終了する。** YouTube の `lifeCycleStatus` が `complete`/`revoked` になるか、OBS の出力フレームが `LIVE_HEALTH_STALL_SEC` ぶん増えないと `LIVE_HEALTH_CHECK_SEC` ごとの点検が気づく |
+| LLM応答失敗 | ライブでは定型文で返答を継続 |
+| Irodori合成失敗 | 復旧処理後、対象の文をVOICEVOXへ切り替え |
+| 音声を合成できない | 対象の発話を省略し、ライブの次の処理へ進む |
+| ARDY利用不可・GPU容量不足 | 保存済みモーション、またはIdleで継続 |
+| biorhythm / 記憶の一部取得失敗 | 取得済みの値や既定値で返答を継続 |
+| チャット取得失敗 | フリートークで継続 |
+| 開始前のUnity描画不足 | 実測fpsが既定20未満なら配信開始を中止 |
+| 配信中の描画速度低下 | 一定期間継続すると通知 |
+| Unityの復旧不能 | 配信を終了 |
+| YouTube終了・OBS出力停止 | 死活確認で検出し、クロージングを省略して終了 |
 
-**live へ入る前だけは、絵が出ていなければ配信そのものを出さない。**
-`session.check_render()` が Unity の fps を `LIVE_FPS_PROBE_SEC` ぶん実測し、
-`LIVE_MIN_FPS`（既定20）に届かなければ例外を投げて枠を畳む。走り出したあとで
-止めない方針とは逆だが、まだ live へ入っていない枠に `complete` は飛ばないので
-損失は無く、止まった人形が1時間喋る配信を出すよりよい、という判断
-（`LIVE_FPS_GATE=false` で警告だけにできる）。live に入ったあとで落ちた場合は
-`LIVE_FPS_STALL_SEC` ぶん続いた時点で一度だけ Discord に流し、配信は続ける。
+起動スクリプトはPythonの終了コードをsystemdへ返し、失敗時はDiscordへ通知します。ライブはメモリ・swap使用率・I/O pressureと出力フレームを点検し、キューの待ち件数・受信件数・破棄件数を記録します。
 
-配信そのものの死活を見ているのは 2026-09-09 の失敗を受けたもの。この日は
-21:08 に YouTube が配信を切ったのに、`run_loop` の終了条件が時刻と `_stopping`
-だけで、`_stopping` が立つのは SIGTERM と「Unity プロセスが死んで復旧上限に
-達した」ときしかなかった。Unity はプロセスとしては生きていた（HTTP に
-10秒で応答できないだけだった）ので何も掛からず、23分間だれも見ていない
-ところへ喋り続けた。締めの発話を省くのは、そこが呼ばれるときは VOICEVOX と
-Unity も詰まっていて、1文ごとにタイムアウトを待つと片付けが数分伸びるため。
-
-同じ文面の警告は `NOTIFY_COOLDOWN_SEC`（既定300秒）のあいだ Discord へ
-流し直さない。詰まっている間は同じものが出続けるので1本目だけでよい
-（`error()` と Shorts の投稿通知は抑制しない）。
-
-### コメントへの往復を遅くしない
-
-初回の配信で「コメントを書いてから画面に出るまで10秒、そこから返事まで10秒」に
-なっていた。内訳と対処:
-
-| どこ | 時間 | 対処 |
-|---|---|---|
-| YouTube がコメントを配る | 次回配信で実測 | `liveChatMessages.streamList` のgRPC持続接続で新着を受信する。定期ポーリングの待ち時間をなくす。YouTube側の配信遅延は残る |
-| コメント欄への反映 | 最大10秒 | `ChatPoller._accept` が受信と同時に `comments.txt` を書く。以前は10秒ごとの雑務に任せていた |
-| 直前の発話が終わるのを待つ | 5〜15秒 | **ここがいちばん効いている。** フリートークは `interruptible=True` で、文と文の切れ目でコメントの有無を見て切り上げる。コメントへの返信は途中で切らない方針なので、ここは残る |
-| 気分・energy | 数ms〜3秒 | `_bot_context()` は `BOT_CONTEXT_TTL_SEC`（既定20秒）キャッシュし、記憶の内部 API の `/bot/presence` を1往復だけ。待つのは `BIORHYTHM_STATE_TIMEOUT_SEC`（既定3秒）まで |
-| LLM | 約2秒 | 実測（gemini-2.5-flash、2〜3文の構造化出力）。`LLM_TIMEOUT_SEC`（既定20秒）で頭を打たせる。会話履歴（`LIVE_HISTORY_TURNS` ぶん）は入力トークンだけを増やす。1ターン100〜150字で、system prompt の約8500字に対して6ターンでも1割ほど |
-| VOICEVOX + 送信 | 0.1〜0.7秒 | 全文まとめてではなく**1文ずつ**合成して Unity のキューへ流し込む。喋り出しまで実測 0.12秒 |
-| ARDY のモーション生成 | 4.6〜12.8秒 | **待たない。** プールから即座に1本引いて再生し、生成は別スレッドで走らせて次回以降に回す（`live/motion.py`） |
-
-実測は `[live] 反応まで X.X秒 (待ち a / DB b / LLM c / 合成 d)` としてログに出る。
-「待ち」がコメント受信から取り出しまで＝ほぼ直前の発話が終わるのを待った時間。
-投稿時刻があるコメントは `[chat] 投稿→受信 X.XX秒` と、返答時の
-`投稿→反応 X.X秒` も記録する。ローカル時計とYouTube側の時計の差、初回接続時の
-過去コメントも含むため、定常時の新着コメントで比較する。
-
-チャット受信は公式の [streamList](https://developers.google.com/youtube/v3/live/docs/liveChatMessages/streamList)
-を使う。`requirements.txt` の `grpcio` / `protobuf` と、リポジトリ内の生成済みprotoが必要。
-既存のYouTube OAuth認証を共用し、再接続時に更新を確認する。接続は最大30分で更新し、
-切断時は最後の `nextPageToken` から再開する。直近10,000件のIDで二重取り込みを防ぐ。
-無通信でも定期的なREST取得は行わず、終了時は受信待ちをキャンセルする。
-
-サーバーは接続から約10秒で正常に閉じる（2026-10-03 の実測で毎回10〜11秒）。
-3秒以上続いてから正常に閉じた場合は、公式サンプルと同じく待たずに繋ぎ直す。
-1回の配信（約80分）で約440接続になる。10/3 は31接続を含む1日の全API合計が463で、
-上限の1万に収まる見込み。3秒未満で閉じた場合は、0秒の再接続が暴走しないよう
-エラー時と同じく倍々に待つ。
-
-一時的な切断は1〜120秒でバックオフし、`RESOURCE_EXHAUSTED` は最低30秒待つ。
-日次枯渇と決めつけて翌日まで停止はしない。チャット終了・無効化・権限エラーなどは
-取得を停止し、配信本体は継続する。RESTの `list` への自動切り戻しは行わない。
-Google Cloudのクォータ自体が増える変更ではない。
-
-公式の現行protoには `messageDeletedEvent` / `messageRetractedEvent` の定義がない。
-受信した `tombstone` は既存の記憶削除コールバックへ渡すが、削除時に即通知される保証はない。
-protoの出典・再生成方法は [こちら](common/youtube_stream_proto/README.md)。
-
-**メインループから DB・LAN を触らないこと。** energy ゲージ・RAG 先読み・記憶の
-引き直しは `_start_chores()` の別スレッドで回している。以前は `run_loop` の中で
-直接呼んでおり、DB のホスト（`DB_HOST`）が不調だと**コメントが1件も無くても
-十数秒止まった**（2026-08-21 の配信。同じホストの 3200/3204 も全滅していた）。
-`DB_CONNECT_TIMEOUT` は既定3秒。
-
-`_speak` は1文ごとに「合成 → `/speak` → いまの文が終わる 0.7秒 前まで待つ」を
-繰り返す。0.7秒 あれば次の文の合成が間に合う（実測 0.05〜0.7秒）ので音は途切れず、
-その待ち時間が割り込みの窓になる。字幕は `SubtitleScheduler.push()` で後から
-足していく（発話を始める時点では2文目以降の尺がまだ分からないため）。
-
-### 字幕は obs-websocket で流し込む
-
-OBS の `text_ft2_source_v2` を `from_file` で使うと、**約1秒に1回しか**
-ファイルを見に行かない（`video_tick` の中の `stat()`。間隔を指定する
-プロパティは無い）。これがそのまま「発話より字幕が遅れる」になる。しかも
-`st_mtime` は秒解像度なので、同じ秒に2回差し替えると2回目が丸ごと落ちる。
-
-`Obs.bind_text_sources()` が配信開始時に字幕ソースを探して `from_file` を切り、
-`subtitle.set_sink()` で `SetInputSettings` へ流す経路に差し替える。
-**シーンを手で直す必要はない**（終了時に `restore_text_files()` で戻す）。
-ソースは名前ではなく `text_file` が `SUBTITLE_JA` / `SUBTITLE_EN` を指しているかで
-見つけるので、手で組んだシーンでも動く。
-
-ファイルへの書き込みは保険として残してあり、websocket が落ちたら
-（`set_text` が3回続けて失敗したら）自動でファイル読み込みへ戻す。
-音声は PulseAudio の null sink 経由で OBS に入るぶん遅れるので、
-ずれが気になるときは `SUBTITLE_LEAD_SEC` で前後に振る。
-
-文と文の間の 0.25秒 の無音は `voice.synthesize_lines(tail_gap=...)` が作る。
-1文ずつ別々に送るので、こちらで作らないと詰まって聞こえる。
-
-**コメント欄は配信の始めに空にすること**（`subtitle.clear_comments()`、`prepare()` で呼ぶ）。
-`comments.txt` はファイルに残り続けるので、消さないと配信開始から最初のコメントが
-来るまで前回配信のコメントが並んだままになる。`clear()` は字幕（ja/en）だけを消す
-（発話のたびに呼ばれるので、ここでコメント欄まで消してはいけない）。
-
-### 会話をつなぐ
-
-**コメント1件＝独立したLLM呼び出し、ではない。** 配信中のやりとりは
-`live/conversation.py` の `ConversationLog` に1本の時系列として積み、
-`common/llm.py:generate_json(history=...)` が `messages` のマルチターン
-（`user` / `assistant` の交互）に展開して渡す。Gemini は OpenAI 互換
-エンドポイント越しなので chat セッションは無く、毎回 messages を組み立て直す形になる。
-
-- **フリートークとオープニング・クロージングも同じ時系列に積む。**
-  積まないと「さっき自分が何を話していたか」が飛ぶ
-- `assistant` に入れるのは読み上げた日本語だけ。返答のJSON全体を積むと
-  `en` / `motion_en` / valence / arousal のぶんトークンが数倍になる。出力形式は
-  毎回 `response_format` で強制されるので、履歴が平文でも崩れない
-- `user` に入れるのも「送り主：/ 内容：」の短い形。プロンプト本文まるごとを積むと、
-  botの状態ブロックと記憶ブロックがターン数ぶん重複する
-- 場の流れから押し出されたぶんも含めて、**いま返す相手とのやりとり**だけは
-  本文に「## この人とさっきまで話していたこと」として添える。
-  流れに残っているターンは二重にならないよう取り除く（`live.py:reply_to_comment`）
-- 履歴は**当日の配信内だけ**のメモリ。DB へは書かない（`memory.save_comment()` が
-  既に `bottan_live.comments` へ書いている）
-
-統合前は botたん自身の発話を8件持つだけで、**視聴者が何を言ったかはどこにも
-残っていなかった**。しかもそれを「## 直前に自分が話したこと（同じ言い回しを
-繰り返さないこと）」という*逆向き*の制約で渡していたので、話を続けるどころか
-話題を逸らす方向に効いていた。「一つ前の会話を忘れている」の正体がこれ。
-いまはコメント返信からこのブロックを外し、フリートーク（同じネタの繰り返し防止が
-主目的）にだけ残している。
-
-### 同一ユーザーのクールダウンは条件付き
-
-`COMMENT_USER_COOLDOWN_SEC`（既定60秒）は「1人が喋り続けて他の視聴者のコメントが
-読まれなくなる」のを防ぐためのもので、**他に返事できるコメントが無いときは無視する**
-（`chat.CommentQueue._next_index`）。待っているのがその人だけなのに60秒黙って
-フリートークへ流れると、1対1で話しかけられている状況で会話が続かない。
-
-`has_pending()` も同じ判定を通るので、フリートークはその人のコメントで切り上がる。
-
-### ペルソナは原典のコピーで、放っておくとドリフトする
-
-`live/persona.py` の `_CHARACTER_TEMPLATE` は
-`bsky-affirmative-bot/packages/shared-configs/src/config/index.ts` の
-`SYSTEM_INSTRUCTION` のコピー（語彙リストだけ実行時に読む）。原典は活発に更新されるので、
-**触るときは必ず原典と差分を取ること。** docstring に同期時点のコミットを書いてある。
-
-実際、統合時のコピーには「# 住んでいる場所（Nagi と Bluesky）」が無く、
-Nagi が SNS の名前だと書いていないのに、プロンプト側は「Nagiで見かけた投稿」を
-渡していた。結果、配信で「Nagiさん」と人名のように呼んでいた。
-
-### モーションを途切れさせない
-
-`/motion` を投げるのは **`idle.IdleAnimator` だけ**。送出者を1つにしておかないと、
-待機スレッドが投げた直後に発話側が投げたとき、Unity（`VrmaMotionPlayer.EnqueueMotion`）が
-フェードイン途中＝重み1未満のクリップを打ち切る。合成後の重み `Min(1, wa+wb)` が
-1に届かず Idle が一瞬混ざって、ポーズが跳ねて見えていた。
-
-- **発話中**（`speak_begin` 〜 `speak_end`）: 「クリップの尺 − `VRMA_CHUNK_OVERLAP`(0.5秒)」
-  ごとに次を投げ、常に2本が重なった状態を保つ。録画パイプラインが
-  時刻表を事前計算して 0.5秒 重ねて置いているのと同じことを、尺が先に分からない
-  配信では時間で刻んでやっている。表情は `_speak` が決めるのでここでは振らない
-- **待機中**: 6〜20秒おきにプールのモーションを1本（落ち着いたカテゴリを厚めに抽選）。
-  1本が約9秒なので、下限が9秒だと待機時間の4割が Animator の Idle（棒立ち）になる
-- **待機中の表情**: 3〜8秒おきに動かす。1/4 の確率で「ほほえみパルス」
-  （valence を 0.85〜0.95 まで上げて `IDLE_SMILE_HOLD_SEC` 保持してから戻す）、
-  1/10 で「はっと顔」（arousal を上げる）、残りは従来のランダムウォーク。
-  直前の発話の感情を素の顔として引き継ぐ
-
-  Unity が受け取れるのは valence/arousal の2軸だけで、**ウィンクのような個別の
-  表情は指定できない**（`LiveController` に `/expression` が無い）。表情の
-  バリエーションを作れるのは値の動かし方だけなので、はっきり分かる山を混ぜている。
-  ウィンクを入れるなら Unity 側に手を入れること（VRM には `blinkLeft`/`blinkRight`
-  プリセットも `Fcl_EYE_Close_L/R` モーフもある）
-
-`IDLE_ENABLED=false` で止まるのは待機中のぶんだけで、発話中は動く。
-
-生成モーション1本は **ARDY のセグメント連結**で作る（`LIVE_MOTION_SEGMENTS` ×
-`ARDY_LIVE_DURATION` ＝ 既定 3×3.0秒 ≒ 9秒、つなぎ目は `ARDY_BLEND_SEC`=0.7秒 の
-クロスフェード）。3秒の単発だと発話中の継ぎ足しが 2.5秒 に1回になり、
-Unity が `/motion` を受けるたびにメインスレッドで `.vrma` をパースする
-（`VrmaMotionPlayer.LoadVrma`）ぶんフレームが落ちやすい。尺は
-`data/motions/<cat>/<hash>.json` に残す（無い古いクリップは3秒とみなす）。
-
-### 生成モーションの見た目は Shorts と共通
-
-`common/vrma_style.py` の `vrma_unity_args()` が返す `-vrmaSmooth` などを、
-録画（`shorts/pipeline.py`）と配信（`live/unity_live.py`）の**両方**が Unity へ渡す。
-渡さないと `VrmaMotionPlayer` は「改修前の見た目」の既定値で動き、
-素の ARDY 出力がそのまま出る。統合前の配信は1つも渡しておらず、Unity のログが
-
-```
-[Vrma] keepIdleHands=False elbowBend=0deg wristBend=0deg headTilt=0deg smooth=0s
+```sh
+journalctl -u bottan-live.service -n 100 --no-pager
+journalctl -u bottan-live-xorg.service -n 50 --no-pager
+journalctl --user -u bottan-unity-license.service -n 50 --no-pager
 ```
 
-になっていた（`-vrmaSmooth 0.10` は実測でカクつき −64%）。配信だけ変えたいときは
-`LIVE_VRMA_SMOOTH` のように `LIVE_` を頭に付けた環境変数を置く。
+描画不良は`:99`のレンダラと実測fps、無音はUnityのsink接続とOBSのmonitor入力、返答遅延はキュー・LLM・音声合成のログを確認します。モデルの再読み込みが頻発する場合はOllamaのコンテキスト長を確認します。
 
-### モーションの安全化は緩めない
+## 8. 関連資料とライセンス
 
-`safety.BANNED_MOTION_RE` は実測で事故った履歴に基づく。しゃがむ・跳ぶ系は
-ARDY が予備動作として「膝を深く曲げて脚を大きく開くしゃがみ」を必ず作り、
-スカート＋腰高カメラで下着が映る（2026-08-11 に実際に発生）。
-拍手は ARDY が描けず手が震えて見える。プロンプトでも禁止しているが
-**LLM は普通に破る**ので、コード側が最後の砦になっている。
+- [環境設定一覧](./.env.example)
+- [外部サーバーの互換性修正](./setup/patches/README.md)
+- [YouTubeチャット用Protocol Buffers](./common/youtube_stream_proto/README.md)
+- [ARDY・YouTubeの調査記録](./docs/investigations/2026-09-06-ardy-youtube.md)
+- [描画停滞の調査記録](./docs/investigations/2026-09-11-display-starvation.md)
+- [旧READMEの運用・設計メモ](./docs/reference/legacy-operations.md)：過去の経緯と測定値を確認する参考資料
+- [HANDOFF](./HANDOFF.md)：開発・運用の引き継ぎ記録
 
-### Unity の時刻源
+本リポジトリのソフトウェアは[MIT License](./LICENSE)で公開しています。音声・背景・BGM・効果音・キャラクター素材には、それぞれの利用条件が適用されます。背景のクレジットは`data/background_credit.txt`、BGMは`data/bgm/CREDIT.md`を参照してください。
 
-配信モードでは `Time.time` を使ってはいけない。`Time.deltaTime` の累積で、
-`maximumDeltaTime`（既定0.333秒）にクランプされるため、フレームが飛ぶと
-実時間から遅れる（実測で実時間7秒に対して5.0秒）。音声は実時間で再生されるので、
-モーションだけ遅れて口と動きがズレる。`LiveMode.Now`（`Time.realtimeSinceStartup`）を使うこと。
-
-### ロック
-
-`run_live.sh` は `/tmp/bottan-render.lock` を取る。録画パイプラインの
-`core.py:record_with_unity` が `pkill -9 -f "Unity -projectPath"` で Unity を
-無差別に殺すため、直列化しないと配信中の Unity が巻き添えで落ちる。
-
-### 配信ログの置き場所
-
-`bottan_live` スキーマに置いている。`affirmative_bot` ではない理由は、
-`bsky-affirmative-bot/scripts/deploy.sh` が `drizzle-kit push` を自動実行しており、
-`schemaFilter` が `['public','affirmative_bot']` なので、drizzle の定義に無い
-テーブルをそこへ置くと **DROP 候補になる**ため。
-
-### 記憶は SQL と Bot Memory API の2本立て
-
-**素の SQL**（`live/memory.py`）は、その日の行動・Nagi と Bluesky の高得点ポスト・
-直近のショート・前回配信のコメントを決め打ちで引く。フリートークの固定枠はこちら。
-
-**Bot Memory API**（`live/bot_memory_client.py`）が本来の RAG。biorhythm_server の
-LAN 内 API `POST /memory/search` を叩き、埋め込みと `pg_trgm` のハイブリッド検索は
-**サーバ側**で走る。`affirmative_bot.bot_memory_documents` に実体があり、
-`source_type` は `bsky_affirmed_post` / `nagi_affirmed_post` / `bsky_received_reply` /
-`nagi_received_reply` / `biorhythm` / `youtube_live_comment` / `web_research` が有効。
-BlueskyのいいねとNagiの絵文字リアクションは会話内容ではなくbotたん自身の投稿を
-重複させるため、RAGには保存・検索しない。
-
-配信で届いたコメントは `memory.BotMemoryWriter` が
-`bot_memory_documents`（`source_type='youtube_live_comment'`）へ非同期で upsert する。
-本文が変わったら `embedding` を NULL に落として、サーバに埋め直させる。
-
-**コメントへの返事もここから引く**（`live/recall.py`）。以前は決め打ちの SQL
-スナップショットしか載っておらず、質問の内容では何も引いていなかった。だから
-biorhythm にゲームの記録があるのに「最近やったゲームなに？」に答えられなかった。
-
-引くときは `source_type` を2つに分ける。
-
-- **`youtube_live_comment` は引かない。** いま届いた質問とほぼ同じ文の「前に誰かが
-  同じことを聞いたコメント」が上位を埋めるだけになる。返り値にそれへの返答は
-  入らない（サーバの `serializeBotMemorySearchResult`）ので、枠を食って答えにならない。
-- **`web_research` は別枠で引く。** 件数が桁違い（15件 対 9020件）で、まとめて引くと
-  知識カードが押し出される。実測: 「eu4ってどんなゲーム？」で5位、
-  「ワルプルギスの廻天って知ってる？」では20位までに出てこなかった。
-  2本を**同時に**投げて、遅いほうに待ち時間を合わせる（実測 約1.4秒）。
-  保管しているのが十数件しかないので必ず何かが返る。**質問がその語
-  （`metadata.term`）を含むものだけ**通す。
-
-検索でプロンプトへ渡した文書IDは、返答が実際に読み上げられ、かつLLMの
-フォールバックでなかった場合だけ `purpose='live_reply'` として非同期記録する。
-フリートークの利用記録 `live_filler` とは分けて追跡する。
-
-検索はクエリが長いほど遅い（実測: 100文字 1.9秒 / 300文字 3.2秒 / 1000文字 9.1秒）。
-サーバがクエリ全文を埋め込んだうえ、`similarity` と `ilike` をクエリ全文で全行に
-当てるため。`BOT_MEMORY_QUERY_MAX_CHARS`（既定500）で頭を打たせている。
-
-**メインループから叩かないこと。** 先読みは `_start_chores()` の雑務スレッドが行い、
-ホットパスはキャッシュを読むだけにする。
-
-### 知らないことは、その場では調べない
-
-配信のホットパスから **Gemini を外した**（`LIVE_GROUNDING` の既定は `false`）。
-外の世界のことを聞かれたら、`common/grounding.classify()` が返した語を
-`affirmative_bot.bot_memory_research_jobs` へ積むだけにする（`live/recall.py`）。
-あとは biorhythm_server の `botMemoryResearchWorker` が60秒ごとに拾い、**SearXNG**
-で調べて `source_type='web_research'` として記憶へ入れる。次に同じ話題が来たときには
-上の思い出しで引ける（**同じ配信の数分後に間に合う**）。
-
-その場では「知らない」と正直に答える。これは Bluesky / Nagi のリプライ経路が前から
-やっていることで、配信だけが輪から外れて同期で Gemini を叩いていた。
-
-`subject_hash` は隣接リポジトリの `researchSubjectHash`（空白正規化 → trim → lower →
-sha256）と**同じ値でなければならない**。ずれると主キーが噛み合わず、同じ語が
-二重に積まれる。上限（60字 / 2字 / pending 200件）も `researchJobs.ts` に合わせる。
-
-コメントの仕分け（`common/grounding.classify()`）は WEB / SELF / NONE の3値で、
-調べる語も同じ1回の呼び出しで返させる。ここはローカルの ollama なので、
-何回呼んでもリクエスト数も課金も増えない。`LIVE_GROUNDING` を切っても走る。
-
-### 同じ話題を二度出さない
-
-`FillerPlanner` は配信中に出した話題を `_used` に貯め、**一度出た話題は二度選ばない**。
-キーは固有名詞を並べた `(種別, 語のシグネチャ)`。語が拾えないときだけ、
-`(種別, 空白を潰した本文の先頭60文字)` に落ちる。頭の60文字で見ていると、
-同じネタでも言い回しが違うだけで別物として通ってしまう。
-
-さらに `_used_terms`（出したお題に含まれていた固有名詞）を持ち、`_overlaps()` で
-**中身が同じネタを種別をまたいで弾く**。RAG は同じ話が別の document_id で何件も
-入っており、`excludeDocumentIds` は ID 単位なので原理的に防げない。受け取ってから
-内容で捨てる。ただし `hobby` / `ask` の固定文には掛けない（人手で書き分けた
-レパートリーなので、重なりで潰すと在庫が痩せる）。
-
-在庫は RAG を除くと最大38件（hobby 11 / ask 6 / mood・nagi・bsky・previous_live が
-各5まで / short 1）。`FILLER_IDLE_SEC` が25秒なので1時間の配信では**枯れうる**。
-枯れたら `_used` を畳んで2周目に入る（`[filler] 話題を一巡したので…`）。
-同じ話が二度出るのはよくないが、黙るよりはよい。
-
-畳む前に、抽選で拾えなかっただけなのか本当に尽きたのかを**種別を順に当たって
-確かめる**こと。`_KINDS` には重複があり、袋のどこから引き始めるかで一巡しても
-触らない種別が出るので、抽選の空振りだけで畳むと在庫を残したまま2周目に入る。
-
-**Nagi と Bluesky は同格に扱う。** botたんのホームは Nagi、Bluesky は毎日通う出張先で、
-ペルソナにも「Blueskyだけがあなたの居場所であるかのように話さないこと」と書いてある。
-`nagi` にだけ固定枠があると逆の偏りが出るので、`bsky`（`affirmative_bot.posts`）も
-同じ形で置いてある。
-
-**スコアの下限も揃える**（`LIVE_POST_MIN_SCORE`、既定80）。以前は両方 88 を直書き
-していたが、`affirmative_bot.posts` は15行しか残らない巻き取りウィンドウで、実測の
-スコアは 65〜88 と**最大値が閾値と同値**だった。88 で切ると Bluesky 枠だけが頻繁に
-空になり、「Nagiの話はするのに Blueskyの話はしない」という偏りになる。
-nagi 側は 70〜92 と分布に余裕があるので同じ閾値でも枯れない。
-
-### mood に引きずられない（`live/topics.py`）
-
-上の `_used` は**お題にしか効かない**。2026-08-24 の配信では、お題が別物でも
-「FLASHBULB」の話が61発話中14回出た。犯人はプロンプトの共通ブロックで、
-
-- `_bot_state_block` が `mood`（さっきまでしてたこと）を全プロンプトに載せ、
-  しかも「返事をこれに寄せてください」と指示していた
-- `mood` は biorhythm 由来で 20〜90分ごとにしか変わらない。1時間の配信では
-  ほぼ全発話に同じ文が乗る
-- `_memory_block` の「今日やってたこと」も同じ `biorhythm_history` を引いており、
-  先頭行が `mood` と同じ文だった（1プロンプトに同じ文が2回）
-- `prefetch_rag` のクエリ先頭も `mood` なので、その話題の記憶ばかり返ってくる
-
-対処は3つ。
-
-1. **`mood` は1回載せたら落とす**（`LiveSession._bot_for_prompt`）。
-   `BOT_MOOD_SERVE_LIMIT`（既定1）まで載せたら、以降のプロンプトから `mood` 行を
-   外す。`mood` が更新されれば数え直すので、配信中に2〜3回は近況を話せる。
-   落としたあとも記憶ブロックからは同じ話を外したいので、元の文は `mood_raw` に残す。
-   - **「実際にその話をしたか」は見ない。** 載せれば高い確率でその話をする
-     （それが上の症状そのもの）ので結果は変わらず、発話から固有名詞を拾う必要が
-     なくなる。mood の3件に1件はカギ括弧が無く、語の抽出に頼ると取りこぼす
-   - `_bot_context()` 側ではやらないこと。あちらは雑務スレッドからも呼ばれるので、
-     そこで予算を使い切ってしまう。覗くだけなら `consume=False`
-2. `_bot_state_block` の見出しから「寄せてください」を消し、`_memory_block` から
-   `mood` と同じ行・`FillerPlanner.used_terms()` に載っている語を含む行を落とす。
-3. `mood` が枯れたら `prefetch_rag` のクエリからも外す。ここを直さないと
-   「その話題で検索 → 候補が返る → 全部弾かれる」という空回りが30秒ごとに続く。
-
-`live/topics.py` は語を取るだけの小さなモジュール。**依存ゼロにしてある**
-（テストがスタブ無しで読める）。形態素解析器は使わず、カギ括弧の中身と
-ラテン文字語の2系統だけ。
-
-- **取りこぼしても壊れない。** 語が拾えなければ `_topic_key` は従来の先頭60文字に
-  落ち、`_overlaps` は False を返す。だから「拾えないかもしれない」を理由に
-  判定を足さないこと。逆に、**拾ってはいけないものは必ず落とす**
-  （抑制が効きすぎるほうが配信では目立つ）
-- カギ括弧はセリフの引用にも使う。実ログには「大丈夫。全部、いいんだよ。」
-  「おかしいな」が入っていたので、文の断片とひらがなだけの語は名前として数えない
-- **Nagi / Bluesky はストップワード。** 固有名詞だが「話題」ではなく居場所の名前で、
-  数えると「Nagiの投稿A」と「Nagiの投稿B」が同じネタ扱いになる
-
-**ネタ元の偏りは配信側では直せない。** FLASHBULB の出どころは
-`bot_state['seasonal_works_v1']`（Google 検索で取る「いま話題のもの」。music 枠は
-数件しかなく7日キャッシュ）→ 日次予定表 → `biorhythm_history.mood` という経路で、
-bsky-affirmative-bot 側の `seasonalWorks.ts` / `dailyPlan.ts` が持っている。
-配信側は「上流が何を出しても配信が壊れない」ところまでを引き受ける。
-
-### 他人の投稿を自分の体験にしない
-
-2026-08-25 の夜版Shortsで、botたんが Nagi の他人の投稿（「資格取得の為に警察署に
-行ってきました」）を**自分の一日の出来事として**喋った。原因はプロンプトの構造で、
-自分の行動と他人の投稿が**同じ箇条書きに並んでいた**こと（詳細は `HANDOFF.md` の23）。
-配信側にも同じ穴があったので一緒に塞いである。
-
-**自分の体験と他人の話は、プロンプトの上で必ずブロックを分ける。**
-`persona._memory_block` は2つの見出しを出す。
-
-```
-## 今日のあなたの出来事（あなた自身が体験したこと。自分の話として話してよい）
-- 今日やってたこと：…
-- 昨日出した動画：…
-
-## 見かけた他の人の投稿・発言（**他人の話**。あなたの体験ではない。…）
-- SNSのNagiで見かけた投稿：…
-- Blueskyで見かけた投稿：…
-- 前回の配信で視聴者が言っていたこと：…
-```
-
-- **行頭ラベルだけでは足りない。** 投稿本文は一人称で書かれているので、
-  同じ箇条書きに混ぜると本文の一人称のほうが強く効く
-- RAG も同じ。`_RAG_SOURCE_LABELS` は「自分の体験か他人の話か」が読み取れる
-  文言にすること。**未知 `source` のフォールバックを「思い出」にしないこと**
-  （以前の既定は「みんなとの思い出」で、他人の投稿が自分の思い出として読めた）
-- **出どころは発話のあとも持ち回る。** `persona.topic_origin(topic)` が返した札を
-  `conversation.add_solo_turn(..., origin=...)` と
-  `LiveSession._begin_thread(..., origin=...)` に渡す。渡さないと、
-  フリートークの発話は履歴で `（フリートーク）` ＋ `role=assistant` になり、
-  次のターンからは「自分が言ったこと」としてしか残らない。
-  掘り下げ（`build_followup_prompt`）には記憶ブロックが付かないので、
-  ここが最後の砦になる
-
-Shorts 側（`shorts/prompts.py`）は**そもそも自分の出来事を渡さない**。
-2026-10 に夜版をループする台本（③決め台詞が①掴みへつながる）へ変えたときに、
-締めの「botたんも今日〜だったけど」を外した。台本で語る botたん自身の話は、
-投稿を読んだ**気持ち**（本音）だけにしてある。
-
-### 話題を掘り下げる
-
-コメントに答えて終わりにせず、出たテーマに別の角度をもう一言足す。
-`reply_to_comment` と `speak_filler` の末尾で `_begin_thread()` がテーマを覚え、
-`FOLLOWUP_IDLE_SEC`（既定8秒）空いたら `speak_followup()` が続きを喋る。
-`FOLLOWUP_MAX_DEPTH`（既定2）まで掘ったら次の話題へ移る。
-
-フリートークの後もテーマを立てるので、
-`話題 → 掘り下げ → 掘り下げ → 次の話題` と自然に多段になる。
-
-- **テーマの登録でネットワークを触らないこと。** `_begin_thread` はフラグを立てるだけで、
-  RAG を引くのは雑務スレッドの `prefetch_followup()`。返事を喋っている15〜25秒の
-  あいだに引き終わるので、掘り下げる時点では候補が揃っている
-- **資料が無くても喋る。** RAG が引けるまで黙るのは本末転倒
-- 掘り下げも `interruptible=True`。コメントが来たら文の切れ目で切り上がる
-- クロージングの `FILLER_STOP_LEAD_SEC`（既定120秒）前からは、フリートークも
-  掘り下げも出さずコメントの消化に専念する。`run_loop` は `LIVE_CLOSING_HHMM` で
-  抜けてしまい、**それ以降に届いたコメントには一切反応できない**
-
-### コメントを捨てるとき
-
-`CommentQueue` は返事せずに捨てた件数を `dropped` に積み、捨てるたびにログを出す。
-数えていないと「コメント欄には出たのに返事が来ない」に気づけない。
-
-- **溢れ**（`maxlen`=200 超）: 優先度が低く、かつ古いものから捨てる。
-  並べ替えは `(priority, -received_at)` で、残すのは先頭 maxlen 件。
-  **受信時刻を昇順にしてはいけない** — 末尾＝「一般視聴者のいちばん新しいコメント」が
-  捨てられ、意図と正反対になる（実際そうなっていた）
-- **滞留**（`COMMENT_MAX_AGE_SEC`、既定180秒）: それ以上待たせた一般コメントは捨てる。
-  取り出しは同じ優先度なら古い順なので、放っておくと「5分前のコメントにいま返事する」
-  状態になり、視聴者から見た遅れが配信の後半ほど伸びていく。
-  **スパチャ・メンバー・オーナーは古くても捨てない**
-
-待ち行列の様子は30秒ごとに出る:
-
-```
-[live] キュー: 待ち12件 / 最古 84秒 / 受信 137件 / 破棄 4件
-```
-
-返事が遅れているのが滞留のせいなのか溢れて捨てているのかは、これでしか切り分けられない。
-
-### 読みの直しは DB の1本管理
-
-読み間違いは `affirmative_bot.bot_memory_pronunciations` に登録して直す。
-`common/pronunciation.py` が**VOICEVOX へ送るテキストそのものを置換**する
-（`audio_query()` が `/audio_query` に投げる直前）。字幕に出る日本語は元のまま。
-
-**VOICEVOX エンジンのユーザー辞書は使わない。** エンジン側の辞書
-（`~/voicevox_user_dict/user_dict.json`）とは独立していて、DB へ入れても
-そちらには反映されない。二重に管理すると、どちらが効いているのか分からなくなる。
-
-置換は区切り（半角/全角スペース・中黒・読点）をまたいで当たる。登録どおりの
-一字一句でしか当たらないと実際にはまず外れる。2026-08-23 の配信では
-`ファイアーエムブレム万紫千紅` と登録してあったのに「ファイアーエムブレム 万紫千紅」と
-喋って素読みした。区切りを許すのは**文字種が変わる位置と、登録側に区切りがあった位置だけ**
-（どこでも許すと `アニメ` が「アニ、メートル」に当たる）。長音 `ー` は読みの一部なので
-境界にしない。ASCII は大小を無視するが、`Halo`(ヘイロー) と `halo`(ハロー) のように
-大小で別語として登録されているものは、大小を保ったキーで先に引くので混ざらない。
-
-**複合語は最小単位でも登録すること。** 長い surface だけに頼ると、
-その一部だけを喋ったときに必ず外れる（`万紫千紅` 単体の行が無いと救えない）。
-
-登録・無効化は bsky-affirmative-bot 側の CLI から行う（SQL を直接叩かない）:
-
-```bash
-pnpm tts-pronunciation -- set <surface> <spoken-form> [work|proper_noun]
-pnpm tts-pronunciation -- disable <surface>
-pnpm tts-pronunciation -- list
-```
-
-表の原典は `bsky-affirmative-bot/packages/database/src/botMemoryPronunciation.ts`。
-自動学習（`origin='auto'`）は `manual` と `disabled` の行を書き換えないので、
-手で入れた読みが後から流されることはない。surface は NFKC で正規化されて入る。
-
-### energy
-
-配信側は energy を**読むだけ**で、加算はしない。`memory.save_comment()` が
-`bottan_live.comments` に残した行を、`bsky-affirmative-bot` の biorhythm_server
-（`apps/biorhythm_server/src/liveCommentEnergySync.ts`）が15秒ごとに拾い、
-1件につき内部energy +10 を足して `bot_state.biorhythm.liveCommentEnergyCursor`
-を進める。
-
-配信側から `POST /energy` を投げると同じコメントで二重に加算されるので投げない。
-読みは `memory.get_biorhythm()` で `bot_state` を直接引く（内部スケール
-0〜10000 を 0〜100 に直して返す）。
-
-## ライセンス
-
-本ソフトウェアは MIT License の下で公開されています。詳細は [LICENSE](./LICENSE) を参照してください。
-
-
-## 音声合成（Irodori-TTS）
-
-Shorts・クイズ・ライブは既定で `~/work/bot-tan-tts` の Irodori を使う。
-サーバの構築・API仕様は同リポジトリの README を参照。
-`TTS_ENGINE=voicevox` で従来の合成へ戻せる。設定一覧は `.env.example`。
-
-- `IRODORI_URL` は既定 `http://localhost:10110`、参照音声は `IRODORI_VOICE=tsumugi`。
-- 読み辞書を適用した後、300字以内に分割して `/synthesize` に送る。
-  復旧できないHTTPエラー・接続失敗・不正なWAVでは、その文全体をVOICEVOXで読み直す。
-- `IRODORI_SPEED=1.0` を既定とし、聞き取りやすさを優先して標準速度で合成する。
-  実際の字幕・モーションの尺はこれまでどおりWAVから測る。
-- Shortsの起動スクリプトはIrodoriの読み込みを180秒まで待つ。
-- Liveは準備時にOllama→Irodori（最大180秒）→ARDYの順に読み込む。
-  配信中のIrodori未ロード・GPUメモリ不足は、停止・再試行を含め最大30秒復旧を待つ。
-  期限を超えた発話だけVOICEVOXへ切り替える。
-- フックやクイズの `speedScale` は基準速度へ掛け、`volumeScale` はWAVへ適用する。
-  `pitchScale` / `intonationScale` はIrodoriには送れない。
-  フック用の参照音声を別途作った場合は `IRODORI_HOOK_VOICE` で選べる
-  （省略時は通常の声）。VOICEVOXへのフォールバックでは従来の全パラメータを使う。
-- 字幕内のモーラ時刻は引き続きVOICEVOXから取得し、Irodoriの実測尺へ伸縮する。
-  文内のタイミングには誤差がありうるため、VOICEVOXも稼働させておく。
-- 朝・夜Shortsは全音声生成→Irodori解放確認→ARDY生成→ARDY停止→収録の順。
-  解放失敗時はARDYを起動しない。
-- LiveはOllama・Irodori・ARDYを同時稼働させる。いずれかのGPU OOM、または
-  Irodoriの読み込み容量不足で、そのセッションのARDYを停止する。
-  保存済みモーションで続行し、同じ配信中は再起動しない。通常の503や通信障害では停止しない。
-- Irodoriサーバーの構造化エラー対応と、ARDYのPEFT CPU読み込み指定が必要。
-  他リポジトリの変更は `setup/patches/` の差分を参照。
-- 発話ごとの `engine=irodori` / `engine=voicevox fallback=...` と
-  ARDY停止理由・停止前後の空きVRAMをログに残す。
-
-公開時の声・クレジットの確認事項は `bot-tan-tts/README.md` の「ライセンス」を参照。
-同READMEでは、参照音声を使ったYouTube公開の扱いが未確認とされている。
-現在の `VOICEVOX:春日部つむぎ` 表記は維持している。
-
-### Unity ライセンスの確認と自動更新
-
-夜の動画・朝のクイズ・配信は重い準備の前に Licensing Client で Editor 権限を
-確認する。期限まで7日以内なら Unity Hub を一時起動し、保存済み認証で更新を試す。
-Hub は更新後に閉じる。更新できなくてもライセンスが有効なら警告して続行し、
-期限切れ・確認不能なら開始前に中止する。認証トークンやパスワードは保存・抽出しない。
-
-本番チェックアウトから、本番ユーザーで実行する（sudo は不要）:
-
-```bash
-bash setup/install_unity_license.sh
-./venv/bin/python -m common.unity_license --check
-systemctl --user start bottan-unity-license.service
-journalctl --user -u bottan-unity-license.service --no-pager
-```
-
-ユーザーtimerが毎日12:00 JSTに確認する。無人運用にはユーザーのlingerが必要。
-録画・配信が共通ロックを使用中なら定期確認は見送り、各ジョブの開始前に確認する。
-`UNITY_LICENSE_REFRESH_DAYS`（既定7日）と
-`UNITY_LICENSE_REFRESH_TIMEOUT_SEC`（既定120秒）で調整できる。
-
-保存済み認証での更新はユーザーのD-Busと鍵保管庫に依存する。再サインインが必要に
-なったら既存Discord通知へ警告する（同じ未復旧状態は1日1回、復旧も通知）。
-通知に失敗した場合は次回も通知を試す。ユーザーtimerのログはjournalに残る。
-`--force-refresh` は有効期間に関係なく更新を試す手動検証用。
-
-Unityの録画ログは動画と同じ接頭辞の `_unity.log` に保存し、ライセンス不良なら
-600秒待つ前に中止する。朝クイズの台本・音声だけの生成、プレビュー、既存動画の
-再合成・投稿ではUnity確認を行わない。
+音声の利用条件と公開時のクレジットは`bot-tan-tts`のREADMEを参照してください。参照音声を用いたYouTube公開の扱いには未確認事項があり、現行の`VOICEVOX:春日部つむぎ`表記を維持しています。
