@@ -75,7 +75,7 @@ HOOK_CLOSEUP_SEC = 4.6
 # 無人実行なので生成は止めず、ログに実測尺と文字数を残してプロンプト調整の材料にする
 NIGHT_DURATION_WARN_SEC = 35.0
 # 引き開始以降カメラを引く量[m]
-VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.7"))
+VRMA_PULLBACK   = float(os.getenv("VRMA_PULLBACK", "0.73"))  # 2026-10-16: botたん v20 で身長を 1.043 倍にしたので、カメラの長さも同じ倍率（旧 0.7）
 # 表情プリセット(Fcl_ALL_*)は口が開くモーフを含むため、arousal が高い文のあとは
 # 無音でも口が半開きのまま残る（2026-10-03 夜版で arousal が 1.0 まで上がり、
 # だんだん口が開いていくように見えた）。朝版・ライブと同じく無音時に口成分を打ち消す

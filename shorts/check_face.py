@@ -108,7 +108,7 @@ def _mouth_pixels(frame: bytes) -> int:
 # （カメラを上げると LookAt でキャラが見上げるので、単純な平行移動より大きく動く）。
 # 画素から自動検出する方式は、口が閉じているときに背景の夕焼けを拾って外れる。
 MOUTH_Y_AT_ZERO = 1086
-MOUTH_Y_PER_OFFSET = 4218
+MOUTH_Y_PER_OFFSET = 4044  # 2026-10-16: botたん v20 で身長を 1.043 倍にしたので、カメラの長さも同じ倍率（旧 4218。オフセット1mあたりの画素は 1/1.043）
 
 
 def mouth_crop_top(camera_offset: float) -> int:
@@ -136,7 +136,7 @@ def measure(webm: str, seg: float, camera_offset: float) -> None:
 def main(argv=None):
     p = argparse.ArgumentParser(description="表情→口の開き具合の実測プローブ")
     p.add_argument("--seg", type=float, default=2.5, help="1ケースあたりの秒数")
-    p.add_argument("--camera-offset", type=float, default=0.11,
+    p.add_argument("--camera-offset", type=float, default=0.115,
                    help="朝版のカメラYオフセット（夜版と揃えるなら 0）")
     p.add_argument("--mouth-close", type=float, default=0.0,
                    help="無音時に表情の口成分を打ち消す強さ（0で無効）")

@@ -74,7 +74,7 @@ PAD_AFTER = {"Q": 0.35, "THINK": 0.60, "A": 0.40, "EXPL": 0.30, "AFF": 0.30, "EN
 # Q はアップの画のままなので、サムネもこれまでどおりアップで撮れる。
 VRMA_PARTS = ("Q", "THINK", "A", "EXPL", "AFF", "END")
 # 生成モーションが始まる THINK からカメラを引く。引く量[m]
-VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.7"))
+VRMA_PULLBACK = float(os.getenv("VRMA_PULLBACK", "0.73"))  # 2026-10-16: botたん v20 で身長を 1.043 倍にしたので、カメラの長さも同じ倍率（旧 0.7）
 # Unity がカメラを引ききるまでの時間[秒]（VideoRecorder.PullbackDuration）
 PULLBACK_MOVE_SEC = 0.4
 # 強く寄るパート（山場）。字幕1枚ごとに寄り・傾きを変えたら多すぎた（2026-10-08）
@@ -94,7 +94,7 @@ QUIZ_TAIL_SEC = 0.6
 
 # Unityカメラを鉛直に上げる量[m]。quiz_layout.PANEL_H と連動しているので
 # 片方だけ変えないこと（実測 3647px/m、PANEL_H=470 → Δy≒0.11）
-CAMERA_OFFSET_Y = float(os.getenv("MORNING_CAMERA_OFFSET_Y", "0.11"))
+CAMERA_OFFSET_Y = float(os.getenv("MORNING_CAMERA_OFFSET_Y", "0.115"))  # 2026-10-16: botたん v20 で身長を 1.043 倍にしたので、カメラの長さも同じ倍率（旧 0.11）
 # カット割りで寄るときの中心（顔の画面座標）。CAMERA_OFFSET_Y を変えたら測り直すこと。
 # 2026-10-08 の録画のフレームから実測した値（目と口の中間）
 FACE_CLOSE = (540, 1540)
