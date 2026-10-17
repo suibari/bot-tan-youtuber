@@ -3,6 +3,7 @@
 botたん 夜の動画 自動投稿パイプライン（毎日 18:00・Bluesky）
 
 Bluesky と Nagi の投稿から1件を紹介する縦動画を作り、Bluesky に投稿する（shorts/bluesky.py）。
+台本の前に企画を立て、②の型・切り口を台帳（shorts/night_history.py）から日替わりで選ぶ。
 その夜のおやすみポスト（bsky-affirmative-bot）が RP とコメントで紹介する。
 YouTube には出さない（2026-10、YouTube は朝のクイズだけに絞った）。
 
@@ -38,9 +39,12 @@ import tempfile
 from dotenv import load_dotenv
 load_dotenv()
 
-from prompts import SYSTEM_PROMPT, build_user_prompt, usable_interactions
+from prompts import (SYSTEM_PROMPT, PLAN_SYSTEM_PROMPT, build_user_prompt,
+                     build_plan_prompt, usable_interactions)
 import english
 import chibi
+import night_history
+import night_research
 import rich_text
 
 # 共通処理は core.py に集約されている。
@@ -140,6 +144,40 @@ SCRIPT_SCHEMA = {
         },
     },
     "required": ["sections", "meta"],
+}
+
+# 企画（台本の前段）のスキーマ。キー名は Ollama がアルファベット順に書いても
+# chosen_post → concrete_things → ideas、about → angle → idea の順になるように選んである（投稿を決めてから候補を書かせる）
+PLAN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "chosen_post": {"type": "integer"},
+        # 投稿に出てくる具体的なもの。豆知識をこれについて書かせる（気持ちの一般論にしない）
+        "concrete_things": {"type": "array", "items": {"type": "string"}},
+        "ideas": {
+            "type": "object",
+            "properties": {
+                "fact": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            # concrete_things のどれについての事実か
+                            "about": {"type": "string"},
+                            "angle": {"type": "string", "enum": list(night_history.FACT_ANGLES)},
+                            "idea": {"type": "string"},
+                        },
+                        "required": ["about", "angle", "idea"],
+                    },
+                },
+                "metaphor": {"type": "string"},
+                "question": {"type": "string"},
+                "reframe": {"type": "string"},
+            },
+            "required": ["fact", "metaphor", "question", "reframe"],
+        },
+    },
+    "required": ["chosen_post", "concrete_things", "ideas"],
 }
 
 # ──────────────────────────────────────────────
@@ -270,11 +308,45 @@ def mentions_nagi(raw_script: str) -> bool:
     return not texts or any(w in t for t in texts for w in ("Nagi", "ナギ", "Bluesky", "ブルースカイ"))
 
 
-def generate_script(data: dict, corner_context: dict = None) -> str:
-    """DBデータから台本を生成する"""
+def plan_corner(data: dict, corner_context: dict = None, history: list[dict] = None) -> dict:
+    """企画: 紹介する投稿と、②の2ステップ目の候補を型ごとに出させ、
+    直近で使っていない型・切り口を選ぶ（night_history.choose_plan）。
+
+    企画に失敗しても台本は作る。そのときも型と切り口は台帳から選ぶ（投稿は台本の LLM が選ぶ）。
+    """
+    history = history or []
+    try:
+        ideas = llm_json(PLAN_SYSTEM_PROMPT, build_plan_prompt(data, corner_context, history),
+                         PLAN_SCHEMA)
+    except Exception as e:
+        print(f"[企画] 失敗しました（型と切り口だけ決めて続行）: {e}")
+        ideas = None
+    print(f"[企画] 候補: {json.dumps(ideas, ensure_ascii=False)}")
+    plan = night_history.choose_plan(ideas, history)
+    if plan["type"] == "fact":
+        # 豆知識は Gemini の検索で調べた事実だけを使う。調べられなければ、その日は別の型にする
+        facts = None
+        if plan.get("about"):
+            try:
+                facts = _timed("Step2b 豆知識の調べもの", night_research.research, plan)
+            except Exception as e:
+                print(f"[企画] 豆知識の調べものに失敗しました: {e}")
+        if facts:
+            plan["research"] = facts
+        else:
+            print("[企画] 豆知識を調べられなかったので、今日は別の型にします")
+            plan = night_history.choose_plan(ideas, history, exclude=("fact",))
+    print(f"[企画] 採用: {plan}")
+    return plan
+
+
+def generate_script(data: dict, corner_context: dict = None, plan: dict = None,
+                    history: list[dict] = None) -> str:
+    """DBデータから台本を生成する。plan は plan_corner の戻り値"""
     print(f"[LLM] 台本生成中...")
 
-    user_prompt = build_user_prompt(data, corner_context=corner_context)
+    user_prompt = build_user_prompt(data, corner_context=corner_context, plan=plan,
+                                    history=history)
     # スキーマは経路によらず response_format で渡す。Gemini はそのまま
     # OpenAI 互換で受け、Ollama は common/llm.py が native の format へ写す。
     # （extra_body に response_mime_type/response_schema を渡すと Gemini は400になる。
@@ -527,22 +599,31 @@ def main():
         except Exception as e:
             print(f"[corner_context] 取得失敗（スキップ）: {e}")
 
+        # 直近の動画で話したこと（型・切り口・①③の言い回し）。同じ話が続かないように使う
+        history = []
+        try:
+            history = night_history.load_recent()
+        except Exception as e:
+            print(f"[台帳] 読み込み失敗（スキップ）: {e}")
+
         # 音声が完成してから ARDY を起動する。
         ardy_proc = None
 
-        # Step 2: 台本生成
+        # Step 2: 企画 → 台本生成
+        plan = None
         script_cache = os.getenv("SCRIPT_CACHE", "")
         if script_cache and Path(script_cache).exists():
             raw_script = open(script_cache).read()
             print(f"[LLM] キャッシュから台本読み込み: {script_cache}")
         else:
-            raw_script = _timed("Step2 台本生成", generate_script, data, corner_context)
+            plan = _timed("Step2a 企画", plan_corner, data, corner_context, history)
+            raw_script = _timed("Step2 台本生成", generate_script, data, corner_context, plan, history)
             # どこで見た投稿かは外せない（Nagi の紹介も兼ねている）。抜けたら書き直させる
             for retry in range(NAGI_MENTION_RETRIES):
                 if mentions_nagi(raw_script):
                     break
                 print(f"[LLM] NagiCorner に「Bluesky」「Nagi」が無いので書き直します（{retry + 1}回目）")
-                raw_script = _timed("Step2 台本生成", generate_script, data, corner_context)
+                raw_script = _timed("Step2 台本生成", generate_script, data, corner_context, plan, history)
             else:
                 if not mentions_nagi(raw_script):
                     print("[警告] 書き直しても NagiCorner に「Bluesky」「Nagi」が入りませんでした。このまま続けます")
@@ -569,7 +650,12 @@ def main():
         print(f"[セクション] 検出: {list(sections.keys())}")
 
         # 紹介元の投稿（動画ポストの添え文にリンクを付ける）
-        picked = pick_source_post(data, script_meta.get("picked_post"))
+        # 企画で投稿が決まっていればそれを使う（台本の一覧にはその1件しか載せていない）。
+        # 企画の番号が一覧に無ければ、台本の LLM が一覧全体から選んだ番号を使う
+        picked_no = (plan or {}).get("picked_post")
+        if not (isinstance(picked_no, int) and 1 <= picked_no <= len(usable_interactions(data))):
+            picked_no = script_meta.get("picked_post")
+        picked = pick_source_post(data, picked_no)
         caption_ja = bluesky.strip_links(script_meta.get("post_caption") or "") or thumbnail_text
         print(f"[紹介元] {picked and (picked['network'], picked['display_name'], picked['uri'])}")
         print(f"[添え文] {caption_ja}")
@@ -729,6 +815,9 @@ def main():
             "caption_en": bluesky.strip_links(en["lines"][-1]) if en else "",
             "source": picked,
             "themes": script_meta.get("nagi_themes") or [],
+            # 台帳（night_history）に残す。投稿できた回だけ bluesky.py が書く
+            "plan": {k: v for k, v in (plan or {}).items() if k not in ("picked_post", "research")},
+            "closing_ja": "".join(st["text"] for st in sections.get("Closing", [])),
             "width": W, "height": H,
         }
         job_path = mp4_path.replace(".mp4", "_bluesky.json")

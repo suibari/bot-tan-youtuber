@@ -128,6 +128,109 @@ class PostListTest(unittest.TestCase):
         self.assertIsNone(pipeline.pick_source_post(data, None))
 
 
+class TypeRotationTest(unittest.TestCase):
+    """②の2ステップ目は日替わりの型で書かせる。
+
+    2026-10-10〜17 は「意外な事実」の8本中7本が脳・ホルモンの話だった。
+    唯一の例が「人と話すだけで、幸せに関わるホルモンが出る」だったのも一因。
+    """
+
+    def test_the_hormone_example_is_gone(self):
+        self.assertNotIn("ホルモン", build())
+
+    def test_each_type_gets_its_own_step(self):
+        for kind, (label, _what, _ex) in prompts.TYPE_STEPS.items():
+            prompt = build(plan={"type": kind, "angle": None, "idea": "", "picked_post": None})
+            self.assertIn(f"2. {label}:", prompt)
+            for other, (other_label, _w, _e) in prompts.TYPE_STEPS.items():
+                if other != kind:
+                    self.assertNotIn(f"2. {other_label}:", prompt)
+
+    def test_the_planned_angle_and_idea_are_passed(self):
+        prompt = build(plan={"type": "fact", "angle": "歴史・由来",
+                             "idea": "警察署の建物は明治に洋風になった", "picked_post": 2})
+        self.assertIn("切り口は「歴史・由来」", prompt)
+        self.assertIn("警察署の建物は明治に洋風になった", prompt)
+
+    def test_a_planned_post_is_the_only_one_listed(self):
+        prompt = build(plan={"type": "question", "angle": None, "idea": "", "picked_post": 2})
+        self.assertIn("2. [Nagi]", prompt)
+        self.assertNotIn("Don't ever give up.", prompt)
+        self.assertIn("meta.picked_post には 2 を書く", prompt)
+
+    def test_an_unknown_planned_post_falls_back_to_the_whole_list(self):
+        prompt = build(plan={"type": "question", "angle": None, "idea": "", "picked_post": 9})
+        self.assertIn("Don't ever give up.", prompt)
+        self.assertIn(POLICE_POST, prompt)
+
+    def test_each_closing_form_gets_its_own_example(self):
+        for form, (_what, example) in prompts.CLOSING_STEPS.items():
+            prompt = build(plan={"type": "fact", "closing_form": form})
+            self.assertIn(f"「{example}」→（ループして）", prompt)
+
+    def test_the_plan_prompt_asks_for_concrete_things(self):
+        prompt = prompts.build_plan_prompt(DATA)
+        self.assertIn("concrete_things", prompt)
+        self.assertIn("about には concrete_things", prompt)
+
+    def test_recent_hooks_and_closings_are_listed(self):
+        prompt = build(history=[{"date": "2026-10-17", "type": "fact", "hook": "こだわりは正解だよ",
+                                 "closing": "今から伝えるね。"}])
+        self.assertIn("「こだわりは正解だよ」", prompt)
+        self.assertIn("「今から伝えるね。」", prompt)
+
+    def test_the_plan_prompt_asks_for_every_type_and_shows_history(self):
+        prompt = prompts.build_plan_prompt(
+            DATA, history=[{"date": "2026-10-17", "type": "fact", "angle": "心と体",
+                            "idea": "脳の報酬系が反応する"}])
+        for kind in prompts.TYPE_STEPS:
+            self.assertIn(f"  - {kind}（", prompt)
+        self.assertIn("意外な事実（心と体） 脳の報酬系が反応する", prompt)
+        self.assertIn(POLICE_POST, prompt)
+
+
+class ResearchedFactTest(unittest.TestCase):
+    """豆知識は Gemini の検索で調べた事実だけを使う（shorts/night_research.py）。"""
+
+    RESEARCH = "- ブックオフの1号店は1990年に相模原で開店した\n- 「本を売るならブックオフ」"
+
+    def test_researched_facts_replace_the_planned_idea(self):
+        prompt = build(plan={"type": "fact", "angle": "歴史・由来", "about": "ブックオフ",
+                             "idea": "ブックオフは1980年に誕生した", "research": self.RESEARCH})
+        self.assertIn("ブックオフの1号店は1990年に相模原で開店した", prompt)
+        self.assertIn("ここに書かれていないことは足さない", prompt)
+        self.assertNotIn("1980年", prompt)
+
+    def test_plan_corner_uses_research_or_switches_type(self):
+        from unittest import mock
+        import pipeline
+        raw = {"chosen_post": 1, "concrete_things": ["ブックオフ"], "ideas": {
+            "fact": [{"about": "ブックオフ", "angle": "歴史・由来", "idea": "1980年に誕生"}],
+            "question": "q", "reframe": "r", "metaphor": "m"}}
+        with mock.patch.object(pipeline, "llm_json", return_value=raw), \
+             mock.patch.object(pipeline.night_research, "research", return_value=self.RESEARCH) as r:
+            plan = pipeline.plan_corner(DATA, history=[])
+        r.assert_called_once()
+        self.assertEqual((plan["type"], plan["research"]), ("fact", self.RESEARCH))
+
+        # 検索が走らなかった日は推測の豆知識を出さず、Gemini をそれ以上呼ばずに次の型へ
+        with mock.patch.object(pipeline, "llm_json", return_value=raw), \
+             mock.patch.object(pipeline.night_research, "research", return_value=None) as r:
+            plan = pipeline.plan_corner(DATA, history=[])
+        r.assert_called_once()
+        self.assertEqual(plan["type"], "question")
+        self.assertNotIn("research", plan)
+
+    def test_a_failed_plan_never_writes_an_unresearched_fact(self):
+        from unittest import mock
+        import pipeline
+        with mock.patch.object(pipeline, "llm_json", side_effect=RuntimeError("down")), \
+             mock.patch.object(pipeline.night_research, "research") as r:
+            plan = pipeline.plan_corner(DATA, history=[])
+        r.assert_not_called()
+        self.assertNotEqual(plan["type"], "fact")
+
+
 class ConstraintSectionTest(unittest.TestCase):
     def test_nagi_theme_exclusion_is_passed(self):
         prompt = build(corner_context={"excluded_nagi_themes": ["眠れない夜"]})

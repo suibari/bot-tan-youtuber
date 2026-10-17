@@ -251,5 +251,8 @@ data/obs/
 # クイズの消費台帳。パイプラインが追記する
 data/quiz_used.csv
 
+# 夜の動画で話した型・切り口の台帳。投稿のたびに追記する（shorts/night_history.py）
+data/night_used.jsonl
+
 # 効果音ラボの効果音。規約で再配布が禁止されているので追跡しない（shorts/chibi.py）
 data/se/

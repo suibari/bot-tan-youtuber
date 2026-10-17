@@ -326,9 +326,18 @@ def post_from_job(job_path: str) -> dict:
 
 
 def _record(job: dict, job_path: str) -> None:
-    """おやすみポストへ渡す記録（night_videos）。失敗したら投げる（記録が無いと紹介されない）。"""
+    """おやすみポストへ渡す記録（night_videos）。失敗したら投げる（記録が無いと紹介されない）。
+
+    あわせて、話した型・切り口を台帳（night_history）に残す。こちらは失敗しても投げない
+    （次の回の型選びが1回ずれるだけ）。
+    """
+    import night_history
     import night_videos
     night_videos.save(job, job["posted"]["uri"], job["posted"]["cid"])
+    try:
+        night_history.append(job)
+    except Exception as e:
+        print(f"[台帳] 書き込み失敗: {e}")
     job["recorded"] = True
     Path(job_path).write_text(json.dumps(job, ensure_ascii=False, indent=2, default=str))
 

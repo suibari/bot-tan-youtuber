@@ -55,9 +55,9 @@ def build_question(item: dict) -> str:
         original_title=item.get("original_title", ""), developer=item.get("developer", ""))
 
 
-def _ask(model: str, question: str) -> dict:
+def _ask(model: str, question: str, system: str = SYSTEM) -> dict:
     body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM}]},
+        "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": question}]}],
         "tools": [{"googleSearch": {}}],
         "generationConfig": {
@@ -80,15 +80,22 @@ def research(item: dict) -> dict | None:
 
     返り値は {"text", "queries", "model"}。API の失敗は例外のまま上げる。
     """
+    return search(build_question(item), item["title"])
+
+
+def search(question: str, label: str, system: str = SYSTEM) -> dict | None:
+    """question を検索つきで聞く。検索が走らなかったら1回だけやり直し、それでも走らなければ None。
+
+    夜版の豆知識（shorts/night_research.py）もこれを使う。system は1行に保つこと（冒頭を参照）。
+    """
     if not grounding._api_key():
         raise RuntimeError("GEMINI_API_KEY がありません")
     model = grounding.LIVE_GROUNDING_MODELS[0]
-    question = build_question(item)
     for attempt in range(1, TRIES + 1):
-        text, queries = grounding._read(_ask(model, question))
-        print(f"[調べもの] {item['title']}: 検索{len(queries)}件（{attempt}回目）")
+        text, queries = grounding._read(_ask(model, question, system))
+        print(f"[調べもの] {label}: 検索{len(queries)}件（{attempt}回目）")
         # 検索せずに返した本文はモデルの記憶からの推測なので、使わない
         if queries and text and not text.strip().upper().startswith("UNKNOWN"):
             return {"text": text, "queries": queries, "model": model}
-    print(f"[調べもの] {item['title']}: 検索が走らなかったので使いません")
+    print(f"[調べもの] {label}: 検索が走らなかったので使いません")
     return None
