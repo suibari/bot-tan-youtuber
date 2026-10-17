@@ -117,8 +117,10 @@ def _wrap_cjk(text: str, font, draw, max_w: int) -> list[str]:
 
 def generate_quiz_thumbnail(frame_png: str, output_png: str, question_text: str,
                             corner_text: str = "朝の勘違いクイズ",
-                            max_lines: int = 3) -> None:
+                            max_lines: int = 3, tagline: str = "A or B？") -> None:
     """問題文を中央に極大表示したサムネイルを作る。
+
+    作品紹介でも作品名を出すのに使う。tagline を空にすると下の煽り文句を出さない。
 
     既存の generate_thumbnail は単一行専用なので流用できない。
     縁取りは draw_text_with_outline だと (2w+1)^2 回描画することになるため
@@ -160,12 +162,13 @@ def generate_quiz_thumbnail(frame_png: str, output_png: str, question_text: str,
                   stroke_width=10, stroke_fill=MINT)
 
     # 煽り文句は問題文の直下に置く（キャラの顔に重ねない）
-    font_ab = ImageFont.truetype(FONT_MARU, 120)
-    bbox = draw.textbbox((0, 0), "A or B？", font=font_ab)
-    draw_text_with_outline(draw, "A or B？", font_ab,
-                           (W - (bbox[2] - bbox[0])) // 2, top + block_h + 70,
-                           text_color=(255, 255, 255), outline_color=MINT,
-                           outline_width=10)
+    if tagline:
+        font_ab = ImageFont.truetype(FONT_MARU, 120)
+        bbox = draw.textbbox((0, 0), tagline, font=font_ab)
+        draw_text_with_outline(draw, tagline, font_ab,
+                               (W - (bbox[2] - bbox[0])) // 2, top + block_h + 70,
+                               text_color=(255, 255, 255), outline_color=MINT,
+                               outline_width=10)
 
     img.convert("RGB").save(output_png)
     print(f"[サムネイル] 生成完了: {output_png} (問題文 {size}px / {len(lines)}行)")

@@ -142,11 +142,14 @@ https://note.com/suibari/n/n36e699f32479
 def build_description(kind: str, credits: str, quiz_line: str = "") -> str:
     """英語版の説明文。credits は日本語版と同じクレジット欄をそのまま使う。
 
-    kind: "night" | "quiz"
+    kind: "night" | "quiz" | "pickup"
     """
     if kind == "quiz":
         lead = ("Bot-tan brings you a morning quiz about common misconceptions.\n"
                 "It's okay not to know. Learning one thing today is more than enough!")
+    elif kind == "pickup":
+        lead = ("Bot-tan introduces a new anime, movie, drama, song or game every morning.\n"
+                "The info is gathered from official databases and web search by AI.")
     else:
         lead = "Bot-tan talks about what she felt on Nagi today."
     if quiz_line:

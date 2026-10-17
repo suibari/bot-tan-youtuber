@@ -1,5 +1,5 @@
 [Unit]
-Description=botたん 朝の勘違いクイズパイプライン
+Description=botたん 朝のShortsパイプライン（作品紹介 / 勘違いクイズ）
 After=network-online.target
 Wants=network-online.target
 

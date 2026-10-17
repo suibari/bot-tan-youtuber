@@ -230,6 +230,7 @@ test*.py
 !tools/test_unity.py
 # クイズ消費台帳（機械が追記するので git 管理しない）
 data/quiz_used.csv
+data/pickup_used.csv
 
 # ── botたん固有 ────────────────────────────────
 # 秘密情報。DB・Gemini・YouTube の資格情報が入る。

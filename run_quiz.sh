@@ -1,5 +1,5 @@
 #!/bin/bash
-# 朝の勘違いクイズ Shorts 生成パイプラインの起動スクリプト
+# 朝の Shorts（作品紹介 / 勘違いクイズ）生成パイプラインの起動スクリプト
 #
 # パスはこのスクリプトの位置から解決する。
 #
@@ -36,10 +36,17 @@ for arg in "$@"; do
     fi
 done
 
-# 朝版は隔日（shorts/turn.py）。番でない日は何もしない。
-# 量産コンテンツ扱いで Shorts フィードから外れたため。夜版は Bluesky に移した。
-# 手動で今すぐ撮るときは SHORTS_ALTERNATE_DAYS=false を引数に渡す
-if ! "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/shorts/turn.py" quiz; then
+# 朝版の中身。2026-10-17 にクイズから作品紹介へ切り替えた（毎日、曜日でテーマが変わる）。
+# クイズに戻すときは MORNING_FORMAT=quiz（隔日。shorts/turn.py）
+MORNING_FORMAT="${MORNING_FORMAT:-pickup}"
+case "$MORNING_FORMAT" in
+    pickup) PIPELINE="$SCRIPT_DIR/shorts/pickup_pipeline.py"; JOB_NAME="朝の作品紹介" ;;
+    quiz)   PIPELINE="$SCRIPT_DIR/shorts/quiz_pipeline.py";   JOB_NAME="朝のクイズ" ;;
+    *) echo "MORNING_FORMAT が不正です: $MORNING_FORMAT（pickup / quiz）" >&2; exit 2 ;;
+esac
+
+# 番でない日は何もしない（クイズは隔日。手動で今すぐ撮るときは SHORTS_ALTERNATE_DAYS=false）
+if ! "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/shorts/turn.py" "$MORNING_FORMAT"; then
     exit 0
 fi
 
@@ -65,7 +72,7 @@ LOG_FILE="$SCRIPT_DIR/logs/quiz_$(date +%Y%m%d_%H%M%S).log"
 # /tmp/.X*-lock も全削除するため、夜版と同時に走ると互いを壊す。
 # systemd timer の Persistent=true により、停止後の再起動で両方が同時発火しうる。
 flock -w 3600 /tmp/bottan-render.lock \
-  "$SCRIPT_DIR/venv/bin/python" -u "$SCRIPT_DIR/shorts/quiz_pipeline.py" "${PY_ARGS[@]}" \
+  "$SCRIPT_DIR/venv/bin/python" -u "$PIPELINE" "${PY_ARGS[@]}" \
   2>&1 | tee "$LOG_FILE"
 # tee ではなく python の終了コードを systemd に返す。
 # 保存しないと下の if 文の値がスクリプトの終了コードになり、
@@ -80,7 +87,7 @@ if [ "$STATUS" -ne 0 ]; then
 import sys
 sys.path.insert(0, '$SCRIPT_DIR')
 from common import notify
-notify.error('朝のクイズ', open('$LOG_FILE', errors='replace').read()[-1500:])
+notify.error('$JOB_NAME', open('$LOG_FILE', errors='replace').read()[-1500:])
 " 2>/dev/null || true
 fi
 

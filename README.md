@@ -1,6 +1,6 @@
 # bot-tan-youtuber
 
-全肯定botたんの動画生成・投稿と、YouTube LiveでのAITuber配信を運用するシステムです。SNSの投稿を紹介する夜の縦動画、朝のクイズShorts、視聴者と会話するライブ配信を、共通の音声合成・モーション生成・記憶基盤で実行します。
+全肯定botたんの動画生成・投稿と、YouTube LiveでのAITuber配信を運用するシステムです。SNSの投稿を紹介する夜の縦動画、朝の作品紹介Shorts、視聴者と会話するライブ配信を、共通の音声合成・モーション生成・記憶基盤で実行します。
 
 本書は、本リポジトリの現行実装に基づく機能仕様と導入・運用手順を定義します。Unityプロジェクト、音声合成サーバー、記憶基盤は別リポジトリで管理します。
 
@@ -20,12 +20,12 @@
 | 機能 | 入力・処理 | 出力先 | 標準スケジュール（JST） |
 |---|---|---|---|
 | 夜の縦動画 | Bluesky / Nagiの投稿を選び、紹介台本・音声・映像を生成 | Bluesky | 毎日18:00 |
-| 朝のクイズShorts | クイズデータから出題・解答の動画を生成 | YouTube | 隔日06:00 |
+| 朝の作品紹介Shorts | 曜日ごとのテーマで作品を選び、検索で調べた事実から紹介動画を生成 | YouTube | 毎日06:00 |
 | 配信枠の事前準備 | 次の2回の配信枠を作成・再利用し、視聴URLを保存 | YouTube / 共有DB | 毎日04:00 |
 | ライブ配信 | コメントへの返答、フリートーク、字幕・モーションの制御 | YouTube Live | 土曜20:40起動、21:00–22:00配信 |
 | Unityライセンス確認 | 有効期限の確認と保存済み認証による更新 | ログ / Discord通知 | 毎日12:00、および各ジョブ開始前 |
 
-夜の縦動画はYouTubeへ投稿しません。朝のクイズはtimer自体が毎日起動し、`shorts/turn.py`がJSTの日付の通し番号が偶数の日だけ実行を許可します。`SHORTS_ALTERNATE_DAYS=false`で毎日実行へ切り替えられます。
+夜の縦動画はYouTubeへ投稿しません。朝版は2026-10-17にクイズから作品紹介へ切り替え、毎日投稿します。`MORNING_FORMAT=quiz`でクイズに戻せます。クイズは`shorts/turn.py`がJSTの日付の通し番号が偶数の日だけ実行を許可し、`SHORTS_ALTERNATE_DAYS=false`で毎日実行になります。
 
 スケジュールの定義は[setupのtimer](./setup/)と[live/schedule.py](./live/schedule.py)です。配信枠の事前準備は、インストール済みの配信timerの曜日を参照します。未インストール時はリポジトリ内のtimerを参照します。
 
@@ -36,7 +36,7 @@
 ```mermaid
 flowchart LR
     SNS[Bluesky / Nagi] --> Shorts[動画生成パイプライン]
-    Quiz[クイズCSV] --> Shorts
+    Works[AniList / TMDB / IGDB / iTunes] --> Shorts
     Shorts --> Upload[Bluesky / YouTube]
     YouTube[YouTube Liveチャット] --> Live[ライブ制御]
     Live --> Unity[Unity]
@@ -68,7 +68,7 @@ flowchart LR
 
 ```text
 common/           設定、LLM、音声、ARDY、DB、OAuth、ライセンス確認の共通処理
-shorts/           夜の縦動画・朝のクイズの生成と投稿
+shorts/           夜の縦動画・朝の作品紹介（旧: クイズ）の生成と投稿
 live/             配信枠、チャット、会話、記憶、Unity・OBSの制御
 setup/            systemd、Xorg、openboxの設定とインストーラ
   patches/        外部サーバーに必要な互換性修正
@@ -77,7 +77,7 @@ data/            クイズ、BGM、演出素材、モーションなど
 docs/            調査記録と参照資料
 tests/           自動テスト
 run.sh           夜の縦動画の起動
-run_quiz.sh      朝のクイズの起動
+run_quiz.sh      朝のShorts（作品紹介 / クイズ）の起動
 run_live.sh      ライブ配信の起動
 .env.example     環境設定のテンプレート
 ```
@@ -104,7 +104,18 @@ run_live.sh      ライブ配信の起動
 
 `data/chibi/`のPNGと`data/se/`の効果音を使って山場を演出します。素材がない演出は省略します。`SKIP_BLUESKY=true`では投稿を省略し、MP4と投稿用JSONを残します。夜版では`SKIP_YOUTUBE=true`も同じ意味です。
 
-### 3.2 朝のクイズShorts
+### 3.2 朝の作品紹介Shorts
+
+曜日ごとのテーマ（月: 新作アニメ、火: 名作アニメ、水: 新曲、木: 新作ゲーム、金: 新作映画、土: 名作映画、日: 新作ドラマ）で作品を1本選び、約30秒の紹介動画を生成してYouTubeへ投稿します。対応は`shorts/pickup_sources.py`の`WEEKDAY_THEMES`です。
+
+1. AniList・iTunes・TMDB・IGDBから候補を取得し、紹介済み（`data/pickup_used.csv`）を除いて選びます。ドラマはテレビ放送の作品に限り、成人向けの作品は除きます。
+2. Geminiの検索グラウンディングで作品の事実を調べます。検索が走らなかった作品は使わず、次の候補へ進みます。
+3. ローカルLLMが調査メモの範囲で台本を書きます。名作の「〇年前の今週」、字数、賞の名前、機種・配信サービス名はコードで検証・修正します。
+4. 画面上部のパネルにアートワーク・作品名・日付・画像の出典を表示します。タイトルは作品名から始めます。
+
+テーマは`PICKUP_THEME`または`--theme`で固定でき、`--stage script`で台本まで確認できます。台帳への記録は`PICKUP_NO_CONSUME=true`で抑止します。映画・ドラマには`TMDB_API_KEY`、ゲームには`IGDB_CLIENT_ID`と`IGDB_CLIENT_SECRET`が必要です。
+
+#### 朝のクイズ（`MORNING_FORMAT=quiz`）
 
 クイズCSVから問題を選択し、出題・思考時間・解答を含む台本、音声、モーション、縦動画を生成してYouTubeへ投稿します。使用済み問題は`data/quiz_used.csv`で管理します。
 
@@ -270,10 +281,10 @@ systemctl list-timers 'bottan-*' --no-pager
 
 ```sh
 ./run.sh SKIP_BLUESKY=true
-./run_quiz.sh SHORTS_ALTERNATE_DAYS=false SKIP_YOUTUBE=true QUIZ_NO_CONSUME=true --preview
+./run_quiz.sh SKIP_YOUTUBE=true PICKUP_NO_CONSUME=true --preview
 ```
 
-夜版はUnity収録まで実行します。クイズの例は投稿・問題消費を抑止し、レイアウト確認用の動画を生成します。台本だけを確認する場合はクイズに`--dry-run`を指定します。
+夜版はUnity収録まで実行します。朝版の例は投稿・台帳への記録を抑止し、レイアウト確認用の動画を生成します。台本だけを確認する場合は`--stage script`を指定します。
 
 ### 6.2 ローカルでライブを確認する
 

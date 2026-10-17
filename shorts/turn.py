@@ -12,7 +12,11 @@
 タイマー（systemd）はそのままにして、起動スクリプトの頭でこれを呼ぶ。
 自分の番でない日は何もせず終わる。SHORTS_ALTERNATE_DAYS=false で毎日に戻る。
 
-    python shorts/turn.py quiz   # 番なら終了コード 0、そうでなければ 1
+2026-10-17 に朝版をクイズから作品紹介（shorts/pickup_pipeline.py）へ切り替えた。
+隔日にしても数字は戻らなかったので、作品紹介は毎日出す（曜日でテーマが変わる）。
+
+    python shorts/turn.py quiz     # 番なら終了コード 0、そうでなければ 1
+    python shorts/turn.py pickup   # 毎日 0
 """
 
 import datetime
@@ -25,8 +29,8 @@ from common.env import env_flag  # noqa: E402  (.env もここで読まれる)
 
 JST = datetime.timezone(datetime.timedelta(hours=9))
 
-# JST の日付の通し番号が偶数の日が朝版の番（夜版と交互だった頃の割り当てを保つ）
-KINDS = {"quiz": 0}
+# JST の日付の通し番号が偶数の日が朝版の番（夜版と交互だった頃の割り当てを保つ）。None は毎日
+KINDS = {"quiz": 0, "pickup": None}
 
 
 def today_jst() -> datetime.date:
@@ -38,7 +42,8 @@ def today_jst() -> datetime.date:
 
 
 def is_my_turn(kind: str, today: datetime.date | None = None) -> bool:
-    if not env_flag("SHORTS_ALTERNATE_DAYS", True):
+    # 作品紹介は毎日（テーマは曜日で変わる。shorts/pickup_sources.py）
+    if KINDS[kind] is None or not env_flag("SHORTS_ALTERNATE_DAYS", True):
         return True
     today = today or today_jst()
     return today.toordinal() % 2 == KINDS[kind]
