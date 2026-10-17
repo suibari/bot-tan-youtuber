@@ -142,11 +142,12 @@ def _insert(youtube, body: dict, mp4_path: str) -> dict:
 
 
 def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_path: str = "",
-                      english: dict = None) -> None:
+                      english: dict = None, tags: list[str] = None) -> None:
     """YouTube Data API v3で動画をアップロードする
 
     english（{"title", "description", "srt"}）を渡すと、英語版のタイトル・説明文を
     投稿と同時に付け、投稿のあとに英語字幕トラックを足す。
+    tags は固定のタグ（botたん など）の前に足す。作品紹介は作品名を入れる。
     """
     print(f"[YouTube] アップロード中: {title}")
     youtube = _get_youtube_client()
@@ -162,7 +163,7 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
             "snippet": {
                 "title": title,
                 "description": description,
-                "tags": ["botたん", "全肯定", "Nagi", "VTuber"],
+                "tags": [t for t in (tags or []) if t] + ["botたん", "全肯定", "Nagi", "VTuber"],
                 "categoryId": "22",
             },
             "status": {

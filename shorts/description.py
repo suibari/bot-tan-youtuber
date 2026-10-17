@@ -110,3 +110,49 @@ def build_quiz_title(hook: str = "") -> str:
     if hook:
         return f"{hook} / 朝の勘違いクイズ"
     return "朝の勘違いクイズ / 全肯定botたん"
+
+
+# ──────────────────────────────────────────────
+# 朝の作品紹介版
+# ──────────────────────────────────────────────
+
+# YouTube のタイトルは100文字まで、< > は使えない（超えると投稿が 400 になる）
+_TITLE_MAX = 100
+
+# TMDB の利用規約で求められる帰属表記
+TMDB_NOTICE = "This product uses the TMDB API but is not endorsed or certified by TMDB."
+
+
+def pickup_suffix(theme: str) -> str:
+    """タイトルの末尾。tools/shorts_stats.py がこれでテーマを見分ける。"""
+    from pickup_sources import THEME_LABELS
+    return f" / botたんの{THEME_LABELS[theme]}紹介"
+
+
+def build_pickup_title(item: dict, hook: str = "") -> str:
+    """作品名を先頭に置く。検索から来てもらうため（クイズの題材は検索されなかった）。"""
+    tail = pickup_suffix(item["theme"])
+    head = f"【{item['title']}】{hook}".replace("<", "").replace(">", "")
+    return head[:_TITLE_MAX - len(tail)].rstrip() + tail
+
+
+def build_pickup_description(item: dict, bgm_generated: bool = False) -> str:
+    from pickup_sources import THEME_LABELS
+    from pickup_layout import date_line
+
+    who = f" / {item['artist']}" if item.get("artist") else ""
+    notice = f"\n{TMDB_NOTICE}" if item["credit"].startswith("画像：TMDB") else ""
+    return f"""全肯定botたんが、朝いちばんに{THEME_LABELS[item['theme']]}を紹介します。
+
+📌 今日の作品：{item['title']}{who}（{date_line(item)}）
+作品の情報：{item['source_url']}
+
+🤖 この動画はAIによる完全自動投稿です
+台本作成・動画撮影・YouTubeアップロードまで全て自動で行っています。
+作品の情報は、公式のデータベースとWeb検索で確認した内容をもとにAIがまとめています。
+最新の情報は公式サイトでご確認ください。
+
+🖼 {item['credit']}{notice}
+
+{_COMMON_FOOTER.replace('#雑学 #クイズ', '#' + THEME_LABELS[item['theme']])}
+{_credits(bgm_generated)}"""

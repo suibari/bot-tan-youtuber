@@ -54,6 +54,7 @@ GENRES = [
 ]
 MOODS = {
     "quiz":  "cheerful, bright and curious morning mood",
+    "pickup": "cheerful, bright and exciting morning mood",
     "night": "warm, gentle and comforting evening mood",
 }
 

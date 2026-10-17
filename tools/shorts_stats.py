@@ -2,6 +2,7 @@
 """朝版・夜版の再生数を週ごとにまとめる（手動で使う）。
 
 2026-09-14 から Shorts フィードに乗らなくなり、朝夜とも1本あたり0〜3回に落ちた。
+2026-10-17 に朝版をクイズから作品紹介へ切り替えた。作品紹介はテーマごとにも並べる。
 隔日化（shorts/turn.py）と配色・台詞の抽選で戻るかを、ここで週ごとに追う。
 
     ./venv/bin/python tools/shorts_stats.py            # 直近8週
@@ -13,6 +14,7 @@ API 呼び出しはチャンネル1回 + アップロード一覧 (本数/50) �
 """
 
 import argparse
+import re
 import datetime
 import sys
 from collections import defaultdict
@@ -25,9 +27,15 @@ JST = datetime.timezone(datetime.timedelta(hours=9))
 
 
 def kind_of(title: str) -> str | None:
-    """タイトルの末尾で見分ける（shorts/description.py の build_*title）。"""
+    """タイトルの末尾で見分ける（shorts/description.py の build_*title）。
+
+    作品紹介はテーマ（「新作アニメ」など）ごとに分ける。どの曜日のテーマが伸びるかを見る。
+    """
     if title.endswith("/ 朝の勘違いクイズ"):
         return "朝"
+    m = re.search(r"/ botたんの(.+)紹介$", title)
+    if m:
+        return m.group(1)
     if title.endswith("/ 全肯定botたん"):
         return "夜"
     return None
@@ -85,6 +93,18 @@ def main() -> None:
                 cell = "-"
             row += f"{cell:<32}"
         print(row)
+
+    # 作品紹介はテーマが曜日で決まるので、週ではなくテーマごとに並べる
+    themes = defaultdict(list)
+    for monday in weeks:
+        for kind, views in weeks[monday].items():
+            if kind not in ("朝", "夜"):
+                themes[kind] += views
+    if themes:
+        print(f"\n{'作品紹介のテーマ':<14}本数  中央値  最大  合計")
+        for kind, views in sorted(themes.items(), key=lambda kv: -sum(kv[1])):
+            views = sorted(views)
+            print(f"{kind:<16}{len(views):>3}本  {views[len(views) // 2]:>5}  {views[-1]:>5}  {sum(views):>6}")
 
 
 if __name__ == "__main__":
