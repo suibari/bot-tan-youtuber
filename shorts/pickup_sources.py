@@ -22,6 +22,8 @@ import datetime
 import os
 import random
 import time
+import math
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
@@ -135,9 +137,45 @@ AL_NG_GENRES = {"Ecchi", "Hentai"}
 
 def _anilist(args: str) -> list[dict]:
     query = f"query{{Page(perPage:20){{media({args}){{{_AL_FIELDS}}}}}}}"
-    r = requests.post(ANILIST, json={"query": query}, headers=UA, timeout=20)
-    r.raise_for_status()
-    return r.json()["data"]["Page"]["media"]
+    for attempt in range(1, 4):
+        r = requests.post(ANILIST, json={"query": query}, headers=UA, timeout=20)
+        if r.status_code == 429:
+            headers = {k: r.headers.get(k) for k in (
+                "Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining",
+                "X-RateLimit-Reset", "Date", "CF-Ray")}
+            print(f"[AniList] 429 試行{attempt}/3 headers={headers} body={r.text[:1000]}")
+            if attempt < 3:
+                delay = _anilist_retry_delay(r.headers)
+                # 長期の制限は早まって再送せず、そのまま失敗させる。
+                if delay <= 300:
+                    print(f"[AniList] {delay:.1f}秒待って再試行します")
+                    time.sleep(delay)
+                    continue
+        r.raise_for_status()
+        return r.json()["data"]["Page"]["media"]
+
+
+def _anilist_retry_delay(headers) -> float:
+    """指定された解除時刻を尊重し、不明なら1分待つ。"""
+    delays = []
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            try:
+                delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+            except (ValueError, TypeError, OverflowError):
+                delay = float("nan")
+        if math.isfinite(delay):
+            delays.append(max(0, delay))
+    try:
+        reset = float(headers.get("X-RateLimit-Reset", "nan")) - time.time()
+        if math.isfinite(reset):
+            delays.append(max(0, reset))
+    except (ValueError, TypeError):
+        pass
+    return max(1, max(delays) + 1) if delays else 61.0
 
 
 def _al_item(m: dict, theme: str) -> dict | None:
