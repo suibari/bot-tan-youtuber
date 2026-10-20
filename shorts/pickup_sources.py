@@ -22,11 +22,11 @@ import datetime
 import os
 import random
 import time
-import math
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
+
+from common import http_retry
 
 JST = datetime.timezone(datetime.timedelta(hours=9))
 UA = {"User-Agent": "bottan-youtuber/pickup"}
@@ -137,45 +137,12 @@ AL_NG_GENRES = {"Ecchi", "Hentai"}
 
 def _anilist(args: str) -> list[dict]:
     query = f"query{{Page(perPage:20){{media({args}){{{_AL_FIELDS}}}}}}}"
-    for attempt in range(1, 4):
-        r = requests.post(ANILIST, json={"query": query}, headers=UA, timeout=20)
-        if r.status_code == 429:
-            headers = {k: r.headers.get(k) for k in (
-                "Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining",
-                "X-RateLimit-Reset", "Date", "CF-Ray")}
-            print(f"[AniList] 429 試行{attempt}/3 headers={headers} body={r.text[:1000]}")
-            if attempt < 3:
-                delay = _anilist_retry_delay(r.headers)
-                # 長期の制限は早まって再送せず、そのまま失敗させる。
-                if delay <= 300:
-                    print(f"[AniList] {delay:.1f}秒待って再試行します")
-                    time.sleep(delay)
-                    continue
-        r.raise_for_status()
-        return r.json()["data"]["Page"]["media"]
+    r = http_retry.request(requests.post, ANILIST, label="AniList",
+                           json={"query": query}, headers=UA, timeout=(10, 20))
+    return r.json()["data"]["Page"]["media"]
 
 
-def _anilist_retry_delay(headers) -> float:
-    """指定された解除時刻を尊重し、不明なら1分待つ。"""
-    delays = []
-    retry_after = headers.get("Retry-After")
-    if retry_after:
-        try:
-            delay = float(retry_after)
-        except ValueError:
-            try:
-                delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
-            except (ValueError, TypeError, OverflowError):
-                delay = float("nan")
-        if math.isfinite(delay):
-            delays.append(max(0, delay))
-    try:
-        reset = float(headers.get("X-RateLimit-Reset", "nan")) - time.time()
-        if math.isfinite(reset):
-            delays.append(max(0, reset))
-    except (ValueError, TypeError):
-        pass
-    return max(1, max(delays) + 1) if delays else 61.0
+_anilist_retry_delay = http_retry.retry_delay
 
 
 def _al_item(m: dict, theme: str) -> dict | None:
@@ -240,7 +207,7 @@ MUSIC_NEW_DAYS = 14
 
 
 def fetch_music_new(day: datetime.date) -> list[dict]:
-    r = requests.get(ITUNES_TOP, headers=UA, timeout=20)
+    r = http_retry.request(requests.get, ITUNES_TOP, label="Apple Music", headers=UA, timeout=(10, 20))
     r.raise_for_status()
     out = []
     for rank, s in enumerate(r.json()["feed"]["results"], 1):
@@ -279,7 +246,7 @@ TV_NETWORKS = ("NHK", "Nippon TV", "NTV", "TBS", "Fuji TV", "TV Asahi", "TV Toky
 
 def _tmdb(path: str, **params) -> dict:
     params = {"api_key": os.environ["TMDB_API_KEY"], "language": "ja-JP", **params}
-    r = requests.get(f"{TMDB}{path}", params=params, headers=UA, timeout=20)
+    r = http_retry.request(requests.get, f"{TMDB}{path}", label="TMDB", params=params, headers=UA, timeout=(10, 20))
     r.raise_for_status()
     return r.json()
 
@@ -372,13 +339,13 @@ def _igdb(endpoint: str, body: str) -> list:
     global _igdb_token
     if _igdb_token is None:
         # 有効期限は約2か月あるが、1回の実行で1回しか取らないので保存しない
-        t = requests.post("https://id.twitch.tv/oauth2/token", timeout=20, params={
+        t = http_retry.request(requests.post, "https://id.twitch.tv/oauth2/token", label="Twitch認証", timeout=(10, 20), params={
             "client_id": os.environ["IGDB_CLIENT_ID"],
             "client_secret": os.environ["IGDB_CLIENT_SECRET"],
             "grant_type": "client_credentials"})
         t.raise_for_status()
         _igdb_token = t.json()["access_token"]
-    r = requests.post(f"{IGDB}/{endpoint}", data=body, timeout=30, headers={
+    r = http_retry.request(requests.post, f"{IGDB}/{endpoint}", label="IGDB", data=body, timeout=(10, 30), headers={
         "Client-ID": os.environ["IGDB_CLIENT_ID"], "Authorization": f"Bearer {_igdb_token}"})
     r.raise_for_status()
     return r.json()
@@ -482,7 +449,7 @@ def candidates(theme: str, day: datetime.date, used: set[str] = None, rng=None):
 def download_artwork(item: dict, out_dir: Path) -> Path:
     """アートワークを一時ディレクトリへ落とす（リポジトリには保存しない）。"""
     path = Path(out_dir) / f"pickup_art_{item['key'].replace(':', '_')}.jpg"
-    r = requests.get(item["artwork"], headers=UA, timeout=30)
+    r = http_retry.request(requests.get, item["artwork"], label="作品画像", headers=UA, timeout=(10, 30))
     r.raise_for_status()
     path.write_bytes(r.content)
     return path

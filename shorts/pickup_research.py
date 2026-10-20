@@ -18,7 +18,7 @@
 
 import requests
 
-from common import grounding
+from common import grounding, http_retry
 
 SYSTEM = "Google検索で調べて、確認できた事実だけを日本語の箇条書き8〜12行で答える。推測で埋めない。"
 
@@ -67,9 +67,9 @@ def _ask(model: str, question: str, system: str = SYSTEM) -> dict:
             "thinkingConfig": {"thinkingLevel": grounding.LIVE_GROUNDING_THINKING},
         },
     }
-    r = requests.post(grounding._ENDPOINT.format(model),
+    r = http_retry.request(requests.post, grounding._ENDPOINT.format(model), label="Gemini検索",
                       headers={"x-goog-api-key": grounding._api_key()},
-                      json=body, timeout=TIMEOUT_SEC)
+                      json=body, timeout=(10, TIMEOUT_SEC))
     if r.status_code != 200:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
     return r.json()
