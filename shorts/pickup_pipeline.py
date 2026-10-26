@@ -7,10 +7,10 @@ JST 6:00 に起動し、その曜日のテーマ（pickup_sources.WEEKDAY_THEMES
 （クイズのコードは quiz_pipeline.py に残してある。run_quiz.sh の MORNING_FORMAT を参照）。
 
 構成（尺は区間ごとに発話長で決まる）:
-  HOOK   掴み           作品名を入れた一言（顔のアップ。サムネもここから撮る）
+  HOOK   掴み           一番の推しを言い切る一言（顔のアップ。サムネもここから撮る）
   WHAT   どんな作品か   あらすじ・概要
   PUSH   推しポイント   山場（強く寄る・ちびキャラ）
-  INFO   公開日など     「ぜひ観てみてね」
+  INFO   締めの一言     「ぜひ観てみてね」（日付はパネルに出ているので読まない）
   END    エンディング   季節の挨拶 + 固定クロージング（quiz_data と共用）
 
 画面の上部にはパネル（アートワーク・作品名・日付・画像の出典）を最初から最後まで出す。
@@ -71,7 +71,8 @@ DURATION_WARN_SEC = 36.0
 
 EMOTION_VARIANTS = {
     "HOOK": [(0.80, 0.70), (0.65, 0.85), (0.90, 0.55)],    # わくわく呼びかけ
-    "WHAT": [(0.60, -0.30), (0.50, -0.50), (0.70, -0.15)],  # 落ち着いて説明
+    # 2026-10-27: 落ち着いた表情（arousal -0.5〜-0.15）は掴みが終わる5秒前後で離脱が多いので明るめにした
+    "WHAT": [(0.75, 0.30), (0.70, 0.15), (0.80, 0.40)],     # 明るく説明
     "PUSH": [(1.00, 0.60), (0.90, 0.80), (0.95, 0.45)],     # 全力で褒める
     "INFO": [(0.80, 0.20), (0.75, 0.05), (0.85, 0.35)],     # 明るくお知らせ
     "END":  quiz_pipeline.EMOTION_VARIANTS["END"],
@@ -112,7 +113,7 @@ def _sources_text(item: dict, research: dict) -> str:
     return json.dumps(item, ensure_ascii=False) + "\n" + research["text"]
 
 
-def generate_script(item: dict, research: dict) -> dict:
+def generate_script(item: dict, research: dict, day) -> dict:
     """台本を書かせ、問題があれば1回だけ作り直させる。字数はコードで合わせる。"""
     sources = _sources_text(item, research)
     problems = []
@@ -121,6 +122,10 @@ def generate_script(item: dict, research: dict) -> dict:
         script = core.llm_json(pickup_prompts.SYSTEM_PROMPT,
                                pickup_prompts.build_user_prompt(item, research["text"], problems),
                                pickup_prompts.SCRIPT_SCHEMA)
+        style = pickup_prompts.select_hook(script, day, sources)
+        print(f"[LLM] 掴みの型: {style or 'なし'}（{pickup_prompts.hook_order(day)[0]} から試す）")
+        # 旧作の INFO は固定文。差し替える前に検証すると、使わない文の日付で作り直しになる
+        pickup_prompts.apply_fixed_info(script, item)
         problems = pickup_prompts.validate_script(script, sources)
         for p in problems:
             print(f"[LLM] 警告（{attempt}回目）: {p}")
@@ -131,7 +136,6 @@ def generate_script(item: dict, research: dict) -> dict:
         script[key] = quiz_pipeline._normalize_sentences(script.get(key))
     for text in pickup_prompts.drop_bad_sentences(script, sources):
         print(f"[LLM] 問題が残った文を落としました: {text}")
-    pickup_prompts.apply_fixed_hook(script, item)
     for key in pickup_prompts.fill_missing(script, item):
         print(f"[LLM] {key} が空になったので固定文で埋めました")
     empty = [key for key in pickup_prompts.PARTS if not script.get(key)]
@@ -295,7 +299,7 @@ def main(argv=None):
         print(f"[作品] {item['title']} を紹介します")
 
         # ── Step 2: 台本
-        script = core._timed("Step2 台本生成", generate_script, item, research)
+        script = core._timed("Step2 台本生成", generate_script, item, research, day)
         script["ending"] = quiz_data.build_ending_sentences()
 
         en = None
