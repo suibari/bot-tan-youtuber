@@ -170,7 +170,7 @@ class ScriptCheckTest(unittest.TestCase):
         self.assertEqual(len(dropped), 3)
         filled = pickup_prompts.fill_missing(script, _item(theme="game_new", title="ゲーム", date="2026-10-15"))
         self.assertEqual(filled, ["hook", "info"])
-        self.assertEqual(script["info"][0]["text"], "2026年10月15日発売だよ。ぜひ遊んでみてね！")
+        self.assertEqual(script["info"][0]["text"], "ぜひ遊んでみてね！")
         self.assertEqual([s["text"] for s in script["what"]], ["どんな話か。"])
 
     def test_fit_length_drops_plain_sentences_first(self):
@@ -183,10 +183,45 @@ class ScriptCheckTest(unittest.TestCase):
         # 山場の文は残す
         self.assertEqual(script["push"][0]["reaction"], "joyful")
 
-    def test_old_theme_hook_is_fixed(self):
-        script = {"hook": [_sent("10年前の今日、始まったよ！")]}
-        pickup_prompts.apply_fixed_hook(script, _item(theme="anime_old", title="舟を編む", years_ago=10))
-        self.assertEqual(script["hook"][0]["text"], "10年前の今週、『舟を編む』の放送が始まったよ！")
+    def test_fit_length_drops_second_peak_when_all_are_peaks(self):
+        script = {"hook": [_sent("あ" * 20)], "what": [_sent("あ" * 40)],
+                  "push": [_sent("い" * 50, "joyful"), _sent("う" * 50, "surprising")], "info": [_sent("あ" * 10)]}
+        dropped = pickup_prompts.fit_length(script, limit=115)
+        self.assertEqual(dropped, ["う" * 50])
+        self.assertEqual(script["push"][0]["reaction"], "joyful")
+
+    def test_old_theme_info_is_fixed(self):
+        script = {"info": [_sent("10年前の今日、始まったよ！")]}
+        pickup_prompts.apply_fixed_info(script, _item(theme="anime_old", title="舟を編む", years_ago=10))
+        self.assertEqual(script["info"][0]["text"], "10年前の今週に始まった名作、ぜひ観てみてね！")
+
+    def test_info_must_not_read_date(self):
+        script = {"hook": [_sent("掴み")], "what": [_sent("説明")], "push": [_sent("推し", "joyful")],
+                  "info": [_sent("10月15日発売だよ！")]}
+        self.assertTrue(any(p.startswith("info:") for p in pickup_prompts.validate_script(script, "")))
+        pickup_prompts.drop_bad_sentences(script, "")
+        self.assertEqual(script["info"], [])
+
+    def test_hook_style_rotates_by_day(self):
+        import datetime
+        day = datetime.date(2026, 10, 27)
+        firsts = [pickup_prompts.hook_order(day + datetime.timedelta(days=7 * w))[0] for w in range(3)]
+        # 同じ曜日でも週ごとに型が変わる
+        self.assertEqual(sorted(firsts), sorted(pickup_prompts.HOOK_STYLES))
+
+    def test_select_hook_skips_empty_and_bad(self):
+        import datetime
+        day = datetime.date(2026, 10, 27)
+        order = pickup_prompts.hook_order(day)
+        script = {"hooks": {order[0]: "", order[1]: "Switchで話題！", order[2]: "推せる一本！"},
+                  "hook_motion": "A person waves."}
+        self.assertEqual(pickup_prompts.select_hook(script, day, ""), order[2])
+        self.assertEqual(script["hook"][0]["text"], "推せる一本！")
+        self.assertEqual(script["hook"][0]["motion"], "A person waves.")
+        # どれも書かれていなければ空（fill_missing で埋める）
+        script = {"hooks": {}}
+        self.assertEqual(pickup_prompts.select_hook(script, day, ""), "")
+        self.assertEqual(script["hook"], [])
 
     def test_peak_is_forced_on_push(self):
         script = {"hook": [_sent("掴み", "joyful")], "push": [_sent("a"), _sent("b")]}
