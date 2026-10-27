@@ -52,6 +52,9 @@ ARDY_URL = f"http://127.0.0.1:{ARDY_PORT}"
 # true にすると既にポートで動いているサーバーをそのまま使う（開発時用）。
 # 既定は false で、古いサーバーは落として起動し直す
 ARDY_REUSE = env_flag("ARDY_REUSE")
+# 常駐する会話用ARDYを共用する。起動・停止やGPU解放は行わない。
+ARDY_SHARED = env_flag("ARDY_SHARED")
+_SHARED_SERVER = object()
 ARDY_READY_TIMEOUT = float(os.getenv("ARDY_READY_TIMEOUT", "600"))
 # 3秒のモーションで実測3〜4秒。ただしGPUが混んでいると20秒、稀に140秒まで伸びる。
 # さらに長時間アイドルだったサーバーは最初のリクエストで固まることがある
@@ -341,10 +344,20 @@ def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
     （そのサーバーは stop() で落とさない）。エンジンが無い場合も None を返す。
     起動できたかどうかは wait_ready() で判定すること。
 
+    ARDY_SHARED=Trueでは対応済みの常駐サーバーだけを使い、停止対象外の
+    ハンドルを返す。未準備でも代替プロセスは起動しない。
+
     low_priority=True にすると ionice を噛ませて I/O の優先度を下げる。読み込みの
     完了を待たずに裏で走らせる録画側で使う。配信側は使わない（配信前に読み込みの
     完了を待つので発話とは競合せず、下げると配信の開始が遅れるだけ）。
     """
+    if ARDY_SHARED:
+        h = health() or {}
+        if h.get("status") != "ok" or not h.get("free_text") or not h.get("spec_api"):
+            print(f"[ARDY] 共用サーバーが未準備です: {ARDY_URL} {h}。{fallback_msg}")
+            return None
+        print(f"[ARDY] 会話用サーバーを共用します: {ARDY_URL}（終了時も停止しません）")
+        return _SHARED_SERVER
     if not available(fallback_msg):
         return None
 
@@ -416,6 +429,9 @@ def start(mem_wait_sec: float = None, reuse: bool = None, log_dir=None,
 
 def wait_ready(timeout: float = None, fallback_msg: str = FALLBACK_MSG_SHORTS) -> bool:
     """GET /health が status=ok になるまで待つ。モデル読み込みに4〜5分かかる。"""
+    if ARDY_SHARED:
+        h = health() or {}
+        return h.get("status") == "ok" and bool(h.get("free_text")) and bool(h.get("spec_api"))
     # サーバーも立っておらずエンジンも無いなら、待っても上がらない。
     # ここで即抜けないと別ドライブ未マウント時に毎回10分止まる
     if health() is None and (not available(fallback_msg)
@@ -447,8 +463,8 @@ def wait_ready(timeout: float = None, fallback_msg: str = FALLBACK_MSG_SHORTS) -
 
 
 def stop(proc, timeout: float = 5, kill_timeout: float = 1) -> None:
-    """start() が起動したサーバーを落とす。None（再利用時）なら何もしない。"""
-    if proc is None:
+    """自分で起動したサーバーだけを落とす。共用ハンドルとNoneは停止しない。"""
+    if proc is None or proc is _SHARED_SERVER:
         return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -492,8 +508,9 @@ def generate_spec(out_json, text: str = None, duration: float = None,
         fallback_total = float(duration)
 
     try:
-        r = requests.post(url("/generate"), json=payload,
+        r = requests.post(url("/generate-spec" if ARDY_SHARED else "/generate"), json=payload,
                           timeout=ARDY_GEN_TIMEOUT if timeout is None else timeout)
+        r.raise_for_status()
         spec = r.json()
     except Exception as e:
         print(f"[ARDY] 生成に失敗: {e}")
