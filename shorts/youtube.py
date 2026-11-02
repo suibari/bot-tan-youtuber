@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common import notify as _notify                  # noqa: E402
 from common import youtube_auth as _youtube_auth      # noqa: E402
 from common.db import DB_CONFIG, connect_raw          # noqa: E402,F401
+from common.env import env_flag                       # noqa: E402
 
 
 
@@ -169,6 +170,9 @@ def upload_to_youtube(mp4_path: str, title: str, description: str, thumbnail_pat
             "status": {
                 "privacyStatus": privacy,
                 "selfDeclaredMadeForKids": False,
+                # 「改変または合成されたコンテンツ」の申告。キャラ・声・モーション・BGM が AI 生成なので付ける。
+                # 投稿後の update ではなく insert で付ける（_localize の docstring のとおりタグが消えるため）
+                "containsSyntheticMedia": env_flag("YOUTUBE_SYNTHETIC_MEDIA", True),
             }
         }
 
