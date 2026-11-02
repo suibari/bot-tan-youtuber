@@ -118,6 +118,8 @@ class UploadEnglishTest(unittest.TestCase):
         self.assertEqual(body["localizations"]["en"], {"title": "T", "description": "D"})
         self.assertEqual(body["snippet"]["defaultLanguage"], "ja")
         self.assertIn("botたん", body["snippet"]["tags"])
+        # AI 生成の申告も insert で付ける
+        self.assertIs(body["status"]["containsSyntheticMedia"], True)
         self.assertEqual(self.yt.videos().update.call_count, 0)
         cap = self.yt.captions().insert.call_args.kwargs["body"]["snippet"]
         self.assertEqual((cap["videoId"], cap["language"]), ("vid", "en"))

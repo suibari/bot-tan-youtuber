@@ -113,6 +113,8 @@ run_live.sh      ライブ配信の起動
 3. ローカルLLMが調査メモの範囲で台本を書きます。名作の「〇年前の今週」、字数、賞の名前、機種・配信サービス名はコードで検証・修正します。
 4. 画面上部のパネルにアートワーク・作品名・日付・画像の出典を表示します。タイトルは作品名から始めます。
 
+YouTubeが公開（`YOUTUBE_PRIVACY=public`）で投稿できたあと、`INSTAGRAM_ENABLED=true`なら同じ動画をInstagramリールにも投稿します（`shorts/instagram.py`）。キャプションは`description.build_pickup_caption`で作り、YouTube・Instagramとも投稿時にAI生成の申告（`containsSyntheticMedia` / `is_ai_generated`）を付けます。Instagramの失敗はDiscordへ通知するだけで、YouTube側の記録は巻き戻しません。
+
 テーマは`PICKUP_THEME`または`--theme`で固定でき、`--stage script`で台本まで確認できます。台帳への記録は`PICKUP_NO_CONSUME=true`で抑止します。映画・ドラマには`TMDB_API_KEY`、ゲームには`IGDB_CLIENT_ID`と`IGDB_CLIENT_SECRET`が必要です。
 
 #### 朝のクイズ（`MORNING_FORMAT=quiz`）
@@ -166,7 +168,7 @@ run_live.sh      ライブ配信の起動
 | Unity | `UNITY_EXE`、`UNITY_PROJECT`、`UNITY_LIVE_PROJECT`、`LIVE_DISPLAY` |
 | LLM | `USE_LOCAL_LLM`、`LOCAL_LLM_MODEL`、`GEMINI_API_KEY` |
 | 音声 | `TTS_ENGINE`、`IRODORI_URL`、`IRODORI_VOICE`、`VOICEVOX_URL` |
-| 投稿・配信 | YouTube OAuth、Bluesky資格情報、`LIVE_YOUTUBE_PRIVACY` |
+| 投稿・配信 | YouTube OAuth、Bluesky資格情報、`INSTAGRAM_*`、`LIVE_YOUTUBE_PRIVACY` |
 | OBS | `OBS_HOST`、`OBS_PORT`、`OBS_PASSWORD`、`OBS_COLLECTION`、`OBS_PROFILE` |
 | 表示・音声経路 | `SUBTITLE_DIR`、`LIVE_AUDIO_SINK` |
 | 検証 | `SKIP_BLUESKY`、`SKIP_YOUTUBE`、`QUIZ_NO_CONSUME`、`DRY_RUN`、`FAKE_COMMENTS` |
@@ -256,6 +258,13 @@ YouTubeの事前認可は次のコマンドで行います。無人配信中に�
 ./venv/bin/python shorts/youtube_reauth.py
 ./venv/bin/python -m common.unity_license --check
 ```
+
+Instagramは、Facebookページとリンクしたプロアカウント（@zenkoutei_bot_tan）に、Metaアプリ「bottan-poster」（開発モード）から投稿します。トークンはグラフAPIエクスプローラで作ります。
+
+1. Metaアプリ（ユースケース「Instagramでメッセージとコンテンツを管理」のFacebookログイン側）で、ビジネス向けFacebookログインの構成「poster」を選び、Generate Access Tokenを押します。権限は`instagram_basic`、`instagram_content_publish`、`pages_show_list`、`pages_read_engagement`、`business_management`です。ポップアップではbotたんのページとInstagramにチェックを入れます。
+2. 接続先を`graph.facebook.com`にして`me/accounts?fields=name,id,instagram_business_account`を送り、`instagram_business_account.id`を`INSTAGRAM_USER_ID`に、トークンを`INSTAGRAM_ACCESS_TOKEN`に入れます。`graph.instagram.com`ではこのトークンを読めません。
+
+トークン自体は期限なしですが、データアクセスは90日で切れます。投稿のたびに`debug_token`で確認し、残り14日を切るとDiscordへ警告します。警告が来たら上の手順でトークンを作り直します。
 
 Unityライセンスの定期確認は本番ユーザーで導入します。
 

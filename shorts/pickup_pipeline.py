@@ -509,6 +509,25 @@ def _upload(item, script, mp4_path, thumbnail_path, bgm_generated=False, en_cues
         else:
             pickup_sources.mark_used(item, yt_url)
 
+        # Instagram は YouTube の記録が全部終わってから。失敗しても YouTube 側は巻き戻さない。
+        # 非公開のテスト投稿で Instagram にだけ公開されないよう、public のときだけ出す
+        if os.getenv("YOUTUBE_PRIVACY", "public") == "public":
+            _post_instagram(item, script, mp4_path, title, bgm_generated)
+
+
+def _post_instagram(item, script, mp4_path, title, bgm_generated=False):
+    import instagram
+    from description import build_pickup_caption
+    from common import notify
+
+    if not instagram.enabled():
+        return
+    instagram.check_token()
+    caption = build_pickup_caption(item, script.get("title_hook", ""), bgm_generated)
+    ig_url = core._timed("Step9 IG投稿", instagram.upload_reel, mp4_path, caption)
+    if ig_url:
+        notify.instagram_posted(ig_url, title)
+
 
 if __name__ == "__main__":
     sys.exit(main())

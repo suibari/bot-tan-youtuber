@@ -81,6 +81,14 @@ def youtube_uploaded(yt_url: str, title: str) -> None:
         print("[Discord] 通知送信完了")
 
 
+def instagram_posted(url: str, title: str) -> None:
+    """朝の作品紹介を Instagram リールにも出した。"""
+    if not _webhook():
+        return
+    if send(f"✅ Instagram リール投稿完了！\n**{title}**\n{url}"):
+        print("[Discord] 通知送信完了")
+
+
 def bluesky_posted(url: str, caption: str) -> None:
     """夜の動画を Bluesky に投稿した。"""
     if not _webhook():

@@ -156,3 +156,62 @@ def build_pickup_description(item: dict, bgm_generated: bool = False) -> str:
 
 {_COMMON_FOOTER.replace('#雑学 #クイズ', '#' + THEME_LABELS[item['theme']])}
 {_credits(bgm_generated)}"""
+
+
+# ──────────────────────────────────────────────
+# Instagram リール（朝の作品紹介）
+# ──────────────────────────────────────────────
+
+# キャプションは 2200 字、ハッシュタグは 30 個まで（超えると投稿が弾かれる）
+IG_CAPTION_MAX = 2200
+IG_HASHTAG_MAX = 30
+_IG_FIXED_TAGS = ["botたん", "全肯定", "VTuber", "Nagi"]
+
+
+def _hashtag(text: str) -> str:
+    """ハッシュタグに使えない記号・空白を落とす。長すぎる作品名はタグにしない。"""
+    import re
+    tag = re.sub(r"[^\w]", "", text or "")
+    return tag if 0 < len(tag) <= 30 else ""
+
+
+def build_pickup_caption(item: dict, hook: str = "", bgm_generated: bool = False) -> str:
+    """Instagram 用。YouTube の説明文は「YouTubeアップロードまで自動」と書いてあり、
+    押せない URL が並ぶので使わない。クレジットはライセンス表記なので YouTube と同じものを載せる。"""
+    from pickup_sources import THEME_LABELS
+    from pickup_layout import date_line
+
+    label = THEME_LABELS[item["theme"]]
+    who = f" / {item['artist']}" if item.get("artist") else ""
+    notice = f"\n{TMDB_NOTICE}" if item["credit"].startswith("画像：TMDB") else ""
+
+    tags = []
+    for t in [_hashtag(item["title"]), _hashtag(item.get("artist", "")), _hashtag(label),
+              *_IG_FIXED_TAGS]:
+        if t and t not in tags:
+            tags.append(t)
+    hashtags = " ".join(f"#{t}" for t in tags[:IG_HASHTAG_MAX])
+
+    head = f"【{item['title']}】{hook}".strip()
+    caption = f"""{head}
+全肯定botたんが、朝いちばんに{label}を紹介します。
+
+📌 今日の作品：{item['title']}{who}（{date_line(item)}）
+
+🤖 この動画はAIによる完全自動投稿です
+台本作成から動画撮影・投稿まで全て自動で行っています。
+作品の情報は、公式のデータベースとWeb検索で確認した内容をもとにAIがまとめています。
+最新の情報は公式サイトでご確認ください。
+
+🖼 {item['credit']}{notice}
+
+👧 botたんのことはプロフィールのリンクから
+
+{_credits(bgm_generated)}
+
+{hashtags}"""
+    if len(caption) > IG_CAPTION_MAX:
+        # 作品名や掴みが異常に長いときだけ。先頭の行を詰めて収める
+        over = len(caption) - IG_CAPTION_MAX
+        caption = caption.replace(head, head[:max(len(head) - over - 1, 1)] + "…", 1)
+    return caption[:IG_CAPTION_MAX]
