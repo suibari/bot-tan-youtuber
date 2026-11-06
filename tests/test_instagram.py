@@ -107,6 +107,25 @@ class UploadReelTest(unittest.TestCase):
         self.assertEqual(url, "p")
         self.assertEqual(post.call_count, 4)
 
+    def test_processing_failed_is_retried_even_if_not_retriable(self):
+        # Meta は retriable=false と返すが、同じコンテナへ送り直せば通る（2026-11 の本番）
+        failed = _res(400, {"debug_info": {"retriable": False, "type": "ProcessingFailedError",
+                                           "message": "Request processing failed"}})
+        url, post, _ = self.run_upload(
+            posts=[_res(body={"id": "c1"}), failed, failed,
+                   _res(body={"success": True}), _res(body={"id": "m1"})],
+            gets=[_res(body={"status_code": "FINISHED"}), _res(body={"permalink": "p"})])
+        self.assertEqual(url, "p")
+        self.assertEqual(post.call_count, 5)
+
+    def test_processing_failed_gives_up_after_all_retries(self):
+        failed = _res(400, {"debug_info": {"retriable": False, "type": "ProcessingFailedError"}})
+        url, post, _ = self.run_upload(
+            posts=[_res(body={"id": "c1"})] + [failed] * (len(instagram.UPLOAD_RETRY_DELAYS) + 1),
+            gets=[])
+        self.assertIsNone(url)
+        self.assertEqual(post.call_count, 1 + len(instagram.UPLOAD_RETRY_DELAYS) + 1)
+
     def test_non_retriable_upload_stops(self):
         url, post, _ = self.run_upload(
             posts=[_res(body={"id": "c1"}),
