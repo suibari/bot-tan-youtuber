@@ -33,7 +33,11 @@ RUPLOAD = f"https://rupload.facebook.com/ig-api-upload/{GRAPH_VERSION}"
 POLL_INTERVAL = 30
 POLL_TIMEOUT = 600
 # mp4 の送信だけは、Meta が retriable と返したとき・通信が切れたときに送り直す
-UPLOAD_RETRY_DELAYS = [10, 30]
+UPLOAD_RETRY_DELAYS = [10, 30, 60]
+# retriable=false でも送り直す種類。ProcessingFailedError は動画に関係なく断続的に出て、
+# 同じコンテナへ同じ mp4 を送り直せば通る（2026-11-03〜06 の本番で4回中3回これで落ちた。
+# 同じファイルで失敗と成功が入れ替わるのを手元で確認済み）
+ALWAYS_RETRY_TYPES = {"ProcessingFailedError"}
 # データアクセスの期限（90日）がこの日数を切ったら Discord に警告する
 TOKEN_WARN_DAYS = 14
 
@@ -119,7 +123,8 @@ def _upload_file(container_id: str, mp4_path: str) -> None:
             print(f"[Instagram] 動画を送信しました（{size / 1e6:.1f}MB）")
             return
         info = body.get("debug_info") or {}
-        if not info.get("retriable") or last:
+        retriable = info.get("retriable") or info.get("type") in ALWAYS_RETRY_TYPES
+        if not retriable or last:
             raise InstagramError(f"動画の送信: HTTP {res.status_code} "
                                  f"{info.get('message') or info.get('type') or res.text[:300]}")
         print(f"[Instagram] 動画の送信に失敗（再試行可）: {info.get('type')}")
