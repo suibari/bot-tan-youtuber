@@ -125,9 +125,7 @@ cp .env.example .env      # Shorts と配信で同じ .env を読む。キーは
 URP + VRM では実測 **1.7fps** しか出ない。NVIDIA ドライバでモニタ非接続の
 仮想スクリーンを作って GPU に描かせる。
 
-```sh
-sudo bash setup/install_xorg.sh
-```
+新規導入は [README のライブ用ディスプレイ手順](../../README.md#53-ライブ用ディスプレイ) を参照。
 
 既存デスクトップ（GDM が管理する `:0`）には触らない。`/etc/X11/xorg.conf.d/` ではなく
 `/etc/X11/xorg-bottan-live.conf` を置き、`Xorg -config` で明示的に読ませている。
@@ -168,7 +166,7 @@ DISPLAY=:99 __GL_SYNC_TO_VBLANK=0 timeout 12 stdbuf -o0 glxgears
 呼び、`:99` を入れ直して実測してから配信へ通す。手で直すときも同じ。
 
 ```sh
-sudo bash setup/reset_display.sh          # 作り直して実測まで見る
+sudo systemctl start bottan-live-display.service   # 作り直して実測まで見る
 sudo systemctl restart bottan-live-xorg   # 最小限でよければこれだけ
 ```
 
@@ -614,9 +612,7 @@ curl -X POST 127.0.0.1:2338/camera -d '{"x":-0.25,"y":1.35,"z":0.7}'
 
 ### 5. 自動起動
 
-```sh
-sudo bash setup/install_units.sh
-```
+ユニットの導入・更新は [README の自動実行手順](../../README.md#56-自動実行) を参照。
 
 毎日04:00に次の2回の配信枠と視聴URLを用意する。毎週土曜20:40の本配信が当日の枠へ
 ストリームを紐づける。OBS・Unity・RTMP送出は20:40まで起動しない。

@@ -27,7 +27,8 @@ Wants=network-online.target
 Type=oneshot
 User=__USER__
 Group=__USER__
-WorkingDirectory=__INSTALL_DIR__
+# run_live.sh は配信ユーザーとして checkout へ移動する。
+WorkingDirectory=/
 # 配信中はサイドカーを退かす。あちらは常駐でアイドル時に解放しても RSS 約1.9GB を
 # 掴んだままで、2026-09-09 の配信では 543MB＋swap 1.0GB を占めていた。ホストは 31GB
 # しか無く、ollama(9.4GB)・ARDY・Unity・OBS・VOICEVOX が同居して commit が RAM+swap の
