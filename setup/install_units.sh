@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # botたんの systemd ユニット（Shorts 2本 + ライブ配信）をインストールする。
+# ライブ配信は休止中なので、ユニットは配置するが timer は有効化しない（LIVE_ENABLED=1 で再開）。
 #   sudo bash setup/install_units.sh
 #
 # ユニットの中の __INSTALL_DIR__ / __USER__ を実際の値に置き換えてから配置する。
@@ -101,8 +102,17 @@ if [ ! -f /etc/systemd/system/bottan-live-xorg.service ]; then
     echo "      ライブ配信を使うなら sudo bash setup/install_xorg.sh を先に実行してください。" >&2
 fi
 
-systemctl enable bottan-pipeline.timer bottan-quiz.timer \
-    bottan-live-prepare.timer bottan-live.timer
+systemctl enable bottan-pipeline.timer bottan-quiz.timer
+
+# ライブ配信は 2026-11-27 から休止中。再インストールで勝手に再開しないよう、
+# 明示しない限り配信と枠準備の timer は止めておく。
+# 止めたあとに残った YouTube の枠と DB の告知対象は live/retire_live.py で片付ける。
+if [ -n "${LIVE_ENABLED:-}" ]; then
+    systemctl enable bottan-live-prepare.timer bottan-live.timer
+else
+    systemctl disable --now bottan-live-prepare.timer bottan-live.timer 2>/dev/null || true
+    echo "  ライブ配信は休止中: bottan-live-prepare.timer / bottan-live.timer を無効化しました"
+fi
 
 echo
 echo "次回の起動予定:"

@@ -1,6 +1,6 @@
 # bot-tan-youtuber
 
-全肯定botたんの動画生成・投稿と、YouTube LiveでのAITuber配信を運用するシステムです。SNSの投稿を紹介する夜の縦動画、朝の作品紹介Shorts、視聴者と会話するライブ配信を、共通の音声合成・モーション生成・記憶基盤で実行します。
+全肯定botたんの動画生成・投稿と、YouTube LiveでのAITuber配信を運用するシステムです。ライブ配信は2026-11-27から休止しています（[休止と再開](#ライブ配信の休止と再開)）。SNSの投稿を紹介する夜の縦動画、朝の作品紹介Shorts、視聴者と会話するライブ配信を、共通の音声合成・モーション生成・記憶基盤で実行します。
 
 本書は、本リポジトリの現行実装に基づく機能仕様と導入・運用手順を定義します。Unityプロジェクト、音声合成サーバー、記憶基盤は別リポジトリで管理します。
 
@@ -21,8 +21,8 @@
 |---|---|---|---|
 | 夜の縦動画 | Bluesky / Nagiの投稿を選び、紹介台本・音声・映像を生成 | Bluesky | 毎日18:00 |
 | 朝の作品紹介Shorts | 曜日ごとのテーマで作品を選び、検索で調べた事実から紹介動画を生成 | YouTube | 毎日06:00 |
-| 配信枠の事前準備 | 次の2回の配信枠を作成・再利用し、視聴URLを保存 | YouTube / 共有DB | 毎日04:00 |
-| ライブ配信 | コメントへの返答、フリートーク、字幕・モーションの制御 | YouTube Live | 土曜20:40起動、21:00–22:00配信 |
+| 配信枠の事前準備 | 次の2回の配信枠を作成・再利用し、視聴URLを保存 | YouTube / 共有DB | 毎日04:00（休止中） |
+| ライブ配信 | コメントへの返答、フリートーク、字幕・モーションの制御 | YouTube Live | 土曜20:40起動、21:00–22:00配信（休止中） |
 | Unityライセンス確認 | 有効期限の確認と保存済み認証による更新 | ログ / Discord通知 | 毎日12:00、および各ジョブ開始前 |
 
 夜の縦動画はYouTubeへ投稿しません。朝版は2026-10-17にクイズから作品紹介へ切り替え、毎日投稿します。`MORNING_FORMAT=quiz`でクイズに戻せます。クイズは`shorts/turn.py`がJSTの日付の通し番号が偶数の日だけ実行を許可し、`SHORTS_ALTERNATE_DAYS=false`で毎日実行になります。
@@ -280,11 +280,29 @@ bash setup/install_unity_license.sh
 
 ```sh
 sudo bash setup/install_units.sh
-sudo systemctl start bottan-pipeline.timer bottan-quiz.timer bottan-live-prepare.timer bottan-live.timer
+sudo systemctl start bottan-pipeline.timer bottan-quiz.timer
 systemctl list-timers 'bottan-*' --no-pager
 ```
 
-インストーラはtimerを有効化しますが、起動は別途行います。動画timerは`Persistent=true`で停止中の実行を補います。配信・枠準備timerは`Persistent=false`で、過去の予定を後から実行しません。
+インストーラはtimerを有効化しますが、起動は別途行います。ライブ配信の休止中は、配信と枠準備のtimerを無効化します。動画timerは`Persistent=true`で停止中の実行を補います。配信・枠準備timerは`Persistent=false`で、過去の予定を後から実行しません。
+
+#### ライブ配信の休止と再開
+
+ライブ配信は2026-11-27から休止しています。Shortsは継続します。休止するときは、timerを止めてから残った枠を片付けます。
+
+```sh
+sudo systemctl disable --now bottan-live-prepare.timer bottan-live.timer
+./venv/bin/python live/retire_live.py
+```
+
+`retire_live.py`は、共有DBの未開始の配信枠を終了扱いにし、YouTube上の一度も配信していない自分の枠を削除します。配信済みの枠は残します。timerが動いていると、翌朝04:00の枠準備が枠を作り直します。
+
+再開するときは`LIVE_ENABLED=1`を付けてインストーラを実行し、timerを起動します。
+
+```sh
+sudo LIVE_ENABLED=1 bash setup/install_units.sh
+sudo systemctl start bottan-live-prepare.timer bottan-live.timer
+```
 
 ## 6. 実行と動作確認
 
