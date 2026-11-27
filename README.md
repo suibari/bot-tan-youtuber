@@ -288,14 +288,22 @@ systemctl list-timers 'bottan-*' --no-pager
 
 #### ライブ配信の休止と再開
 
-ライブ配信は2026-11-27から休止しています。Shortsは継続します。休止するときは、timerを止めてから残った枠を片付けます。
+ライブ配信は2026-11-27から休止しています。Shortsは継続します。休止するときは、管理者がライブ用のtimerを止めます。
 
 ```sh
 sudo systemctl disable --now bottan-live-prepare.timer bottan-live.timer
+systemctl show -p UnitFileState -p ActiveState bottan-live-prepare.timer bottan-live.timer
+systemctl show -p ActiveState -p SubState bottan-live-prepare.service bottan-live.service
+systemctl list-jobs --no-pager
+```
+
+両timerが無効かつ停止していることを確認します。停止済みのtimerから起動したサービスにも、実行や再試行が残ることがあります。両サービスの `ActiveState=inactive` を確認し、関連ジョブや手動起動した配信・枠準備が終了してから、本番実行ユーザーで次を実行します。確認から片付けが終わるまでは、YouTube Studioも含めて枠の準備や配信を開始しないでください。
+
+```sh
 ./venv/bin/python live/retire_live.py
 ```
 
-`retire_live.py`は、共有DBの未開始の配信枠を終了扱いにし、YouTube上の一度も配信していない自分の枠を削除します。配信済みの枠は残します。timerが動いていると、翌朝04:00の枠準備が枠を作り直します。
+`retire_live.py`は、共有DBで準備済みかつ開始記録のない枠を告知対象から外します。YouTube側では、このDBに記録されたIDとタイトルが一致し、ストリームが紐づいていない `created` または `ready` の未開始枠だけを削除します。DBに記録されなかった枠、作業中の枠、配信済みの枠は再開前にYouTube Studioで確認してください。YouTube側の処理が一部失敗すると終了コード1を返します。DBの告知停止は先に確定するので、timerを止めたまま再実行できます。
 
 再開するときは`LIVE_ENABLED=1`を付けてインストーラを実行し、timerを起動します。
 
