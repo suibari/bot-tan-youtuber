@@ -1,17 +1,29 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # botたんライブ配信用の GPU 仮想ディスプレイをインストールする。
-#   sudo bash setup/install_xorg.sh
+#   sudo /bin/bash /root/bottan-deploy/source/setup/install_xorg.sh APP_USER
 #
 # 既存のデスクトップ（GDM が管理する :0）には一切触らない。
 # /etc/X11/xorg.conf.d/ ではなく単独のファイルを置き、Xorg -config で読ませる。
 set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "root で実行してください: sudo bash $0" >&2
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ "$EUID" != 0 || "$HERE" != /root/* || "$#" != 1 ]]; then
+    echo "README.md の手順で /root 配下の確認済みコピーから実行してください（引数: APP_USER）" >&2
     exit 1
 fi
+cd /
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_USER="$1"
+if [[ ! "$RUN_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]; then
+    echo "APP_USER の形式が無効です" >&2
+    exit 1
+fi
+RUN_UID="$(id -u -- "$RUN_USER")"
+if [[ "$RUN_UID" == 0 ]]; then
+    echo "APP_USER は非特権の配信ユーザーを指定してください" >&2
+    exit 1
+fi
 
 # GPU の BusID が設定ファイルと合っているか確かめる。合っていないと
 # "No devices detected" で起動に失敗する
@@ -54,7 +66,7 @@ echo "起動を待っています..."
 for i in $(seq 1 20); do
     if [ -e /tmp/.X11-unix/X99 ]; then
         echo "OK: DISPLAY=:99 が使えます"
-        DISPLAY=:99 glxinfo -B 2>/dev/null | grep -i "renderer" || true
+        runuser -u "$RUN_USER" -- env DISPLAY=:99 glxinfo -B 2>/dev/null | grep -i "renderer" || true
 
         # **xrandr では確かめない。** NoScanout の :99 に現在モードが無いのは正常で、
         # そもそも xrandr が返すのはモードの公称値だから絵が出ている保証にならない
@@ -64,7 +76,7 @@ for i in $(seq 1 20); do
         # vblank を待つと描けていても 1fps を返す。配信の Unity にも
         # live/unity_live.py が同じ値を渡している
         PROBE_LOG="$(mktemp)"
-        runuser -u "${SUDO_USER:-$USER}" -- \
+        runuser -u "$RUN_USER" -- \
             env DISPLAY=:99 __GL_SYNC_TO_VBLANK=0 \
             timeout 12 stdbuf -o0 glxgears > "$PROBE_LOG" 2>/dev/null || true
         FPS="$(awk '/FPS/ { v = $(NF-1) } END { printf "%.1f", v + 0 }' "$PROBE_LOG")"
@@ -85,7 +97,7 @@ for i in $(seq 1 20); do
             exit 1
         fi
         install -m 0644 "$HERE/openbox-rc.xml" /etc/X11/openbox-bottan-live.xml
-        sed "s|__USER__|${SUDO_USER:-$USER}|" "$HERE/bottan-live-wm.service" \
+        sed "s|__USER__|$RUN_USER|" "$HERE/bottan-live-wm.service" \
             > /etc/systemd/system/bottan-live-wm.service
         chmod 0644 /etc/systemd/system/bottan-live-wm.service
         systemctl daemon-reload
@@ -94,7 +106,7 @@ for i in $(seq 1 20); do
         # なっている。残っていると "ウィンドウマネージャが既に起動しています" で
         # 起動できないため、先に確実に止める
         systemctl stop bottan-live-wm.service 2>/dev/null || true
-        pkill -f "openbox .*openbox-bottan-live" 2>/dev/null || true
+        pkill -u "$RUN_UID" -f "openbox .*openbox-bottan-live" 2>/dev/null || true
         sleep 1
         systemctl start bottan-live-wm.service
         sleep 2

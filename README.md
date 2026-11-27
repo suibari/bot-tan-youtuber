@@ -219,17 +219,17 @@ cp .env.example .env
 
 ### 5.3 ライブ用ディスプレイ
 
-[setup/xorg-bottan-live.conf](./setup/xorg-bottan-live.conf)のGPU BusIDを確認してから導入します。`:99`は配信用に確保し、他の仮想ディスプレイ用途では別番号を使用します。
+[setup/xorg-bottan-live.conf](./setup/xorg-bottan-live.conf)のGPU BusIDを確認してから導入します。下記の管理者用コピーを用意してから、新規ホストでは配信・録画が止まっている時間帯に実行します。`:99`は配信用に確保し、他の仮想ディスプレイ用途では別番号を使用します。
 
 ```sh
-sudo bash setup/install_xorg.sh
+sudo /bin/bash /root/bottan-deploy/source/setup/install_xorg.sh "$app_user"
 DISPLAY=:99 glxinfo -B
 DISPLAY=:99 __GL_SYNC_TO_VBLANK=0 timeout 12 stdbuf -o0 glxgears
 ```
 
 NVIDIAレンダラと実測の描画速度を確認します。プロセスの生存や公称リフレッシュレートだけでは判定しません。ライブ用Unityはソフトウェアレンダラを拒否します。Xvfbは動画収録には使用しますが、ライブの描画環境には使用しません。
 
-配信前は`bottan-live-display.service`がディスプレイを再初期化します。手動復旧には`setup/reset_display.sh`を使用します。Xorg再起動は`:99`上のUnity・OBSに影響するため、配信停止後に行います。
+配信前は`bottan-live-display.service`がディスプレイを再初期化します。手動復旧は配信停止後に`sudo systemctl start bottan-live-display.service`で行います。失敗時は配信ユーザーでDiscord通知を送り、原因を`journalctl -u bottan-live-display.service -n 50`で確認できます。
 
 ### 5.4 OBSと素材
 
@@ -276,15 +276,42 @@ bash setup/install_unity_license.sh
 
 ### 5.6 自動実行
 
-実際に運用するチェックアウトから導入します。インストーラは、そのディレクトリをsystemdの実行先として登録します。
+配信ユーザーが管理する本番チェックアウトを `app_checkout`、そのユーザー名を `app_user` に指定します。通常どおり配信ユーザーでチェックアウトとvenvを更新します。管理者は、レビュー済みのコミットを保護された `/root` 配下に別途取得します。システムのインストーラはこのコピーから実行します。
 
 ```sh
-sudo bash setup/install_units.sh
+app_checkout=/home/bottan/work/bot-tan-youtuber
+app_user=bottan
+reviewed_commit='レビュー済みコミットの完全なSHA'
+
+# 初回に管理者用の取得先を用意する
+sudo install -d -o root -g root -m 0700 /root/bottan-deploy
+sudo /usr/bin/git clone --no-checkout https://github.com/suibari/bot-tan-youtuber.git /root/bottan-deploy/source
+
+# 初回・更新共通。main への取り込みとレビュー済みSHAを確認する
+sudo /usr/bin/git -C /root/bottan-deploy/source fetch origin main &&
+sudo /usr/bin/git -C /root/bottan-deploy/source merge-base --is-ancestor "$reviewed_commit" origin/main &&
+sudo /usr/bin/git -C /root/bottan-deploy/source checkout --detach "$reviewed_commit"
+```
+
+初回は必要に応じて [ライブ用ディスプレイ](#53-ライブ用ディスプレイ) を導入します。既存ホストの移行・更新は、収録も配信も動いていない時間帯に関連タイマーを一時停止し、次のとおり配置します。既存のXorgとopenboxの設定はそのまま利用できます。初回はタイマーの停止を省略します。
+
+```sh
+sudo systemctl stop bottan-pipeline.timer bottan-quiz.timer bottan-live-prepare.timer bottan-live.timer
+sudo /bin/bash /root/bottan-deploy/source/setup/install_units.sh "$app_checkout" "$app_user"
+sudo stat -c '%U:%G %a %n' /usr/local/libexec/bottan \
+  /usr/local/libexec/bottan/reset_display.sh /usr/local/libexec/bottan/probe_display.sh
+sudo systemctl show -p FragmentPath -p DropInPaths -p User -p WorkingDirectory -p ExecStart \
+  bottan-live-display.service bottan-live-display-notify.service
+```
+
+補助ディレクトリとスクリプトは `root:root` の `755`、ディスプレイ準備ユニットの実行元は `/usr/local/libexec/bottan/reset_display.sh` です。通知ユニットのユーザーと実行先は `app_user` と `app_checkout` になります。独自のdrop-inがある場合は、読み込まれる設定も確認して、旧チェックアウトのスクリプトをrootで実行する指定を取り除いてください。確認後、Shortsのタイマーを起動します。
+
+```sh
 sudo systemctl start bottan-pipeline.timer bottan-quiz.timer
 systemctl list-timers 'bottan-*' --no-pager
 ```
 
-インストーラはtimerを有効化しますが、起動は別途行います。ライブ配信の休止中は、配信と枠準備のtimerを無効化します。動画timerは`Persistent=true`で停止中の実行を補います。配信・枠準備timerは`Persistent=false`で、過去の予定を後から実行しません。
+インストーラはShortsのタイマーを有効化します。起動は上のコマンドで行います。配信・枠準備のタイマーは既定で停止・無効化され、`LIVE_ENABLED=1`を指定したときだけ有効になります。動画timerは`Persistent=true`で停止中の実行を補います。配信・枠準備timerは`Persistent=false`で、過去の予定を後から実行しません。
 
 #### ライブ配信の休止と再開
 
@@ -297,10 +324,10 @@ sudo systemctl disable --now bottan-live-prepare.timer bottan-live.timer
 
 `retire_live.py`は、共有DBの未開始の配信枠を終了扱いにし、YouTube上の一度も配信していない自分の枠を削除します。配信済みの枠は残します。timerが動いていると、翌朝04:00の枠準備が枠を作り直します。
 
-再開するときは`LIVE_ENABLED=1`を付けてインストーラを実行し、timerを起動します。
+再開するときは上の手順で用意した管理者用コピーを使い、`LIVE_ENABLED=1`を付けて配置してからtimerを起動します。ライブを再開済みで、更新後も運用する場合は同じ指定が必要です。
 
 ```sh
-sudo LIVE_ENABLED=1 bash setup/install_units.sh
+sudo LIVE_ENABLED=1 /bin/bash /root/bottan-deploy/source/setup/install_units.sh "$app_checkout" "$app_user"
 sudo systemctl start bottan-live-prepare.timer bottan-live.timer
 ```
 

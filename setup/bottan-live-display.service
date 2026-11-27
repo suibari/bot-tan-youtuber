@@ -4,6 +4,7 @@ Documentation=https://github.com/suibari
 # 配信の直前に走らせる。bottan-live.service からは Requires= で引かれるので、
 # ここが失敗すれば配信は始まらない（止まった絵を1時間流すより出さないほうがよい）
 Before=bottan-live.service
+OnFailure=bottan-live-display-notify.service
 
 # **bottan-live-xorg.service への Requires= も After= も書かないこと。**
 # このユニットは Xorg を自分で restart する。依存として宣言してしまうと、
@@ -16,11 +17,9 @@ Type=oneshot
 # Xorg と openbox を systemctl で入れ直すので root で走る。
 # 配信本体は User=__USER__ のままで、こちらに sudoers は要らない
 User=root
-WorkingDirectory=__INSTALL_DIR__
-# 点検の glxinfo / glxgears は配信と同じユーザーで走らせる（runuser）。
-# root で X に繋げても Unity が繋げるとは限らない
-Environment=BOTTAN_USER=__USER__
-ExecStart=__INSTALL_DIR__/setup/reset_display.sh
+WorkingDirectory=/
+# 点検は配信ユーザーに権限を落として実行する。
+ExecStart=/usr/local/libexec/bottan/reset_display.sh __USER__
 # Xorg の再起動 30秒 + openbox + 点検 12秒 に余裕を足す
 TimeoutStartSec=180
 StandardOutput=journal

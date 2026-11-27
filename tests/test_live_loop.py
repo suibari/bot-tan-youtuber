@@ -348,11 +348,11 @@ class RenderGateTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             session.check_render()
         # 復旧手順まで通知に載せる。人が見るのは Discord の1行だけ。
-        # 復旧は :99 の作り直しで、その係は reset_display.sh（Xorg と openbox の
+        # 復旧は :99 の作り直しで、その係は display ユニット（Xorg と openbox の
         # 両方を入れ直し、実測まで見る）。__GL_SYNC_TO_VBLANK も必ず添えること。
         # これを落として測ると健全なホストでも 1fps に見え、切り分けが振り出しに戻る
         message = str(caught.exception)
-        self.assertIn("reset_display.sh", message)
+        self.assertIn("sudo systemctl start bottan-live-display.service", message)
         self.assertIn("__GL_SYNC_TO_VBLANK=0", message)
 
     def test_the_gate_can_be_turned_off(self):

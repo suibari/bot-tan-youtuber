@@ -1205,7 +1205,7 @@ class LiveSession:
                              f"あります（確認: "
                              f"`DISPLAY={LIVE_DISPLAY or ':99'} __GL_SYNC_TO_VBLANK=0 "
                              f"timeout 12 stdbuf -o0 glxgears`、"
-                             f"復旧: `sudo bash setup/reset_display.sh`）")
+                             f"復旧: `sudo systemctl start bottan-live-display.service`）")
 
     def check_render(self) -> float:
         """絵が実際に動いているかを実測し、fps を返す。
@@ -1221,7 +1221,7 @@ class LiveSession:
         msg = (f"Unity の描画が {fps:.1f}fps しか出ていません"
                f"（目安 {LIVE_MIN_FPS:.0f}fps）。"
                f"{LIVE_DISPLAY or ':99'} が描画から締め出されています。"
-               f"`sudo bash setup/reset_display.sh` で作り直してください。"
+               f"`sudo systemctl start bottan-live-display.service` で作り直してください。"
                f"手で測るときは `DISPLAY={LIVE_DISPLAY or ':99'} "
                f"__GL_SYNC_TO_VBLANK=0 timeout 12 stdbuf -o0 glxgears`"
                f"（この環境変数を落とすと健全でも 1fps に見えます）")

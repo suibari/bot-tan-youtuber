@@ -1,0 +1,12 @@
+[Unit]
+Description=botたんライブ配信用 ディスプレイ準備失敗の通知
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+NoNewPrivileges=yes
+ExecStart=__INSTALL_DIR__/venv/bin/python -c "from common import notify; notify.error('配信ディスプレイの準備', '詳細は journalctl -u bottan-live-display.service -n 50 を確認してください')"
+TimeoutStartSec=30

@@ -1,25 +1,35 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # botたんの systemd ユニット（Shorts 2本 + ライブ配信）をインストールする。
-# ライブ配信は休止中なので、ユニットは配置するが timer は有効化しない（LIVE_ENABLED=1 で再開）。
-#   sudo bash setup/install_units.sh
+#   sudo /bin/bash /root/bottan-deploy/source/setup/install_units.sh APP_CHECKOUT APP_USER
+# ライブ用 timer は既定で無効。LIVE_ENABLED=1 で有効にする。
 #
 # ユニットの中の __INSTALL_DIR__ / __USER__ を実際の値に置き換えてから配置する。
-# 本番と dev の両方から実行できるので、systemd がどちらを向くかは
-# 「どのディレクトリでこれを走らせたか」で決まる。
+# インストール元には管理者が確認した /root 配下のスナップショットを使う。
+# APP_CHECKOUT は非特権サービスの実行先。README.md の導入手順を参照。
 #
 # 映像まわり（Xorg :99 / openbox）は install_xorg.sh が別に入れる。
 set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "root で実行してください: sudo bash $0" >&2
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ "$EUID" != 0 || "$HERE" != /root/* || "$#" != 2 || "${1:-}" != /* ]]; then
+    echo "README.md の手順で /root 配下の確認済みコピーから実行してください（引数: APP_CHECKOUT APP_USER）" >&2
     exit 1
 fi
+cd /
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="$(cd "$HERE/.." && pwd)"
-RUN_USER="${SUDO_USER:-$USER}"
-# ライブ配信の OBS が PulseAudio に繋ぐのに要る（bottan-live.service の Environment）
-RUN_UID="$(id -u "$RUN_USER")"
+INSTALL_DIR="$(realpath -e -- "$1")"
+RUN_USER="$2"
+# テンプレートへ埋め込んでも systemd や sed の構文として解釈されない値に限る。
+if [[ ! "$INSTALL_DIR" =~ ^/[a-zA-Z0-9_./-]+$ || ! "$RUN_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]; then
+    echo "APP_CHECKOUT または APP_USER の形式が無効です" >&2
+    exit 1
+fi
+RUN_UID="$(id -u -- "$RUN_USER")"
+if [[ "$RUN_UID" == 0 ]]; then
+    echo "APP_USER は非特権の配信ユーザーを指定してください" >&2
+    exit 1
+fi
 
 for f in run.sh run_quiz.sh run_live.sh; do
     if [ ! -f "$INSTALL_DIR/$f" ]; then
@@ -28,43 +38,40 @@ for f in run.sh run_quiz.sh run_live.sh; do
     fi
 done
 
-# systemd が向く先は「このスクリプトがどこに置かれているか」で決まる。
-# dev の worktree から実行すると本番のタイマーが dev を向いてしまい、
+# dev の worktree を指定すると本番のタイマーが dev を向いてしまい、
 # 配信が dev の Unity・限定公開で走る。意図してやるとき以外は止める
 if [[ "$(basename "$INSTALL_DIR")" == *-dev ]] && [ -z "${ALLOW_DEV:-}" ]; then
     PROD_DIR="$(dirname "$INSTALL_DIR")/$(basename "$INSTALL_DIR" -dev)"
     echo "$INSTALL_DIR は dev の worktree です。" >&2
     echo "本番へ入れるなら本番のディレクトリで実行してください:" >&2
-    echo "    cd $PROD_DIR && sudo bash setup/install_units.sh" >&2
-    echo "dev を承知で入れるなら: sudo ALLOW_DEV=1 bash $0" >&2
+    echo "    sudo /bin/bash $0 $PROD_DIR $RUN_USER" >&2
+    echo "dev を承知で入れるなら: sudo ALLOW_DEV=1 /bin/bash $0 $INSTALL_DIR $RUN_USER" >&2
     exit 1
 fi
 
 echo "インストール先: $INSTALL_DIR (User=$RUN_USER, UID=$RUN_UID)"
 
 install_unit() {
-    local name="$1"
+    local name="$1" staged
+    staged="$(mktemp /etc/systemd/system/.bottan-unit.XXXXXXXX)"
     sed -e "s|__INSTALL_DIR__|$INSTALL_DIR|g" -e "s|__USER__|$RUN_USER|g" \
         -e "s|__UID__|$RUN_UID|g" \
-        "$HERE/$name" > "/etc/systemd/system/$name"
-    chmod 0644 "/etc/systemd/system/$name"
+        "$HERE/$name" > "$staged"
+    chmod 0644 "$staged"
+    mv -fT -- "$staged" "/etc/systemd/system/$name"
     echo "  配置: $name"
 }
+
+install -d -o root -g root -m 0755 /usr/local/libexec/bottan
+install -o root -g root -m 0755 "$HERE/reset_display.sh" "$HERE/probe_display.sh" /usr/local/libexec/bottan/
 
 for u in bottan-pipeline.service bottan-pipeline.timer \
          bottan-quiz.service bottan-quiz.timer \
          bottan-live-prepare.service bottan-live-prepare.timer \
-         bottan-live-display.service \
+         bottan-live-display-notify.service bottan-live-display.service \
          bottan-live.service bottan-live.timer; do
     install_unit "$u"
 done
-
-# 準備ユニットが呼ぶ。リポジトリの中に置いたまま実行するので、実行ビットが
-# 落ちていると配信が始まらない（git は実行ビットを持つが、zip 展開などで落ちる）
-chmod 0755 "$INSTALL_DIR/setup/reset_display.sh"
-# bottan-live.service の ExecStopPost が呼ぶ。落ちていると配信後に OBS が残り、
-# 翌晩の reset_display.sh のガードに引っかかって配信が始まらない
-chmod 0755 "$INSTALL_DIR/setup/stop_live_processes.sh"
 
 systemctl daemon-reload
 
@@ -99,7 +106,7 @@ fi
 if [ ! -f /etc/systemd/system/bottan-live-xorg.service ]; then
     echo
     echo "警告: bottan-live-xorg.service がありません。" >&2
-    echo "      ライブ配信を使うなら sudo bash setup/install_xorg.sh を先に実行してください。" >&2
+    echo "      新規導入は README.md の install_xorg.sh の手順を参照してください。" >&2
 fi
 
 systemctl enable bottan-pipeline.timer bottan-quiz.timer
@@ -107,10 +114,10 @@ systemctl enable bottan-pipeline.timer bottan-quiz.timer
 # ライブ配信は 2026-11-27 から休止中。再インストールで勝手に再開しないよう、
 # 明示しない限り配信と枠準備の timer は止めておく。
 # 止めたあとに残った YouTube の枠と DB の告知対象は live/retire_live.py で片付ける。
-if [ -n "${LIVE_ENABLED:-}" ]; then
+if [[ "${LIVE_ENABLED:-}" == 1 ]]; then
     systemctl enable bottan-live-prepare.timer bottan-live.timer
 else
-    systemctl disable --now bottan-live-prepare.timer bottan-live.timer 2>/dev/null || true
+    systemctl disable --now bottan-live-prepare.timer bottan-live.timer
     echo "  ライブ配信は休止中: bottan-live-prepare.timer / bottan-live.timer を無効化しました"
 fi
 
