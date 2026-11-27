@@ -391,6 +391,30 @@ def retire_other_prepared_broadcasts(keep_ids: list[str]) -> None:
         conn.commit()
 
 
+def retire_unstarted_broadcasts() -> list[tuple[str, str | None]]:
+    """休止用に未開始枠を告知対象から外し、YouTube 側で確認する候補を返す。"""
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE {LIVE_SCHEMA}.broadcasts
+                SET ended_at = now()
+                WHERE prepared_at IS NOT NULL
+                  AND started_at IS NULL
+                  AND ended_at IS NULL
+            """)
+            # 前回 YouTube の片付けに失敗した枠も次回の候補にする。
+            cur.execute(f"""
+                SELECT broadcast_id, title
+                FROM {LIVE_SCHEMA}.broadcasts
+                WHERE prepared_at IS NOT NULL
+                  AND started_at IS NULL
+                  AND broadcast_id IS NOT NULL
+            """)
+            candidates = cur.fetchall()
+        conn.commit()
+    return candidates
+
+
 def start_broadcast(broadcast_id: str, url: str, title: str) -> None:
     with connect() as conn:
         with conn.cursor() as cur:
